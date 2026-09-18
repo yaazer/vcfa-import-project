@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "vcfa-import: tests",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tests/run_tests.py",
+      "args": ["--unit-only"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "vcfa-import: demo campaign",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/demo.py",
+      "args": ["--keep", "${workspaceFolder}/rehearsal"],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "vcfa-import: CLI (edit args)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/vcfa-import.py",
+      "args": ["-c", "vcfa-lab/vcfa-import.toml", "status"],
+      "console": "integratedTerminal"
+    }
+  ]
+}
