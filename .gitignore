@@ -1,0 +1,32 @@
+# run state, ledgers, manifests and reports are per-campaign, never source
+run/
+run.*/
+rehearsal/
+*.log
+tracker.csv
+transitions.csv
+picker.html
+report.html
+selection.csv
+ledger.jsonl
+
+# build output
+dist/
+build/
+*.spec
+*.pyz
+*.exe
+*.zip
+*.7z
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors / OS
+.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db

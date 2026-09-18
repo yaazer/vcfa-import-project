@@ -1,0 +1,4 @@
+portgroup,namespace,subnet,wave
+VLAN197-Prod,redbull-ns1-r95mc,subnet-vlan197,1
+VLAN200-DB,redbull-ns2-k22ab,subnet-vlan200,2
+VLAN210-App,redbull-ns2-k22ab,subnet-vlan210,2
