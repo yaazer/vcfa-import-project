@@ -728,3 +728,4 @@ rehearse a campaign without a cluster:
 ```toml
 kubectl = "python /path/to/tools/fake_kubectl.py"
 ```
+
