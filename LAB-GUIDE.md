@@ -151,6 +151,22 @@ the exact spelling.
 
 ## 5. Preflight and validate — nothing applied yet
 
+Two words come up from here on that sound alike but are different things:
+
+| | `preflight` | `precheck` |
+|---|---|---|
+| who does the checking | **the tool**, from the jump box, with read-only `kubectl` calls | **the Mobility Operator**, on the Supervisor |
+| what is created on the cluster | nothing | an `ImportOperationBatch` with `precheckOnly: true` (and its child `ImportOperation`) |
+| what it looks at | your config and queue against the cluster: is this the Supervisor context, is the operator installed and its pod healthy, do the target namespaces exist, may you create batches in them, do the subnets you named exist | the VM itself: the operator connects to vCenter, finds the VM by moref, and checks whether it can be imported (powered on, VM Tools, supported hardware, NIC/portgroup resolvable, and so on) |
+| when to run it | before anything is applied; re-run after any config or map change | once per VM before its real import; `run` refuses a VM without a passed precheck (`require_precheck = true`) |
+| result | `[ok]`/`[FAIL]` per check; exit code 2 stops you | VM moves to `precheck_passed` or `precheck_failed` with the operator's message |
+
+Preflight catches the mistakes that would make every batch fail the same way
+(wrong context, wrong namespace name, wrong subnet object name, no RBAC).
+Precheck catches the per-VM problems (a VM without Tools, an unsupported
+device) that only the operator can see. Both are non-destructive: nothing is
+migrated until `run`.
+
 ```bash
 vcfa-import preflight
 ```
@@ -188,8 +204,12 @@ vcfa-import precheck --folder Lab/Import --limit 1     # one VM from the lab fol
 `status` — so the lab folder can be driven in isolation even if other VMs are
 queued.)
 
-This applies a batch with `precheckOnly: true`. Watch the output; the tool
-polls and reports when it settles. Then:
+This applies a batch with `precheckOnly: true`. The operator handles it like
+a real import batch — it connects to vCenter, locates each VM and runs its
+compatibility checks — but stops before moving anything. A precheck-only
+batch ends at `ReadyForImport: True`; `ReadyForCommit` and `Complete` never
+turn true for it, which is expected. Watch the output; the tool polls and
+reports when it settles. Then:
 
 ```bash
 vcfa-import vms
@@ -211,6 +231,23 @@ Once one works, precheck the rest:
 ```bash
 vcfa-import precheck --wave 1
 ```
+
+**Before moving on to `run`, delete the finished precheck batch.** The
+operator names the child `ImportOperation` after the VM (`<vmname>-<moref
+digits>`), so a precheck batch and an import batch for the same VM collide:
+the import batch cannot create its child and sits at `ReadyForImport: False`
+with `number of operations from status: 0 does not match number of operations
+from spec: 1`. Seen in the lab on 2026-09-18. Until the tool does this itself:
+
+```bash
+kubectl get importoperationbatches -n <ns>            # pre-w1-... is the precheck batch
+kubectl delete importoperationbatch pre-w1-<...> -n <ns>
+kubectl wait --for=delete importoperation/<vmname>-<digits> -n <ns> --timeout=60s
+```
+
+Do not use `abandon` for this — it also returns the VMs to `pending`, and you
+want them to keep `precheck_passed`. The tool's own record of the precheck is
+in `state.db` and the ledger, not in the batch object.
 
 ---
 
