@@ -100,12 +100,27 @@ class VmRecord:
         subnets = sorted(n.subnet or "-" for n in self.nics)
         return "+".join(subnets) if subnets else "no-network"
 
-    def operation_name(self) -> str:
+    def operation_name(self, discriminator: str = "") -> str:
+        """Name for this VM's operation, and so for the child object it creates.
+
+        The operator names each child `ImportOperation` after the operation and
+        makes the batch its controller. Two batches for the same VM therefore
+        ask for the same child name, and the second one deadlocks: it cannot
+        create the object (it exists) and cannot adopt it (another controller
+        owns it), so its status.operations stays empty forever. Observed in the
+        lab on 2026-09-21 between a precheck batch and the import that followed.
+
+        The discriminator -- the batch's own digest, see render.py -- keeps each
+        batch's children distinct. It is deterministic in the batch name, so
+        re-planning the same batch reproduces the same names and a resumed run
+        still matches its children.
+        """
         base = slugify(self.vm_name) or slugify(self.moref)
         suffix = self.moref.split("-")[-1] if "-" in self.moref else self.moref
+        tail = "-" + discriminator if discriminator else ""
         base = base[:48].rstrip("-")
         name = "{}-{}".format(base, slugify(suffix)) if base else slugify(self.moref)
-        return name[:63].rstrip("-")
+        return name[:63 - len(tail)].rstrip("-") + tail
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -319,7 +334,8 @@ def _warn_on_name_collisions(records: List[VmRecord], warnings: List[str]) -> No
         op = rec.operation_name()
         if op in names:
             warnings.append(
-                "operation name '{}' collides in namespace {} ({} and {}); a numeric suffix will be added"
+                "operation name '{}' is shared in namespace {} ({} and {}); the batch "
+                "discriminator keeps the child objects apart"
                 .format(op, rec.namespace, names[op], rec.moref)
             )
         else:

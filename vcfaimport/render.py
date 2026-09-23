@@ -7,6 +7,7 @@ jump host than one that needs pip access.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,23 @@ LABEL_KIND = "vcfa-import/stage"
 ANNOTATION_TOOL = "vcfa-import/tool-version"
 ANNOTATION_TIME = "vcfa-import/generated-at"
 ANNOTATION_VMS = "vcfa-import/vm-names"
+
+# Length of the per-batch discriminator appended to every operation name. Five
+# hex characters is what `_batch_name` already uses for batches; it keeps the
+# names readable and is far below any realistic collision risk.
+OP_DISCRIMINATOR_LEN = 5
+
+
+def batch_discriminator(batch_name: str) -> str:
+    """The tag that makes one batch's operation names its own.
+
+    Derived from the batch name rather than sliced out of it, so it does not
+    depend on how `_batch_name` happens to be formatted, and two batches can
+    never share a tag unless they share a name -- in which case they are the
+    same batch being re-planned, which is exactly when the names must match.
+    """
+    return hashlib.sha1(batch_name.encode("utf-8")).hexdigest()[:OP_DISCRIMINATOR_LEN]
+
 
 # Plain (unquoted) scalars must not collide with YAML's implicit types.
 _YAML_RESERVED = {
@@ -135,13 +153,18 @@ def build_batch_manifest(
 
     operations: List[Dict[str, Any]] = []
     used: Dict[str, int] = {}
+    discriminator = batch_discriminator(name)
     for rec in records:
-        op_name = rec.operation_name()
-        if op_name in used:
-            used[op_name] += 1
-            op_name = "{}-{}".format(op_name[:59], used[op_name])
+        base = rec.operation_name()
+        if base in used:
+            # Two VMs with the same name in one batch: extend the tag rather
+            # than the base, so the batch's own discriminator always survives.
+            used[base] += 1
+            tag = "{}{}".format(discriminator, used[base])
         else:
-            used[op_name] = 0
+            used[base] = 0
+            tag = discriminator
+        op_name = rec.operation_name(tag)
 
         spec: Dict[str, Any] = {"virtualMachineID": rec.moref}
         nics = [

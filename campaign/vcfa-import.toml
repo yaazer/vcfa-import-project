@@ -9,24 +9,24 @@ api_version    = "mobility-operator.vmware.com/v1alpha3"
 
 [import]
 mode               = "preserve"   # preserve keeps the existing IP addressing
-commit_action      = "Wait"       # Auto | Wait  (Wait = manual commit gate)
+commit_action      = "Auto"       # Auto | Wait  (Wait = manual commit gate)
 # Rollback is never set at creation time -- see `vcfa-import rollback --help`.
 subnet_api_group   = "crd.nsx.vmware.com"
 subnet_kind        = "Subnet"
 default_device_key = 4000
 
 [batching]
-batch_size                         = 2   # VMs per ImportOperationBatch
-max_parallel_batches               = 1    # in-flight batches, cluster wide
+batch_size                         = 10   # VMs per ImportOperationBatch
+max_parallel_batches               = 4    # in-flight batches, cluster wide
 max_parallel_batches_per_namespace = 2
-poll_interval_seconds              = 10
+poll_interval_seconds              = 20
 batch_timeout_minutes              = 90
 rollback_timeout_minutes           = 30
 settle_seconds                     = 5
 max_retries                        = 1
 
 [safety]
-failure_rate_abort      = 0.5   # halt the wave once 25% of results have failed
+failure_rate_abort      = 0.25   # halt the wave once 25% of results have failed
 failure_rate_min_sample = 8
 max_vms_per_run         = 0      # 0 = unlimited
 require_precheck        = true

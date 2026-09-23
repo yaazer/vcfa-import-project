@@ -23,6 +23,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import yaml  # test-only dependency
 
@@ -74,13 +75,54 @@ def op_outcome(vm_id: str, precheck: bool) -> str:
     return "Succeeded"
 
 
-def build_status(obj: dict, polls: int) -> dict:
+def operation_name_owners(data: dict) -> dict:
+    """Which batch owns each child ImportOperation name.
+
+    Children are cluster objects in a shared namespace, so the first batch to
+    claim a name keeps it; dict order here is apply order. Mirrors the real
+    controller, which cannot adopt a child another controller already owns.
+    """
+    owners: dict = {}
+    for key, obj in data.get("batches", {}).items():
+        ns = key.split("/", 1)[0]
+        for entry in ((obj.get("spec") or {}).get("operations") or []):
+            owners.setdefault((ns, entry.get("name")), key)
+    return owners
+
+
+def blocked_operations(obj: dict, key: str, data: dict) -> list:
+    """Operation names this batch wants but another batch already owns."""
+    owners = operation_name_owners(data)
+    ns = key.split("/", 1)[0]
+    return [e.get("name") for e in ((obj.get("spec") or {}).get("operations") or [])
+            if owners.get((ns, e.get("name")), key) != key]
+
+
+def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = None) -> dict:
     """Synthesise the status the operator would report after `polls` reads."""
     spec = obj.get("spec", {})
     default = spec.get("defaultSpec", {})
     control = default.get("controlAction", {}) or {}
     precheck = bool(control.get("precheckOnly"))
     committed = control.get("commitAction") == "Auto" and obj.get("_committed")
+
+    blocked = blocked_operations(obj, key, data) if data is not None and key else []
+    if blocked:
+        # Observed 2026-09-21: the batch applies fine, but its controller can
+        # neither create nor adopt the children, so it never reports any
+        # operations at all. It stays here until the other batch is deleted.
+        total = len((spec.get("operations") or []))
+        msg = ("number of operations from status: 0 does not match number of "
+               "operations from spec: {}".format(total))
+        busy = "Operations are not ready. Operation Names: " + "; ".join(blocked)
+        return {"conditions": [
+            {"type": "Complete", "status": "False", "reason": "ObjectNotReady",
+             "message": busy},
+            {"type": "ReadyForCommit", "status": "False", "reason": "ObjectNotReady",
+             "message": busy},
+            {"type": "ReadyForImport", "status": "False", "reason": "ObjectNotReady",
+             "message": msg}],
+            "readyCount": 0, "readyOps": [], "_blocked_on": blocked}
 
     if polls < settle():
         # Still working: every gate False / ObjectNotReady, exactly as observed.
@@ -130,9 +172,9 @@ def real_vocabulary(obj: dict, ops: list, precheck: bool, rolling: bool, reverte
       conditions ReadyForImport / ReadyForCommit / Complete, each "True" when
       reached or "False" with reason ObjectNotReady and a message such as
       "Operations are not ready. Operation Names: <op>"; plus readyCount and
-      readyOps. No per-operation list, no ImportOperation children for a
-      precheck-only batch. The failed/completed/rolled-back name lists below
-      (failedOps, completedOps, rolledBackOps) are this simulator's guesses.
+      readyOps. No per-operation list. Precheck-only batches *do* get
+      ImportOperation children (2026-09-21). The failed/completed/rolled-back
+      name lists below (failedOps, completedOps, rolledBackOps) are guesses.
     """
     names = [o["name"] for o in ops]
     failed = [o["name"] for o in ops if o["phase"] == "Failed"]
@@ -188,55 +230,93 @@ def real_vocabulary(obj: dict, ops: list, precheck: bool, rolling: bool, reverte
         status["rolledBackOps"] = rolled
     # Per-VM detail for import batches also comes through ImportOperation children.
     status["_ops"] = ops
+    status["_precheck"] = precheck
     return status
 
 
 def child_operations(obj: dict, status: dict) -> list:
     """The ImportOperation objects the operator would create for a batch.
 
-    None are created for a precheck-only batch (observed); import batches get one
-    per operation, carrying the per-VM phase.
+    Observed on a real Supervisor (2026-09-21): precheck-only batches create
+    children too, and a child is named after its operation exactly -- the batch
+    name is *not* prefixed. That naming is what lets two batches collide.
+
+    A batch that lost the race for its names creates nothing (see build_status).
     """
     name = obj["metadata"]["name"]
     ns = obj["metadata"]["namespace"]
+    if status.get("_blocked_on"):
+        return []
     out = []
     for entry in status.get("_ops", []):
         out.append({
             "apiVersion": "{}/{}".format(GROUP, VERSION),
             "kind": "ImportOperation",
             "metadata": {
-                "name": "{}-{}".format(name, entry["name"])[:63],
+                "name": entry["name"][:63],
                 "namespace": ns,
-                "ownerReferences": [{"kind": "ImportOperationBatch", "name": name}],
+                "ownerReferences": [{"kind": "ImportOperationBatch", "name": name,
+                                     "controller": True, "blockOwnerDeletion": True}],
             },
             "spec": {"virtualMachineID": entry["virtualMachineID"]},
-            "status": child_conditions(entry["phase"], entry.get("message", "")),
+            "status": child_conditions(entry["phase"], entry.get("message", ""),
+                                       precheck=bool(status.get("_precheck"))),
         })
     return out
 
 
-def child_conditions(phase: str, message: str) -> dict:
-    """An ImportOperation's status in the operator's own condition vocabulary."""
+# The VM-lifecycle conditions a finished import child carries alongside its
+# verdict (observed 2026-09-23). The tool ignores them; they are here so the
+# fake's objects look like the real ones.
+CHILD_LIFECYCLE = ("VirtualMachineCreated", "VirtualMachineReady",
+                   "VirtualMachineReadyForImport", "NetworkBackingReady",
+                   "GuestCustomization", "VirtualMachineSetManagedBySucceeded")
+
+
+def child_conditions(phase: str, message: str, precheck: bool = False) -> dict:
+    """An ImportOperation's status in the child condition vocabulary.
+
+    Children do NOT speak the batch's vocabulary -- observed 2026-09-23 on a
+    real Supervisor:
+      * a child's completion condition is `Completed`, not the batch's `Complete`
+      * a child states its precheck verdict as `PrecheckSucceeded`; batches have
+        no equivalent and signal a pass with ReadyForImport: True
+      * a precheck-only child carries `PrecheckSucceeded` and nothing else
+    Mirroring the batch's three conditions onto children (as this fake used to)
+    hid a bug that left committed VMs reading as awaiting_commit forever.
+    """
     def cond(kind, ok, reason=None):
         return {"type": kind, "status": "True" if ok else "False",
                 "reason": "True" if ok else (reason or "ObjectNotReady"),
                 "message": "" if ok else message}
+
+    if precheck:
+        # Observed: the only condition on a precheck child.
+        if phase == "Succeeded":
+            return {"conditions": [cond("PrecheckSucceeded", True)]}
+        if phase == "Failed":
+            return {"conditions": [cond("PrecheckSucceeded", False, "PrecheckFailed")]}
+        return {"conditions": [cond("PrecheckSucceeded", False)]}
+
+    done = [cond(k, True) for k in CHILD_LIFECYCLE]
     if phase == "Succeeded":
-        return {"conditions": [cond("ReadyForImport", True), cond("ReadyForCommit", True),
-                               cond("Complete", True)]}
+        return {"conditions": [cond("PrecheckSucceeded", True), cond("ReadyForCommit", True),
+                               cond("Completed", True)] + done,
+                "completionTime": "2026-09-23T19:52:11Z"}
     if phase == "AwaitingCommit":
-        return {"conditions": [cond("ReadyForImport", True), cond("ReadyForCommit", True),
-                               cond("Complete", False)]}
+        # Completed-while-False at the gate is inferred, not yet observed: the
+        # lab only ever caught these children after the commit had landed.
+        return {"conditions": [cond("PrecheckSucceeded", True), cond("ReadyForCommit", True),
+                               cond("Completed", False)] + done}
     if phase == "Failed":
-        return {"conditions": [cond("ReadyForImport", False, "OperationFailed"),
+        return {"conditions": [cond("PrecheckSucceeded", True),
                                cond("ReadyForCommit", False, "OperationFailed"),
-                               cond("Complete", False, "OperationFailed")]}
+                               cond("Completed", False, "OperationFailed")]}
     if phase in ("RollingBack", "RolledBack"):
-        return {"conditions": [cond("ReadyForImport", True),
+        return {"conditions": [cond("PrecheckSucceeded", True),
                                cond("ReadyForCommit", False, phase),
-                               cond("Complete", False, phase)]}
-    return {"conditions": [cond("ReadyForImport", False), cond("ReadyForCommit", False),
-                           cond("Complete", False)]}
+                               cond("Completed", False, phase)]}
+    return {"conditions": [cond("ReadyForCommit", False), cond("Completed", False)]}
 
 
 def strip_globals(argv: list) -> list:
@@ -394,7 +474,7 @@ def main(argv: list) -> int:
                     continue
                 data["polls"][key] = data["polls"].get(key, 0) + 1
                 enriched = json.loads(json.dumps(obj))
-                enriched["status"] = {k: v for k, v in build_status(obj, data["polls"][key]).items()
+                enriched["status"] = {k: v for k, v in build_status(obj, data["polls"][key], key, data).items()
                                       if not k.startswith("_")}
                 matches.append(enriched)
             save_state(data)
@@ -413,7 +493,7 @@ def main(argv: list) -> int:
                 obj_ns = key.split("/", 1)[0]
                 if ns and obj_ns != ns:
                     continue
-                status = build_status(obj, data["polls"].get(key, 0))
+                status = build_status(obj, data["polls"].get(key, 0), key, data)
                 items.extend(child_operations(obj, status))
             print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
             return 0

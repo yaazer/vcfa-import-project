@@ -260,14 +260,25 @@ def _child_operations(children: List[Dict[str, Any]], batch_name: str, cfg: Conf
 #
 # A precheckOnly batch stops at ReadyForImport=True; ReadyForCommit and Complete
 # stay False/ObjectNotReady for it forever, which is *success* for a precheck.
-# No ImportOperation children were created for a precheck-only batch.
+# A precheck-only batch does create ImportOperation children (2026-09-21); each
+# child is named after its operation, with no batch-name prefix, so two batches
+# naming the same operation fight over one object -- see render.batch_discriminator.
 #
 # The per-operation lists for failure/commit/rollback outcomes have not been
 # observed yet; the names below are educated guesses and are tried in order.
 COND_READY_IMPORT = "ReadyForImport"
 COND_READY_COMMIT = "ReadyForCommit"
 COND_COMPLETE = "Complete"
-OPERATOR_CONDITIONS = (COND_READY_IMPORT, COND_READY_COMMIT, COND_COMPLETE)
+# A batch says "Complete"; its children say "Completed" for the same thing
+# (observed 2026-09-23). Reading only the batch spelling left committed VMs
+# stuck at awaiting_commit forever, because child status wins over the batch.
+COND_COMPLETED_ALT = "Completed"
+COMPLETE_CONDITIONS = (COND_COMPLETE, COND_COMPLETED_ALT)
+# Children report their precheck verdict here; batches have no equivalent and
+# express a passed precheck as ReadyForImport: True.
+COND_PRECHECK_OK = "PrecheckSucceeded"
+OPERATOR_CONDITIONS = (COND_READY_IMPORT, COND_READY_COMMIT, COND_COMPLETE,
+                       COND_COMPLETED_ALT, COND_PRECHECK_OK)
 REASON_WORKING = ("objectnotready", "notready", "inprogress", "pending", "reconciling")
 
 READY_OPS_KEYS = ("readyOps", "readyOperations")
@@ -284,6 +295,15 @@ def _condition_map(status: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if isinstance(cond, dict) and cond.get("type"):
             out[str(cond["type"])] = cond
     return out
+
+
+def _first_cond(conds: Dict[str, Dict[str, Any]],
+                types: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    """The first of these condition types the object actually carries."""
+    for name in types:
+        if name in conds:
+            return conds[name]
+    return None
 
 
 def _names(status: Dict[str, Any], keys: Tuple[str, ...]) -> List[str]:
@@ -318,7 +338,8 @@ def operator_status(
     precheck = stage == "precheck" if stage else _precheck_only(batch_obj)
     ready_import = conds.get(COND_READY_IMPORT)
     ready_commit = conds.get(COND_READY_COMMIT)
-    complete = conds.get(COND_COMPLETE)
+    complete = _first_cond(conds, COMPLETE_CONDITIONS)
+    precheck_ok = conds.get(COND_PRECHECK_OK)
 
     def reason_of(cond: Optional[Dict[str, Any]]) -> str:
         return str((cond or {}).get("reason") or "")
@@ -338,7 +359,20 @@ def operator_status(
         return bool(cond) and not _is_true(cond) and not working(cond)
 
     # --- batch-level verdict -------------------------------------------------
-    if precheck:
+    if precheck and precheck_ok is not None:
+        # A child ImportOperation states its precheck verdict outright. Without
+        # this, a failed precheck child (PrecheckSucceeded: False, reason e.g.
+        # VirtualMachineAlreadyExists) fell through to the phase heuristics,
+        # read as "still running", and the batch sat until batch_timeout_minutes.
+        if _is_true(precheck_ok):
+            bucket, phase, message = BUCKET_SUCCEEDED, COND_PRECHECK_OK, message_of(precheck_ok)
+        else:
+            phase = reason_of(precheck_ok) or COND_PRECHECK_OK
+            bucket = BUCKET_RUNNING if working(precheck_ok) else classify(phase, cfg)
+            if bucket == BUCKET_UNKNOWN:
+                bucket = BUCKET_FAILED
+            message = message_of(precheck_ok)
+    elif precheck:
         if _is_true(ready_import):
             bucket, phase, message = BUCKET_SUCCEEDED, COND_READY_IMPORT, message_of(ready_import)
         elif not verdict(ready_import):

@@ -120,8 +120,21 @@ state, and every network adapter with its **device key** (which is exactly what
 ```bash
 vcfa-import discover --vcenter vcenter.example.local --user administrator@vsphere.local
 vcfa-import discover --insecure          # self-signed vCenter certificate
-vcfa-import discover --powered-on --no-tools --concurrency 24
+vcfa-import discover --powered-on --no-tools --concurrency 24   # large estate, in a hurry
 ```
+
+That last line is the "thousands of VMs" combination: `--powered-on` caches only
+powered-on VMs, `--no-tools` drops the per-VM VM Tools call (discovery makes one
+REST call per VM for details and a second for Tools, so this roughly halves the
+calls), and `--concurrency 24` raises the worker pool from the default 12 —
+values above 32 are clamped.
+
+`--no-tools` is the one with a cost. Without it `tools_status` stays empty, so
+discovery cannot print its *"N VM(s) are not running VM Tools (likely precheck
+failures)"* warning and `--tools-running` filters match nothing. VM Tools not
+running is a common precheck failure, so you are trading an early, cheap warning
+for speed — worth it on a first sweep of a large estate, less so on the batch you
+are about to import.
 
 Credentials come from `--vcenter/--user/--password`, then `VCFA_VC_SERVER` /
 `VCFA_VC_USER` / `VCFA_VC_PASSWORD`, then an interactive prompt. **The password
@@ -197,14 +210,55 @@ just be a plain list of morefs or VM names, one per line.
 vcfa-import select --folder Production/Web --powered-on --with-nics \
                    --namespace redbull-ns1-r95mc --wave 1
 vcfa-import select --folder Legacy --exclude-name 'test-*'
-vcfa-import select --folder Production/App --deselect
-vcfa-import select --none                         # start over
 ```
 
 Filters are ANDed. `--folder` takes paths (subtree by default); `--name`,
 `--cluster`, `--datacenter`, `--network`, `--guest-os` and `--exclude-name`
 take globs; all are repeatable; `--regex` matches VM names. `select` with no
 filters refuses to act — pass `--all` if you really mean every VM.
+
+### Unselecting: the selection is cumulative
+
+**`select` only ever adds.** Each run marks its matches as selected and leaves
+every other VM untouched, so running `select` again with a narrower filter does
+not narrow the selection — it just selects a few more VMs you had already
+selected. After `select --all`, a following `select --folder Production/Web` is
+effectively a no-op, and the whole estate is still queued.
+
+This surprises people most often in this shape:
+
+```bash
+vcfa-import select --all                          # 2,400 VMs selected
+vcfa-import select --folder Production/Web        # still 2,400 -- not 80
+```
+
+Two ways back:
+
+```bash
+vcfa-import select --none                         # clear the selection entirely
+vcfa-import select --deselect --folder Lab/Scratch   # subtract just these
+vcfa-import select --deselect --powered-off          # any filter works in reverse
+```
+
+`--none` resets every row in one step and ignores all other filters. `--deselect`
+takes exactly the same filters as a normal `select` and removes the matches
+instead of adding them.
+
+To make the selection *exactly* some set — the usual intent — clear first, then
+select:
+
+```bash
+vcfa-import select --none
+vcfa-import select --folder Production/Web
+```
+
+That two-step also applies to the picker: `select --from-file selection.csv`
+adds the VMs listed in the file but does **not** deselect the ones absent from
+it, so re-exporting a narrowed list from `pick` will not shrink an existing
+selection on its own.
+
+Check what you actually have at any point with `browse --selected`, or the
+`selected` column of `folders`.
 
 ### Stage the selection for import
 
@@ -388,7 +442,7 @@ it never touches batches it did not create.
 | `run` | apply the real import batches; `--folder` scopes, `--rollback-failed` reverts failures afterwards |
 | `status` | progress by wave and namespace, or `--folder` for one subtree; `--refresh` re-polls first |
 | `watch` | redraw `status` on an interval until nothing is in flight |
-| `commit` | release VMs held by `commitAction: Wait` |
+| `commit` | release VMs held by `commitAction: Wait`; scopes by `--wave` or `--vm` (**no `--folder`**), or commits everything waiting |
 | `retry` | return failed VMs to the queue |
 | `rollback` | hand failed imports back to vCenter: set `rollbackAction`, wait for the revert, optionally delete |
 | `cleanup` | delete batch objects whose rollback the operator has confirmed |
@@ -407,6 +461,79 @@ pending ──precheck──> precheck_passed ──run──> importing ──>
                                                    │         │
                                                    └──> failed ──rollback──> rolled_back ──retry──> pending
 ```
+
+---
+
+## The commit gate
+
+With `commit_action = "Wait"` (the default in the sample config), `run` stops
+one step short of finishing. The operator imports each VM, hands ownership to
+the Supervisor, and then holds: the VM is running under VCFA but the import is
+not final. Those VMs sit in `awaiting_commit` until you release them.
+
+This is the safety gate. Up to this point the import is reversible; after the
+commit it is not.
+
+**1. See what is waiting.**
+
+```bash
+vcfa-import status                      # "awaiting commit  2"
+vcfa-import vms --state awaiting_commit # the VMs, with wave, namespace and batch
+```
+
+**2. Release them.**
+
+```bash
+vcfa-import commit                                   # everything awaiting commit
+vcfa-import commit --wave 1                          # just this wave
+vcfa-import commit --vm vm-3082 --vm vm-3083         # named VMs, repeatable
+```
+
+`commit` lists what it is about to release, warns that it is irreversible, and
+prompts for confirmation (`-y` skips the prompt for scripted runs). It patches
+the batch, it does not wait — the operator finishes asynchronously.
+
+> **The gate lives on the batch, not the VM.** `commit` patches
+> `commitAction: Auto` onto each batch holding a selected VM, and the operator
+> then releases *every* operation still waiting in that batch. So
+> `commit --vm vm-3082` commits vm-3082's whole batch, not just vm-3082.
+>
+> Be aware that the confirmation prompt currently lists only the VMs your filter
+> matched, so it **under-reports** what a narrowed `--vm` or `--wave` will
+> actually commit. Check the `batch` column in `vms --state awaiting_commit` and
+> assume every waiting VM sharing a batch goes with it. To commit a genuine
+> subset, the VMs have to be in separate batches (`batch_size`, or a `group`
+> column in the inventory).
+
+> **`commit` does not take `--folder`.** `precheck`, `run`, `status` and
+> `rollback` all scope by folder; `commit` scopes only by `--wave` or `--vm`. If
+> you have been working through a campaign with `--folder`, drop the flag here or
+> switch to `--wave`.
+>
+> Watch the wave number too: a folder called `migration-wave3` says nothing about
+> which wave its VMs are in. Check with `vms --state awaiting_commit` rather than
+> assuming — `commit --wave 3` on wave-1 VMs reports *"no VMs are awaiting
+> commit"* and does nothing, which looks like a failure but is just an empty
+> filter.
+
+**3. Confirm it landed.**
+
+```bash
+vcfa-import status --refresh
+```
+
+The VMs move `awaiting_commit → committed` once the operator reports
+`Complete: True`.
+
+### Or hand them back instead
+
+A VM at the gate has not been committed, so it can still be returned to vCenter:
+
+```bash
+vcfa-import rollback --batch imp-w1-migration-wave3-001-5271a
+```
+
+That is the last moment this is possible. See below.
 
 ---
 
@@ -612,14 +739,42 @@ status.readyCount / readyOps      operations that passed precheck
 |---|---|
 | precheck | `ReadyForImport: True` → `precheck_passed`. `ReadyForCommit`/`Complete` stay False for a precheck-only batch and are ignored |
 | import | `ReadyForCommit: True` → `awaiting_commit`; `Complete: True` → `committed` |
+
+Children use **different condition names than their batch** — a point worth
+knowing if you ever read the CRs by hand:
+
+| | batch | child `ImportOperation` |
+|---|---|---|
+| import finished | `Complete` | `Completed` |
+| precheck verdict | `ReadyForImport: True` | `PrecheckSucceeded` |
+
+A precheck-only child carries `PrecheckSucceeded` and nothing else. A finished
+import child adds the VM-lifecycle conditions (`VirtualMachineCreated`,
+`VirtualMachineReady`, `NetworkBackingReady`, `GuestCustomization`, …) and a
+`completionTime`. Per-VM status is read from the children in preference to the
+batch, so both spellings matter.
 | any | `ObjectNotReady` → still running; the condition's message is copied onto the VM row so `vms` shows *why* it is waiting (a DNS failure on the Supervisor node looked like this) |
 
-Two observations from the lab that shape how to use it: a precheck-only batch
-creates **no** `ImportOperation` children, so per-VM detail comes from
-`readyOps`; and a precheck **passed with an invalid subnet name** — the subnet
-reference is evidently only exercised by a real import. The per-operation
-lists for failure/commit/rollback outcomes have not been observed yet; the
-names the tool tries are in `status.py` (`FAILED_OPS_KEYS` etc.).
+Three observations from the lab shape how to use it. A precheck-only batch
+**does** create `ImportOperation` children, each named after its operation with
+no batch-name prefix and owned by the batch — so two batches that name the same
+operation fight over one object, and the loser reports `number of operations
+from status: 0 does not match number of operations from spec: N` forever (see
+*Operation names* below). A precheck **passed with an invalid subnet name** —
+the subnet reference is evidently only exercised by a real import. And the
+per-operation lists for failure/commit/rollback outcomes have not been observed
+yet; the names the tool tries are in `status.py` (`FAILED_OPS_KEYS` etc.).
+
+#### Operation names
+
+Every operation name carries a five-character digest of its batch's name, so
+`ubuntu-3` in moref `vm-3079` becomes `ubuntu-3-3079-be78d` under a precheck
+batch and `ubuntu-3-3079-008cf` under the import that follows. The digest is
+derived from the batch name, so it is stable across re-planning (a resumed run
+still recognises its children) and differs for every distinct batch. A precheck
+batch can therefore be left on the cluster as a record; it no longer blocks the
+import. Two VMs that slug to the same name inside *one* batch get a counter
+appended to the digest.
 
 Anything outside that vocabulary falls back to the heuristics below.
 

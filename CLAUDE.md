@@ -55,12 +55,28 @@ learned from a real cluster — the fakes should model what was observed.
 - Conditions: `ReadyForImport` / `ReadyForCommit` / `Complete`; `False` with reason
   `ObjectNotReady` while working; `True` when reached. `readyCount`, `readyOps`.
 - A precheck-only batch ends at `ReadyForImport: True`; `Complete` never turns True.
-- The operator creates a child `ImportOperation` named after the operation
-  (`<vmname>-<moref digits>`), owned by the batch, carrying the same conditions.
-  Two batches for the same VM collide on that name.
+- The operator creates a child `ImportOperation` named after the operation,
+  owned by the batch (controller ownerRef), carrying the same conditions.
+  Precheck-only batches create children too (2026-09-21). Two batches naming the
+  same operation deadlock: the second can neither create the child nor adopt it,
+  and reports `number of operations from status: 0 does not match number of
+  operations from spec: N`. Operation names therefore carry a per-batch digest
+  (`render.batch_discriminator`) — do not remove it.
 - `subnetInfo` is `{apiGroup, kind (Subnet|SubnetSet), name}` — no namespace. In a
   VPC-backed namespace the `Subnet` lives in the VPC's own namespace and is referenced
   by plain name. Precheck **does not validate** the subnet reference.
+- **Children speak a different condition vocabulary than batches** (2026-09-23). A
+  batch's completion condition is `Complete`; a child's is `Completed`. A child states
+  its precheck verdict as `PrecheckSucceeded` (batches have no equivalent and signal a
+  pass with `ReadyForImport: True`); a precheck-only child carries that condition alone.
+  A finished import child also carries `VirtualMachineCreated`, `VirtualMachineReady`,
+  `VirtualMachineReadyForImport`, `NetworkBackingReady`, `GuestCustomization`,
+  `VirtualMachineSetManagedBySucceeded`, plus `completionTime`, `stateTransitions` and
+  `taskMonitor` in `status`. Child status wins over the batch, so reading only the batch
+  spelling left committed VMs stuck at `awaiting_commit` and failed prechecks reading as
+  "still running" until the 90-minute batch timeout. See `COMPLETE_CONDITIONS` /
+  `COND_PRECHECK_OK` in `status.py` — do not collapse them back to the batch names.
+- A batch `status` may also carry `operationPlacements` (seen 2026-09-23; unparsed).
 - Not yet observed: the per-op lists for failed/completed/rolled-back operations, the
   target VM resource name field. `status.py` tries several spellings; confirm when seen.
 - A wedged `systemd-resolved` on a Supervisor CP node showed up as
@@ -77,7 +93,7 @@ learned from a real cluster — the fakes should model what was observed.
 ## Backlog
 
 - `adopt --batch NAME`: take over a batch the tool did not create.
-- Unique operation names per batch (avoid the child-name collision).
 - `abandon` should delete the batch's `ImportOperation` children and wait for them.
-- Refuse to apply when the cluster already has an `ImportOperation` for the same vmID.
+- Refuse to apply when the cluster already has an `ImportOperation` for the same vmID
+  (still worth having for batches the tool did not create).
 - Preflight: warn when two lab workspaces (two `run/state.db`) target the same namespace.

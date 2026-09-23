@@ -27,7 +27,7 @@ from vcfaimport.config import Config  # noqa: E402
 from vcfaimport.inventory import InventoryError, load_inventory  # noqa: E402
 from vcfaimport.planner import plan_batches  # noqa: E402
 from vcfaimport.render import build_batch_manifest, to_yaml  # noqa: E402
-from vcfaimport.status import batch_status, classify  # noqa: E402
+from vcfaimport.status import batch_status, classify, operator_status  # noqa: E402
 
 RESULTS = {"pass": 0, "fail": 0}
 FAILURES = []
@@ -279,6 +279,91 @@ def t_planner_salt():
     assert a[0].name != b[0].name, (a[0].name, b[0].name)
 
 
+@test("a precheck and an import never name the same child ImportOperation")
+def t_planner_operation_names_are_per_batch():
+    # Observed 2026-09-21: the operator names each child ImportOperation after
+    # its operation and owns it from the batch. When a precheck batch and the
+    # import that follows both asked for "ubuntu-3-3079", the import could
+    # neither create nor adopt that object and reported
+    # "number of operations from status: 0 does not match ... from spec: 2"
+    # until the precheck batch was deleted.
+    cfg = Config()
+    records, _ = _sample_records()
+    pre = plan_batches(records, cfg, "run1", "precheck")
+    imp = plan_batches(records, cfg, "run1", "import")
+
+    def op_names(batches):
+        return [o["name"] for b in batches for o in b.manifest["spec"]["operations"]]
+
+    pre_names, imp_names = op_names(pre), op_names(imp)
+    eq(len(pre_names), len(records))
+    assert not (set(pre_names) & set(imp_names)), \
+        "precheck and import share a child name: {}".format(set(pre_names) & set(imp_names))
+    for name in pre_names + imp_names:
+        assert len(name) <= 63, (name, len(name))
+        assert name == name.lower().strip("-"), name
+
+    # Re-planning the same batch must reproduce the names, or a resumed run
+    # would stop recognising the children it already applied.
+    eq(op_names(plan_batches(records, cfg, "run1", "import")), imp_names, "stable")
+    # A retry salt makes a new batch, so its children are new objects too.
+    salted = op_names(plan_batches(records, cfg, "run1", "import", name_salt="run1#r2"))
+    assert not (set(salted) & set(imp_names)), salted
+
+
+@test("two VMs that slug to the same name stay distinct within one batch")
+def t_render_operation_name_within_batch():
+    from vcfaimport.inventory import Nic, VmRecord
+    from vcfaimport.render import batch_discriminator
+    cfg = Config()
+    nic = Nic(device_key=4000, subnet="sub-a", subnet_kind="Subnet",
+              subnet_api_group="crd.nsx.vmware.com")
+    # Same display name, and morefs whose trailing digits match as well.
+    records = [VmRecord(moref="vm-100", vm_name="dup", namespace="ns-a", nics=[nic], wave=1),
+               VmRecord(moref="vmx-100", vm_name="dup", namespace="ns-a", nics=[nic], wave=1)]
+    manifest = build_batch_manifest("imp-w1-g-001-abcde", "ns-a", records, cfg,
+                                    run_id="run1", wave=1)
+    names = [o["name"] for o in manifest["spec"]["operations"]]
+    eq(len(set(names)), 2, "names must stay distinct")
+    tag = batch_discriminator("imp-w1-g-001-abcde")
+    for name in names:
+        assert tag in name, (name, tag)
+        assert len(name) <= 63, name
+
+
+@test("the fake operator reproduces the child-name deadlock")
+def t_fake_operator_name_collision():
+    # Guards the simulator itself: if it stopped modelling the collision, the
+    # e2e runs would pass even with per-batch naming reverted.
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_kubectl
+
+    def batch(name, ops):
+        return {"metadata": {"name": name, "namespace": "ns-a"},
+                "spec": {"defaultSpec": {"mode": "preserve"},
+                         "operations": [{"name": o, "spec": {"virtualMachineID": "vm-1"}}
+                                        for o in ops]}}
+
+    data = {"batches": {"ns-a/pre-1": batch("pre-1", ["ubuntu-3-3079"]),
+                        "ns-a/imp-1": batch("imp-1", ["ubuntu-3-3079"])},
+            "polls": {}}
+    blocked = fake_kubectl.build_status(data["batches"]["ns-a/imp-1"], 99, "ns-a/imp-1", data)
+    eq(blocked["readyCount"], 0)
+    ready_for_import = [c for c in blocked["conditions"] if c["type"] == "ReadyForImport"][0]
+    eq(ready_for_import["status"], "False")
+    assert "does not match number of operations from spec: 1" in ready_for_import["message"], \
+        ready_for_import["message"]
+    eq(fake_kubectl.child_operations(data["batches"]["ns-a/imp-1"], blocked), [],
+       "a blocked batch creates no children")
+
+    # The first claimant is unaffected, and distinct names free both batches.
+    ok = fake_kubectl.build_status(data["batches"]["ns-a/pre-1"], 99, "ns-a/pre-1", data)
+    assert "_blocked_on" not in ok, ok
+    data["batches"]["ns-a/imp-1"] = batch("imp-1", ["ubuntu-3-3079-008cf"])
+    freed = fake_kubectl.build_status(data["batches"]["ns-a/imp-1"], 99, "ns-a/imp-1", data)
+    assert "_blocked_on" not in freed, freed
+
+
 # ---------------------------------------------------------------- status
 @test("phase strings classify into the right buckets")
 def t_status_classify():
@@ -396,6 +481,83 @@ def t_status_child_does_not_mask_pass():
     st = batch_status(batch, cfg, [child_opaque], stage="precheck")
     eq(st.by_moref()["vm-3064"].bucket, "unknown", "opaque child is unknown...")
     eq(st.bucket, "succeeded", "...but the batch verdict stands; the engine defers to it")
+
+
+@test("a child's Completed condition is read as committed, not awaiting commit")
+def t_status_child_completed_spelling():
+    """Observed 2026-09-23: batches say `Complete`, children say `Completed`.
+
+    Reading only the batch spelling left `complete` as None on every child, so
+    the ReadyForCommit branch won and two committed VMs sat at awaiting_commit
+    through every refresh -- child status wins over the batch verdict.
+    """
+    cfg = Config()
+    batch = {"metadata": {"name": "imp-w1-x-001-5271a"},
+             "spec": {"defaultSpec": {"controlAction": {"commitAction": "Auto"}}},
+             "status": {"conditions": [
+                 {"type": "Complete", "status": "True", "reason": "True"},
+                 {"type": "ReadyForCommit", "status": "True", "reason": "True"},
+                 {"type": "ReadyForImport", "status": "True", "reason": "True"}],
+                 "readyCount": 2}}
+    child = {"metadata": {"name": "ubuntu-5-3082-92323",
+                          "ownerReferences": [{"name": "imp-w1-x-001-5271a"}]},
+             "spec": {"virtualMachineID": "vm-3082"},
+             "status": {"conditions": [
+                 {"type": "Completed", "status": "True", "reason": "True"},
+                 {"type": "ReadyForCommit", "status": "True", "reason": "True"},
+                 {"type": "PrecheckSucceeded", "status": "True", "reason": "True"},
+                 {"type": "VirtualMachineCreated", "status": "True", "reason": "True"}],
+                 "completionTime": "2026-09-23T19:52:11Z"}}
+    st = batch_status(batch, cfg, [child], stage="import")
+    eq(st.by_moref()["vm-3082"].bucket, "succeeded", "Completed means committed")
+
+    # Still at the gate: ReadyForCommit true, Completed explicitly false.
+    child["status"]["conditions"][0] = {"type": "Completed", "status": "False",
+                                        "reason": "ObjectNotReady"}
+    child["status"].pop("completionTime")
+    st = batch_status(batch, cfg, [child], stage="import")
+    eq(st.by_moref()["vm-3082"].bucket, "awaiting_commit", "the gate still holds")
+
+    # The batch spelling must keep working -- batches really do say `Complete`.
+    eq(operator_status(batch, cfg, "import").bucket, "succeeded")
+
+
+@test("a child's PrecheckSucceeded verdict is read directly")
+def t_status_child_precheck_condition():
+    """Observed 2026-09-21/23: a precheck child carries PrecheckSucceeded alone.
+
+    It is not in the batch vocabulary, so a *failed* precheck child used to fall
+    through to the phase heuristics, read as "still running", and hang the batch
+    until batch_timeout_minutes (90) expired.
+    """
+    cfg = Config()
+    batch = {"metadata": {"name": "pre-w1-x-001-b5f31"},
+             "spec": {"defaultSpec": {"controlAction": {"precheckOnly": True}}},
+             "status": {"conditions": [
+                 {"type": "ReadyForImport", "status": "False", "reason": "ObjectNotReady",
+                  "message": "Operations are not ready. Operation Names: ubuntu-3-3079-6df9d"}]}}
+
+    def child(status, reason, message=""):
+        return {"metadata": {"name": "ubuntu-3-3079-6df9d",
+                             "ownerReferences": [{"name": "pre-w1-x-001-b5f31"}]},
+                "spec": {"virtualMachineID": "vm-3079"},
+                "status": {"conditions": [{"type": "PrecheckSucceeded", "status": status,
+                                           "reason": reason, "message": message}]}}
+
+    st = batch_status(batch, cfg, [child("True", "True")], stage="precheck")
+    eq(st.by_moref()["vm-3079"].bucket, "succeeded")
+
+    failed = child("False", "VirtualMachineAlreadyExists",
+                   "virtual machine with name ubuntu-3 already exists at target folder")
+    st = batch_status(batch, cfg, [failed], stage="precheck")
+    op = st.by_moref()["vm-3079"]
+    eq(op.bucket, "failed", "a named verdict is a failure, not 'still working'")
+    eq(op.phase, "VirtualMachineAlreadyExists")
+    assert "already exists" in (op.message or ""), op.message
+
+    # A transient reason is still just work in progress.
+    st = batch_status(batch, cfg, [child("False", "ObjectNotReady")], stage="precheck")
+    eq(st.by_moref()["vm-3079"].bucket, "running")
 
 
 @test("the operator's DNS stall reads as running, with the reason exposed")
@@ -1984,9 +2146,11 @@ UNIT = [
     t_precheck_no_commit,
     t_inventory_aliases, t_inventory_dupes, t_inventory_multinic, t_inventory_skip,
     t_inventory_moref_warning,
-    t_planner_grouping, t_planner_salt,
+    t_planner_grouping, t_planner_salt, t_planner_operation_names_are_per_batch,
+    t_render_operation_name_within_batch,
     t_status_classify, t_status_children, t_status_inline, t_status_empty,
     t_status_operator_precheck, t_status_child_does_not_mask_pass, t_status_operator_stall,
+    t_status_child_completed_spelling, t_status_child_precheck_condition,
     t_status_operator_import,
     t_status_conditions,
     t_filter_and, t_filter_folder, t_folder_map, t_folder_map_precedence, t_folder_tree,
@@ -2000,6 +2164,7 @@ UNIT = [
 ]
 
 E2E = [
+    t_fake_operator_name_collision,
     t_e2e_happy, t_e2e_precheck_gate, t_e2e_preflight_missing, t_e2e_flaky,
     t_e2e_init_maps, t_e2e_preflight_subnet_hint, t_e2e_preflight_vpc_subnet, t_e2e_preflight_operator_pod,
     t_e2e_running_message, t_e2e_vanished_batch, t_e2e_abandon, t_e2e_abandon_refuses_live_import,

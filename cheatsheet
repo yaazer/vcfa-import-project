@@ -1,0 +1,21 @@
+kubectl get pods -A -o wide | grep -i mobility                 # Running? which node? restarts?
+kubectl logs -n <ns> <pod> --since=15m | grep -iE 'c9672|ubuntu-2|error|reconcil' | tail -20
+kubectl get importoperationbatches -n migration-testing-ns-kcvm5   # is the OLD batch (418fa)
+
+
+
+kubectl get importoperationbatches -n migration-testing-ns-kcvm5
+kubectl get importoperations -n migration-testing-ns-kcvm5 -o yaml | grep -E 'name:|ownerReferences|uid:|deletionTimestamp|reason:|message:' 
+kubectl logs -n vmware-system-mobility-operator vmware-system-mobility-operator-controller-manager-7f9b485lppwh --since=20m | grep -iE 'exist|conflict|owner|fail' | tail
+
+
+../vcfa-import.pyz abandon --stage precheck -y        # drops ada3b from the tool's book; VM → pending
+kubectl delete importoperationbatch pre-w1-migration-wave1-001-c9672 -n migration-testing-ns-kcvm5
+kubectl get importoperationbatches,importoperations -n migration-testing-ns-kcvm5   # wait until BOTH are empty
+../vcfa-import.pyz precheck --limit 1
+
+
+kubectl describe importoperationbatch pre-w1-migration-wave1-001-c9672 -n migration-testing-ns-kcvm5 | sed -n '/^Status:/,$p'
+
+
+kubectl annotate importoperationbatch imp-w1-migration-wave1-001-69b19 -n migration-testing-ns-kcvm5 vcfa-import/kick="$(date +%s)"
