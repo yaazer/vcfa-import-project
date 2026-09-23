@@ -1,0 +1,4 @@
+vm_name,moref,namespace,subnet,device_key,wave,group,mode,notes
+app-web-01,vm-1483405,redbull-ns1-r95mc,subnet-vlan197,4000,1,,,pilot
+app-web-02,vm-1483407,redbull-ns1-r95mc,subnet-vlan197,4000,1,,,
+db-01,vm-1483411,redbull-ns2-k22ab,subnet-vlan200,4000,2,,,dual-nic example below
