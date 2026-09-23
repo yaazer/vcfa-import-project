@@ -452,6 +452,30 @@ it never touches batches it did not create.
 | `events` | the run's event log |
 | `report` | standalone HTML and/or CSV report |
 
+### Preflight vs precheck
+
+`preflight` is the **tool** checking the **environment**: read-only `kubectl`
+calls from the jump box that confirm the context is a Supervisor with the
+Mobility Operator CRDs, the operator pod is healthy, every target namespace in
+the queue exists, you may create batches in it, and every subnet the queue
+names resolves (in the namespace, or VPC-scoped in the VPC's namespace).
+Nothing is created; a failure exits 2. Run it before anything is applied and
+again after any change to the config or the maps.
+
+`precheck` is the **operator** checking the **VMs**: a real
+`ImportOperationBatch` with `precheckOnly: true`. The operator connects to
+vCenter, locates each VM and runs its compatibility checks, then stops with
+`ReadyForImport: True` instead of migrating. Each VM lands in
+`precheck_passed` or `precheck_failed` with the operator's message. It costs a
+batch object on the cluster but moves nothing, and `run` refuses a VM that has
+not passed one (`require_precheck = true`).
+
+Preflight finds the mistakes that would fail every batch the same way;
+precheck finds the per-VM problems only the operator can see. Note that
+precheck does **not** validate the subnet reference — an import with a wrong
+subnet name is only caught by the real import, which is why
+`commit_action = "Wait"` matters.
+
 ### VM lifecycle
 
 ```
