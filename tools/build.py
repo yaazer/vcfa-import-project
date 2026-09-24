@@ -30,6 +30,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+DOC_FILES = ("README.md", "LAB-GUIDE.md")
 DIST = ROOT / "dist"
 sys.path.insert(0, str(ROOT))
 from vcfaimport import __version__  # noqa: E402
@@ -42,6 +43,10 @@ def build_pyz() -> Path:
         shutil.rmtree(staging)
     shutil.copytree(ROOT / "vcfaimport", staging / "vcfaimport",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # The console's Help page shows these guides; they ship as package data.
+    (staging / "vcfaimport" / "web" / "docs").mkdir()
+    for name in DOC_FILES:
+        shutil.copy2(ROOT / name, staging / "vcfaimport" / "web" / "docs" / name)
     (staging / "__main__.py").write_text(
         "import sys\nfrom vcfaimport.cli import main\nsys.exit(main())\n", encoding="utf-8")
     out = DIST / "vcfa-import.pyz"
@@ -82,6 +87,8 @@ def build_exe() -> Path | None:
         "--hidden-import", "vcfaimport.web.server",
         "--add-data", "{}{}{}".format(ROOT / "vcfaimport" / "web" / "static", os.pathsep,
                                       "vcfaimport/web/static"),
+        *[arg for name in DOC_FILES for arg in
+          ("--add-data", "{}{}{}".format(ROOT / name, os.pathsep, "vcfaimport/web/docs"))],
         str(ROOT / "vcfa-import.py"),
     ]
     print("  running PyInstaller...")
@@ -115,8 +122,9 @@ def smoke(pyz: Path, exe: Path | None) -> None:
     # The web console's UI ships as package data; a build without it serves a blank page.
     with zipfile.ZipFile(pyz) as zf:
         names = set(zf.namelist())
-    missing = [f for f in ("index.html", "core.js", "fx.js", "views.js", "gov.js", "app.css")
+    missing = [f for f in ("index.html", "core.js", "fx.js", "views.js", "gov.js", "help.js", "app.css")
                if "vcfaimport/web/static/" + f not in names]
+    missing += [f for f in DOC_FILES if "vcfaimport/web/docs/" + f not in names]
     if missing:
         raise SystemExit("web console assets missing from the .pyz: " + ", ".join(missing))
     print("  smoke web  ok   console assets present")

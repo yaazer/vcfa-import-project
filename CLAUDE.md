@@ -54,6 +54,10 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - Secrets never hit disk: SMTP passwords via `password_env`, user tokens stored as
   sha256, remembered vCenter credentials live in memory for the console's lifetime.
 - Notifications must never break a run: delivery runs in threads and failures are events.
+- Help links point at heading slugs of README.md / LAB-GUIDE.md (GitHub rule). Renaming a
+  heading breaks them; `t_help_doc_anchors` and ui_stress `help` catch it. The guides ship
+  inside the .pyz/.exe as `vcfaimport/web/docs/` (tools/build.py); new UI terms get a
+  `GLOSSARY` entry and a `tip('key')`.
 
 ## Layout
 
@@ -77,7 +81,7 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/settings.py` | workspace settings overlay: `FIELDS` with ranges, `apply`, `update`, `describe` |
 | `vcfaimport/notify.py` | Teams / Slack / webhook / email channels, `EVENTS`, retrying delivery |
 | `vcfaimport/verify.py` | post-import checks: power, Tools, IP kept, ping, TCP ports |
-| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `views.js` (pages), `gov.js` (Change control, Settings, badges, saved views), `app.css` (token design system) |
+| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `views.js` (pages), `gov.js` (Change control, Settings, badges, saved views), `help.js` (glossary + `?` tooltips, welcome tour, offline Markdown viewer for the guides), `app.css` (token design system) |
 | `tools/web_demo.py` | the console against the fakes: `--keep ./webdemo` |
 | `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge (`govern` runs in its own workspace) |
 | `tools/fake_kubectl.py` | simulated kubectl + operator (emits the real condition vocabulary) |

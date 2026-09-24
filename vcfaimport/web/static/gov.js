@@ -156,7 +156,7 @@ VIEWS.schedule = view({
     const f = v.form, i = me();
     return html`
       ${!v.s.scheduler ? html`<div class="note warn mb">The scheduler is not running in this console, so windows will not start from here. Keep <code>vcfa-import serve</code> running, or run <code>vcfa-import schedule tick</code> every few minutes from Task Scheduler or cron.</div>` : ''}
-      <div class="card"><div class="card-h"><h3>Approvals</h3><span class="sub">${v.a.required.length ? 'two-person rule on for ' + v.a.required.join(', ') : 'the two-person rule is off — turn it on in Settings'}</span></div>
+      <div class="card"><div class="card-h"><h3>Approvals ${tip('approval')}</h3><span class="sub">${v.a.required.length ? 'two-person rule on for ' + v.a.required.join(', ') : 'the two-person rule is off — turn it on in Settings'}</span></div>
         ${pending.length ? html`<div class="stack card-b" style="gap:10px">${pending.map((x) => approvalRow(x, i))}</div>`
           : html`<div class="card-b small muted">Nothing waiting. Requests appear here when someone starts a ${v.a.required.join(' or ') || 'gated'} step.</div>`}
         ${decided.length ? html`<details class="card-b" style="border-top:1px solid var(--line)"><summary class="small" style="cursor:pointer;font-weight:600">History (${n(decided.length)})</summary>
@@ -164,7 +164,7 @@ VIEWS.schedule = view({
           ${decided.slice(0, 50).map((x) => html`<tr><td class="num">${x.id}</td><td>${x.summary}</td><td class="small">${x.requested_by}<div class="tiny faint">${fmtTime(x.requested_at, true)}</div></td>
             <td><span class="tag ${APPROVAL_TONE[x.state] || ''}">${x.state}</span></td><td class="small">${x.decided_by || ''}<div class="tiny faint">${fmtTime(x.decided_at, true)}</div></td><td class="small muted">${x.note || ''}</td></tr>`)}</tbody></table></details>` : ''}
       </div>
-      <div class="card mt"><div class="card-h"><h3>Change windows</h3><span class="sub">next 7 days</span></div>
+      <div class="card mt"><div class="card-h"><h3>Change windows ${tip('change_window')}</h3><span class="sub">next 7 days</span></div>
         <div class="card-b">${timeline(open.concat(past))}</div>
         ${open.length ? html`<div class="table-wrap" style="border-top:1px solid var(--line)"><table class="t compact"><thead><tr><th>#</th><th>Runs</th><th>Window</th><th>State</th><th>By</th><th></th></tr></thead><tbody>
           ${open.map((x) => html`<tr><td class="num">${x.id}</td><td><b>${x.stage}</b> ${scheduleScope(x.body)}</td>
@@ -190,7 +190,7 @@ VIEWS.schedule = view({
             <label class="field"><span>Closes</span><input class="input" type="datetime-local" id="w-end" data-input="fTime" data-k="end" value="${f.end}"></label>
             <label class="field"><span>Folder scope (optional)</span><input class="input" data-input="fTime" data-k="folder" value="${f.folder}" placeholder="every folder"></label>
           </div>
-          <div id="w-fit">${fitNote(v)}</div>
+          <div id="w-fit">${fitNote(v)}</div><div class="tiny faint">How the estimate is made ${tip('eta')}</div>
           ${S.info.features.require_approval.includes(f.stage) ? html`<div class="note info">${f.stage} needs a second person: the window waits for approval, and is cancelled if it is rejected or not approved before it closes.</div>` : ''}
         </div>
         <div class="card-f"><button class="btn primary" data-act="createWindow" ${attr(!can('operator'), 'disabled')}>${icon('calendar')} Schedule ${f.stage}</button>
@@ -319,7 +319,7 @@ VIEWS.settings = view({
     return html`
       ${admin ? '' : html`<div class="note warn mb">You are signed in as <b>${me().name}</b> (${me().role}). Only an admin can change settings; they are shown read-only.</div>`}
       <div class="note info mb">Values here override the TOML file for this workspace, for the console and the CLI alike. <b>↺</b> returns a setting to the file's value. Every change is recorded in the event log with who made it.</div>
-      <div class="grid two settings-grid">${Object.entries(groups).map(([g, rows]) => html`<div class="card"><div class="card-h"><h3>${g}</h3></div>
+      <div class="grid two settings-grid">${Object.entries(groups).map(([g, rows]) => html`<div class="card"><div class="card-h"><h3>${g} ${tip(SETTING_TIPS[g] || 'workspace_setting')}</h3></div>
         <div class="card-b stack" style="gap:14px">${rows.map((r) => settingField(v, r, admin))}</div></div>`)}</div>
       ${notifyCard(v, admin)}
       ${admin ? usersCard(v) : ''}
@@ -425,6 +425,7 @@ Object.assign(GLOBAL_ACT, {
 async function refreshInfo() {
   try { S.info = await GET('/api/info'); renderTopbar(); } catch (e) { /* keep the old info */ }
 }
+const SETTING_TIPS = { Pacing: 'parallel', Safety: 'circuit_breaker', Governance: 'approval', Applications: 'app', Verification: 'verification' };
 function settingField(v, r, admin) {
   const val = r.key in v.changes ? v.changes[r.key] : r.value;
   const changed = r.key in v.changes;
@@ -453,7 +454,7 @@ function settingField(v, r, admin) {
 function notifyCard(v, admin) {
   const c = v.newCh, ev = v.s.events;
   const email = c.type === 'email';
-  return html`<div class="card mt"><div class="card-h"><h3>Notifications</h3><span class="sub">Teams, Slack, a webhook or email — when runs finish, fail, need a decision</span>
+  return html`<div class="card mt"><div class="card-h"><h3>Notifications ${tip('notify')}</h3><span class="sub">Teams, Slack, a webhook or email — when runs finish, fail, need a decision</span>
       <div class="tools">${v.notify.length ? html`<button class="btn sm" data-act="chTest" ${attr(!admin, 'disabled')}>${icon('bell')} Send a test to all</button>` : ''}</div></div>
     ${v.notify.length ? html`<div class="table-wrap"><table class="t compact"><thead><tr><th>Channel</th><th>Type</th><th>Where</th><th>Events</th><th>On</th><th></th></tr></thead><tbody>
       ${v.notify.map((ch, i) => html`<tr><td><b>${ch.name}</b></td><td><span class="tag">${ch.type}</span></td>
@@ -480,7 +481,7 @@ function notifyCard(v, admin) {
       <div class="card-f"><button class="btn" data-act="chAdd">${icon('plus')} Add channel</button><span class="small muted">Added channels are saved with the Save button below.</span></div>` : ''}</div>`;
 }
 function usersCard(v) {
-  return html`<div class="card mt"><div class="card-h"><h3>People</h3><span class="sub">personal links; everything they do is recorded under their name</span></div>
+  return html`<div class="card mt"><div class="card-h"><h3>People ${tip('roles')}</h3><span class="sub">personal links; everything they do is recorded under their name</span></div>
     <div class="table-wrap"><table class="t compact"><thead><tr><th>User</th><th>Role</th><th>Created</th><th>Last seen</th><th></th></tr></thead><tbody>
       <tr><td><b>owner</b> <span class="tiny faint">the link printed at start-up</span></td><td><span class="tag">admin</span></td><td></td><td></td><td></td></tr>
       ${(v.users || []).map((u) => html`<tr class="${u.disabled ? 'off' : ''}"><td><b>${u.name}</b></td><td><span class="tag ${u.role === 'admin' ? 'warn' : u.role === 'viewer' ? '' : 'info'}">${u.role}</span></td>

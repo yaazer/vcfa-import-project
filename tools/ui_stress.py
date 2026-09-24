@@ -83,6 +83,8 @@ window.addEventListener('unhandledrejection', (e) => H.errors.push('rejection: '
 const HP = new URLSearchParams(location.search);
 H.scenario = HP.get('s');
 store.set('vcfa-token', HP.get('bad') ? 'wrong-token' : HP.get('t'));
+// The first-visit welcome would cover every page; only the help scenario wants it.
+store.set('vcfa-welcome', 'done');
 if (HP.get('theme')) store.set('vcfa-theme', HP.get('theme'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function flush() {
@@ -134,6 +136,8 @@ function overflowers() {
   }
   return out.slice(0, 6).join(' | ');
 }
+// An element's own text, without the "?" help marks inside it.
+const ownText = (el) => [...el.childNodes].filter((n) => !(n.classList && n.classList.contains('tipq'))).map((n) => n.textContent).join('').trim();
 const noInjection = () => !window.__pwned && !document.querySelector('[data-evil]') && !document.querySelector('img[src="x"]');
 function click(sel, root) {
   const el = typeof sel === 'string' ? (root || document).querySelector(sel) : sel;
@@ -160,7 +164,7 @@ const counts = async () => (await GET('/api/overview')).counts;
 
 const SCENARIOS = {
   async pages() {
-    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'activity', 'schedule', 'settings']) {
+    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'activity', 'schedule', 'settings', 'help']) {
       const ok = await open(id);
       check('renders ' + id, ok);
       check('no error box on ' + id, !brokeView(), brokeView());
@@ -170,6 +174,11 @@ const SCENARIOS = {
     for (const tab of ['jobs', 'events', 'movement', 'exports']) {
       await open('activity', 'tab=' + tab);
       check('activity tab ' + tab + ' renders', !brokeView() && document.querySelector('.tabs button.on').textContent.length > 0);
+    }
+    for (const q of ['doc=lab', 'doc=readme', 'tab=glossary']) {
+      await open('help', q);
+      check('help ' + q + ' renders', !brokeView() && noInjection());
+      if (HP.get('narrow')) check('no page-level horizontal scroll on help ' + q, document.documentElement.scrollWidth <= innerWidth + 2, document.documentElement.scrollWidth + ' > ' + innerWidth + ': ' + overflowers());
     }
   },
 
@@ -505,7 +514,7 @@ const SCENARIOS = {
 
     // ---- settings: guardrails, a save bar, refusals explained
     await open('settings');
-    const groups = [...document.querySelectorAll('#view .card-h h3')].map((h) => h.textContent);
+    const groups = [...document.querySelectorAll('#view .card-h h3')].map(ownText);
     check('settings show every group', ['Pacing', 'Safety', 'Governance', 'Applications', 'Verification'].every((g) => groups.includes(g)), groups.join(','));
     click('[data-act="toggle"][data-k="app_together"]');
     check('a change raises the save bar', await waitFor(() => document.querySelector('.stickybar [data-act="save"]')));
@@ -657,7 +666,7 @@ const SCENARIOS = {
 
     // ---- queue: verification
     await open('queue', 'state=committed');
-    check('the queue has a Verified column', [...document.querySelectorAll('#view th')].some((x) => x.textContent === 'Verified'));
+    check('the queue has a Verified column', [...document.querySelectorAll('#view th')].some((x) => ownText(x) === 'Verified'));
     click('#view tbody input[data-act="chk"]');
     await sleep(100);
     since = await jobIds();
@@ -670,12 +679,170 @@ const SCENARIOS = {
     check('governance pages never broke', !brokeView() && noInjection());
   },
 
+  async help() {
+    const count = () => { const c = document.querySelector('.tour-card .tour-count'); return c ? parseInt(c.textContent, 10) : 0; };
+    const key = (k) => document.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+
+    // ---- first visit: the welcome, then the whole tour
+    store.set('vcfa-welcome', null);
+    HELP.maybeWelcome();
+    const welcome = await waitFor(() => document.querySelector('.tour-card.center'), 5000);
+    check('a first visit opens the welcome', welcome && /Welcome/.test(welcome.textContent));
+    check('the welcome says the tour changes nothing', welcome && /changes nothing/.test(welcome.textContent));
+    check('it offers the lab guide straight away', document.querySelector('.tour-card [data-tour="lab"]'));
+    click('[data-tour="next"]');
+    const n = HELP.TOUR_STEPS.length;
+    let seen = 0, spotted = 0;
+    const off = [], wrong = [];
+    for (let k = 1; k < n; k++) {
+      if (!(await waitFor(() => count() === k, 8000))) { H.notes.push('tour stuck before step ' + k); break; }
+      seen++;
+      if (document.querySelector('.tour-spot')) spotted++;
+      const want = HELP.TOUR_STEPS[k].route;
+      if (want && S.route !== want) wrong.push(k + ':' + S.route);
+      const r = document.querySelector('.tour-card').getBoundingClientRect();
+      if (r.left < 0 || r.top < 0 || r.right > innerWidth + 1 || r.bottom > innerHeight + 1) off.push(k);
+      if (k === 2) {
+        key('ArrowLeft');
+        check('the Left arrow goes back a step', await waitFor(() => count() === 1, 5000));
+        key('ArrowRight');
+        check('and Right goes forward', await waitFor(() => count() === 2, 5000));
+      }
+      if (k < n - 1) click('[data-tour="next"]');
+    }
+    check('every tour step renders', seen === n - 1, seen + ' of ' + (n - 1));
+    check('the steps spotlight what they talk about', spotted >= seen - 1, spotted + ' of ' + seen);
+    check('every tour card stays on screen', !off.length, off.join(','));
+    check('the tour opens each page it talks about', !wrong.length, wrong.join(','));
+    click('[data-tour="next"]');
+    check('Finish closes the tour', await waitFor(() => !document.querySelector('#tour-root')));
+    check('and the welcome does not come back', store.get('vcfa-welcome') === 'done');
+    HELP.startTour(3);
+    await waitFor(() => document.querySelector('.tour-card'));
+    key('Escape');
+    check('Escape ends the tour', await waitFor(() => !document.querySelector('#tour-root')));
+
+    // ---- tooltips
+    await open('execute');
+    const tipBox = () => { const t = document.getElementById('tip'); return t && !t.hidden ? t : null; };
+    const pf = document.querySelector('.steps .tipq[data-tip="preflight"]');
+    pf.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+    const t1 = await waitFor(tipBox, 3000);
+    check('hovering a ? explains it', t1 && /Preflight/.test(t1.textContent) && /read-only/.test(t1.textContent), t1 && t1.textContent);
+    const tr = t1 && t1.getBoundingClientRect();
+    check('the tooltip stays on screen', tr && tr.left >= 0 && tr.right <= innerWidth && tr.top >= 0 && tr.bottom <= innerHeight);
+    pf.dispatchEvent(new PointerEvent('pointerout', { bubbles: true, relatedTarget: document.body }));
+    check('and leaving hides it', await waitFor(() => !tipBox(), 3000));
+    const chip = document.querySelector('.ctxchip[data-tip="commit_action"]');
+    chip.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+    const t2 = await waitFor(tipBox, 3000);
+    check('the commit chip explains commitAction for this workspace', t2 && /commitAction: (Auto|Wait)/.test(t2.textContent));
+    check('Auto is flagged as irreversible', !/Auto/.test(t2.textContent) || (t2.classList.contains('bad') && /never be handed back/.test(t2.textContent)));
+    key('Escape');
+    await waitFor(() => !tipBox(), 2000);
+    click(pf);
+    check('clicking a ? pins it', await waitFor(() => tipBox() && tipBox().classList.contains('pinned'), 3000));
+    pf.dispatchEvent(new PointerEvent('pointerout', { bubbles: true, relatedTarget: document.body }));
+    await sleep(400);
+    check('a pinned tooltip stays when the pointer leaves', tipBox());
+    const link = tipBox() && tipBox().querySelector('a.tip-l');
+    check('it links into the lab guide', link && /doc=lab/.test(link.getAttribute('href')));
+    if (link) {
+      link.click();
+      const hd = await waitFor(() => S.route === 'help' && S.view.loaded && document.getElementById('h-5-preflight-and-validate--nothing-applied-yet'), 8000);
+      check('the link lands on the right section of the guide', hd && hd.getBoundingClientRect().top < innerHeight / 2 && hd.getBoundingClientRect().top > -5, hd && hd.getBoundingClientRect().top);
+      check('and the tooltip closes', !tipBox());
+    }
+    await open('discover');
+    const tls = document.querySelector('input[data-k="insecure"]');
+    const before = tls.checked;
+    click('.tipq[data-tip="insecure"]');
+    await sleep(150);
+    check('a ? inside a checkbox label does not tick the box', tls.checked === before && tipBox() && /TLS/.test(tipBox().textContent));
+    key('Escape');
+    await open('select');
+    const sortKey = S.view.sort.key;
+    const thq = document.querySelector('th .tipq[data-tip="readiness"]');
+    if (thq) {
+      click(thq);
+      await sleep(150);
+      check('a ? in a column header does not sort the table', S.view.sort.key === sortKey && tipBox());
+      key('Escape');
+    }
+    await open('queue');
+    const pillEl = document.querySelector('#view .pill[data-tip]');
+    pillEl.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
+    check('status pills explain themselves', await waitFor(() => tipBox() && tipBox().textContent.length > 20, 3000), pillEl.textContent);
+    pillEl.dispatchEvent(new PointerEvent('pointerout', { bubbles: true, relatedTarget: document.body }));
+    await waitFor(() => !tipBox(), 2000);
+
+    // ---- every ? on every page has an explanation
+    const missing = new Set();
+    let marks = 0;
+    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'triage', 'schedule', 'settings', 'help']) {
+      await open(id);
+      document.querySelectorAll('[data-tip]').forEach((el) => { marks++; if (!HELP.glossary(el.dataset.tip)) missing.add(id + ':' + el.dataset.tip); });
+    }
+    check('every ? has an explanation', !missing.size && marks > 30, [...missing].join(', ') + ' / ' + marks + ' marks');
+
+    // ---- every link into the guides lands on a heading
+    const ids = {}, htmls = {};
+    for (const d of ['lab', 'readme']) {
+      htmls[d] = HELP.mdBlocks((await GET('/api/docs/' + d)).markdown, d).html;
+      ids[d] = new Set([...htmls[d].matchAll(/ id="h-([^"]+)"/g)].map((m) => m[1]));
+    }
+    const refs = Object.values(HELP.GLOSSARY).map((g) => g.doc).concat(HELP.TOUR_STEPS.map((x) => x.doc)).filter(Boolean);
+    const broken = refs.filter(([d, h]) => !ids[d].has(h)).map((r) => r.join('#'));
+    check('every tooltip and tour link lands on a heading', !broken.length && refs.length > 20, broken.join(', '));
+    const inDoc = [];
+    for (const d of ['lab', 'readme']) {
+      for (const m of htmls[d].matchAll(/href="#\/help\?doc=(\w+)&amp;h=([^"]+)"/g)) if (!ids[m[1]].has(decodeURIComponent(m[2]))) inDoc.push(d + '->' + m[1] + '#' + m[2]);
+    }
+    check('links inside the guides resolve', !inDoc.length, inDoc.join(', '));
+
+    // ---- the guides render, safely
+    await open('help', 'doc=lab');
+    check('the lab guide renders with a table of contents', document.querySelectorAll('.toc a').length > 10, document.querySelectorAll('.toc a').length);
+    check('angle brackets in the guide are shown as text', document.querySelector('.doc').textContent.includes('<target-namespace>') && noInjection());
+    check('code blocks render', document.querySelectorAll('.doc pre.code').length > 5);
+    const ext = document.querySelector('.doc a[target="_blank"]');
+    check('outside links open in a new tab without opener', ext && /noopener/.test(ext.rel));
+    await open('help', 'doc=readme&h=the-two-person-rule');
+    const h2 = await waitFor(() => document.getElementById('h-the-two-person-rule'));
+    check('a deep link scrolls to its heading', h2 && h2.getBoundingClientRect().top > -5 && h2.getBoundingClientRect().top < innerHeight / 2, h2 && h2.getBoundingClientRect().top);
+    check('README tables render', document.querySelectorAll('.doc table').length > 3);
+    await open('help', 'tab=glossary');
+    const all = document.querySelectorAll('.gloss').length;
+    type('#gloss-q', 'irreversible');
+    check('the glossary searches', await waitFor(() => { const k = document.querySelectorAll('.gloss').length; return k > 0 && k < all; }, 3000), all);
+
+    // ---- hints can be hidden
+    HELP.setHints(false);
+    await open('execute');
+    check('hiding hints hides every ?', [...document.querySelectorAll('.tipq:not(.static)')].every((x) => getComputedStyle(x).display === 'none'));
+    HELP.setHints(true);
+    await open('execute');
+    check('and showing brings them back', [...document.querySelectorAll('.tipq')].some((x) => getComputedStyle(x).display !== 'none'));
+
+    // ---- the palette and the topbar lead here too
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
+    const pq = await waitFor(() => document.getElementById('cmdk-q'));
+    type(pq, 'tour');
+    check('the palette offers the tour', await waitFor(() => [...document.querySelectorAll('.cmdk-item')].some((i) => /Take the tour/.test(i.textContent))));
+    document.getElementById('cmdk-q').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    click('[data-act="help"]');
+    check('the ? button in the topbar opens Help', await waitFor(() => S.route === 'help'));
+    check('help never broke', !brokeView() && noInjection());
+  },
+
   async shot() {   // tools only: open one page and let it settle, for a screenshot
     if (HP.get('by')) FX.set({ streamBy: HP.get('by') });
     await open(HP.get('page') || 'overview', HP.get('q') || '');
     if (S.view) S.view.render();
     await sleep(800);
     if (window.FX) FX.drawNow();
+    if (HP.get('tour')) { HELP.startTour(+HP.get('tour')); await waitFor(() => document.querySelector('.tour-card'), 8000); await sleep(700); }
+    if (HP.get('tip')) { const q = document.querySelector('.tipq[data-tip="' + HP.get('tip') + '"]'); if (q) q.click(); await sleep(300); }
   },
 
   async scale() {
@@ -731,10 +898,9 @@ document.addEventListener('DOMContentLoaded', () => {
 # ------------------------------------------------------------------ plumbing
 def install_harness(harness_dir):
     index = web_server._static("index.html").decode("utf-8")
-    index = index.replace('<script src="/static/gov.js" defer></script>',
-                          '<script src="/static/gov.js" defer></script>\n'
-                          '<script src="/static/h_harness.js" defer></script>')
-    assert "h_harness.js" in index, "index.html no longer loads gov.js last"
+    # Last in <head>: the harness runs after every console script.
+    index = index.replace('</head>', '<script src="/static/h_harness.js" defer></script>\n</head>', 1)
+    assert "h_harness.js" in index
 
     (harness_dir / "h_index.html").write_text(index, encoding="utf-8")
     (harness_dir / "h_harness.js").write_text(HARNESS_JS, encoding="utf-8")
@@ -841,7 +1007,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme", "palette", "stream", "govern"]
+             "resilience", "token", "theme", "palette", "stream", "govern", "help"]
 
 
 def main():

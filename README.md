@@ -76,6 +76,7 @@ one workspace, and a batch started from either shows up in both.
 | **Activity & logs** | Every job's full log (searchable, *problems only*), the event log with who did what, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
 | **Change control** | Change windows on a week timeline (plan one and see whether the work fits before it closes), and the approvals queue for the two-person rule |
 | **Settings** | Guardrails (pacing, safety, governance, applications, verification) with their file values and allowed ranges, notification channels with a *Test* button, and people: personal links for viewers, operators and admins |
+| **Help & guides** | The welcome tour, a step-by-step *first import*, this README and the lab guide rendered offline with a table of contents, and a searchable glossary |
 
 **Look and feel.** The Overview opens on the **Migration Stream**: every VM is a
 particle, flowing from vCenter through precheck and import into VCF Automation,
@@ -94,6 +95,14 @@ turn it amber, a running job quickens it, and a finished campaign blooms.
 - **Stream lanes**: the Migration Stream flows by stage, or regroups its
   particles into one lane per wave, namespace or application, coloured by state.
 - **Density**: *Compact* in the Theme Studio fits more rows on a screen.
+
+**Help while you work.** The first visit opens a two-minute welcome tour
+(it changes nothing; re-run it from *Help & guides* or `Ctrl+K`). A small **?**
+sits next to every value that matters -- commitAction, batch size, dry run,
+the maps, the subnet, readiness and more -- and explains it on hover or tap,
+with a link to the right section of the lab guide or this README, which the
+console carries offline. Status pills explain themselves too. Experts can
+hide the marks under *Help & guides -> Hints*.
 
 Long operations run as background **jobs**. Their log streams into a panel at
 the bottom of every page, and is kept under `<workdir>/jobs/` so it survives a

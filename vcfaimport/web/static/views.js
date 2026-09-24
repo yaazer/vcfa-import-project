@@ -122,18 +122,18 @@ VIEWS.discover = view({
           <div class="form-grid">
             <label class="field"><span>vCenter server</span><input class="input" id="f-server" data-input="field" data-k="server" value="${f.server}" placeholder="vcenter.example.local" autocomplete="off"></label>
             <label class="field"><span>User</span><input class="input" id="f-user" data-input="field" data-k="user" value="${f.user}" placeholder="administrator@vsphere.local" autocomplete="username"></label>
-            <label class="field"><span>Password</span><input class="input" id="f-pass" type="password" data-input="field" data-k="password" value="${f.password}" data-enter="discover"
+            <label class="field"><span>Password ${tip('vc_password')}</span><input class="input" id="f-pass" type="password" data-input="field" data-k="password" value="${f.password}" data-enter="discover"
               placeholder="${vc.password_from_env ? 'from VCFA_VC_PASSWORD' : ''}" autocomplete="current-password">
               <small>Used for this discovery only; never stored.</small></label>
-            <label class="field"><span>Parallel detail reads</span><input class="input" type="number" min="1" max="32" id="f-conc" data-input="field" data-k="concurrency" value="${f.concurrency}"></label>
+            <label class="field"><span>Parallel detail reads ${tip('concurrency')}</span><input class="input" type="number" min="1" max="32" id="f-conc" data-input="field" data-k="concurrency" value="${f.concurrency}"></label>
           </div>
           <div class="row wrap" style="gap:18px">
-            <label class="check"><input type="checkbox" data-change="field" data-k="powered_on" ${attr(f.powered_on, 'checked')}> Powered-on VMs only</label>
-            <label class="check"><input type="checkbox" data-change="field" data-k="no_tools" ${attr(f.no_tools, 'checked')}> Skip the VM Tools check</label>
-            <label class="check"><input type="checkbox" data-change="field" data-k="insecure" ${attr(f.insecure, 'checked')}> Skip TLS verification</label>
-            <label class="check"><input type="checkbox" data-change="field" data-k="no_tags" ${attr(f.no_tags, 'checked')}> Skip vCenter tags</label>
+            <label class="check"><input type="checkbox" data-change="field" data-k="powered_on" ${attr(f.powered_on, 'checked')}> Powered-on VMs only ${tip('powered_on')}</label>
+            <label class="check"><input type="checkbox" data-change="field" data-k="no_tools" ${attr(f.no_tools, 'checked')}> Skip the VM Tools check ${tip('no_tools')}</label>
+            <label class="check"><input type="checkbox" data-change="field" data-k="insecure" ${attr(f.insecure, 'checked')}> Skip TLS verification ${tip('insecure')}</label>
+            <label class="check"><input type="checkbox" data-change="field" data-k="no_tags" ${attr(f.no_tags, 'checked')}> Skip vCenter tags ${tip('no_tags')}</label>
           </div>
-          <label class="check small"><input type="checkbox" data-change="field" data-k="remember" ${attr(f.remember, 'checked')}> Keep these credentials in memory for post-import verification
+          <label class="check small"><input type="checkbox" data-change="field" data-k="remember" ${attr(f.remember, 'checked')}> Keep these credentials in memory for post-import verification ${tip('remember')}
             <span class="muted">(never written to disk; gone when the console stops)</span></label>
           ${f.insecure ? html`<div class="note warn">TLS verification is off: fine for a lab with a self-signed certificate, not for production.</div>` : ''}
           <div id="disc-progress">${running ? discProgress(S.pulse.job) : ''}</div>
@@ -259,7 +259,7 @@ VIEWS.select = view({
     const f = v.f;
     const allOnPage = pageRows.length && pageRows.every((x) => x.selected);
     return html`<div class="grid side">
-      <div class="card"><div class="card-h"><h3>Folders</h3><span class="sub">${plural(v.vms.length, 'VM')}</span></div>
+      <div class="card"><div class="card-h"><h3>Folders ${tip('selection')}</h3><span class="sub">${plural(v.vms.length, 'VM')}</span></div>
         <div class="tree" data-scroll="tree">
           <div class="tnode ${f.folder === null ? 'on' : ''}" data-act="folder" data-path="" data-all="1"><span class="caret"></span><span class="name">All folders</span><span class="cnt"><b>${n(selCount)}</b> / ${n(v.vms.length)}</span></div>
           ${treeHtml(v)}</div></div>
@@ -283,9 +283,9 @@ VIEWS.select = view({
             <button class="btn sm" data-act="selMatching" data-on="0" ${attr(!inViewSel, 'disabled')}>Deselect</button>
             <span class="grow"></span>
             <input class="input sm" id="bulk-ns" list="ns-list" placeholder="namespace" style="width:180px">
-            <button class="btn sm" data-act="bulkNs" ${attr(!inViewSel, 'disabled')}>Set namespace</button>
+            <button class="btn sm" data-act="bulkNs" ${attr(!inViewSel, 'disabled')}>Set namespace</button>${tip('namespace')}
             <input class="input sm" id="bulk-wave" type="number" min="0" placeholder="wave" style="width:74px">
-            <button class="btn sm" data-act="bulkWave" ${attr(!inViewSel, 'disabled')}>Set wave</button>
+            <button class="btn sm" data-act="bulkWave" ${attr(!inViewSel, 'disabled')}>Set wave</button>${tip('wave')}
             <input class="input sm" id="bulk-app" list="app-list" placeholder="application" style="width:140px">
             <button class="btn sm" data-act="bulkApp" ${attr(!inViewSel, 'disabled')}>Set app</button>
             <datalist id="ns-list">${nss.map((x) => html`<option value="${x}">`)}</datalist>
@@ -294,7 +294,7 @@ VIEWS.select = view({
           <div class="table-wrap"><table class="t">
             <thead><tr><th class="chk"><input type="checkbox" data-act="selPage" title="Select this page" ${attr(allOnPage, 'checked')}></th>
               ${th(v, 'name', 'VM')}${th(v, 'folder', 'Folder · cluster')}${th(v, 'networks', 'Networks')}
-              ${th(v, 'cpu_count', 'Size')}${th(v, 'power_state', 'Power · Tools')}${th(v, 'readiness', 'Ready')}${th(v, 'app', 'App · tags')}${th(v, 'namespace', 'Namespace')}${th(v, 'wave', 'Wave')}<th>Queue</th></tr></thead>
+              ${th(v, 'cpu_count', 'Size')}${th(v, 'power_state', 'Power · Tools')}${th(v, 'readiness', html`Ready ${tip('readiness')}`)}${th(v, 'app', html`App · tags ${tip('app')}`)}${th(v, 'namespace', 'Namespace')}${th(v, 'wave', 'Wave')}<th>Queue</th></tr></thead>
             <tbody>${pageRows.map((x, i) => html`<tr class="${x.selected ? 'on' : ''}">
               <td class="chk"><input type="checkbox" data-act="sel" data-moref="${x.moref}" data-i="${v.page * PAGE + i}" ${attr(x.selected, 'checked')}></td>
               <td><span class="vm-name">${x.name}<small>${x.moref}</small></span></td>
@@ -457,25 +457,25 @@ VIEWS.stage = view({
         <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.</div>
       <datalist id="ns-options">${nsOptions.map((x) => html`<option value="${x}">`)}</datalist>
       <div class="grid two mt">
-        <div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
+        <div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
           <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage)}</div></div>
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'f')}</div>
-          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="f">${icon('plus')} Add entry</button><span class="small muted">Globs allowed, e.g. <code>Legacy/*</code>. A folder covers its whole subtree.</span></div></div>
-        <div class="card"><div class="card-h"><h3>Networks → subnet</h3><span class="sub mono tiny" title="${v.maps.network.path}">${v.maps.network.path.split(/[\\/]/).pop()}</span>
-          <div class="tools"><label class="check small"><input type="checkbox" data-change="adv" ${attr(v.adv, 'checked')}> Advanced columns</label></div></div>
+          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="f">${icon('plus')} Add entry</button><span class="small muted">Globs allowed, e.g. <code>Legacy/*</code>. A folder covers its whole subtree.</span>${tip('batch_group')}</div></div>
+        <div class="card"><div class="card-h"><h3>Networks → subnet ${tip('portgroup_map')}</h3><span class="sub mono tiny" title="${v.maps.network.path}">${v.maps.network.path.split(/[\\/]/).pop()}</span>
+          <div class="tools"><label class="check small"><input type="checkbox" data-change="adv" ${attr(v.adv, 'checked')}> Advanced columns</label>${tip('device_key')}</div></div>
           <div class="card-b"><div class="small muted mb">Portgroups of the selected VMs</div><div id="cov-networks" class="cov">${covNetworks(p.coverage)}</div></div>
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'n')}</div>
-          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="n">${icon('plus')} Add entry</button><span class="small muted">In a VPC namespace, name the Subnet as it appears in the VPC's own namespace.</span></div></div>
+          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="n">${icon('plus')} Add entry</button><span class="small muted">In a VPC namespace, name the Subnet as it appears in the VPC's own namespace.</span>${tip('subnet')}</div></div>
       </div>
       <details class="card mt tagmap" ${attr(v.tr.length || (p.coverage.tags || []).length && v.tagOpen !== false, 'open')} data-toggle="tagOpen">
-        <summary class="card-h"><h3>${icon('tag')} vCenter tags → namespace &amp; wave</h3><span class="sub">optional · beats the folder map · <span class="mono tiny">${v.maps.tag.path.split(/[\\/]/).pop()}</span></span></summary>
+        <summary class="card-h"><h3>${icon('tag')} vCenter tags → namespace &amp; wave ${tip('tag_map')}</h3><span class="sub">optional · beats the folder map · <span class="mono tiny">${v.maps.tag.path.split(/[\\/]/).pop()}</span></span></summary>
         <div class="card-b"><div class="small muted mb">Tags on the selected VMs</div><div id="cov-tags" class="cov">${covTags(p.coverage)}</div></div>
         <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 't')}</div>
         <div class="card-f"><button class="btn sm" data-act="addRow" data-m="t">${icon('plus')} Add entry</button><span class="small muted">Tags are <code>Category:Tag</code>; globs allowed, e.g. <code>Application:*</code>. An exact tag beats a glob.</span></div></details>
       <div class="card mt"><div class="card-h"><h3>Result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
-        <div class="tools"><label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default namespace</span>
+        <div class="tools"><label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default namespace ${tip('default_namespace')}</span>
           <input class="input sm" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none — report instead" style="width:200px"></label>
-          <label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default wave</span>
+          <label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default wave ${tip('default_wave')}</span>
           <input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px"></label></div></div>
         <div id="stage-preview">${stagePreview(v)}</div></div>
       <div class="callout stickybar" style="background:var(--panel)"><div class="ic">${icon('stage')}</div>
@@ -646,11 +646,11 @@ VIEWS.waves = view({
         <div class="search">${icon('search')}<input class="input" id="wave-q" placeholder="Find a VM or folder…" value="${v.q}" data-input="q"></div>
         ${q ? html`<span class="small muted">${plural(hits.length, 'match', 'matches')}</span>` : ''}
         <button class="btn sm ghost" data-act="expand" data-on="1">Expand all</button><button class="btn sm ghost" data-act="expand" data-on="0">Collapse all</button>
-        ${hasApps ? html`<label class="check small" title="Moving one VM of an application moves all of it"><input type="checkbox" data-change="withApp" ${attr(v.withApp, 'checked')}> Move whole apps</label>` : ''}
+        ${hasApps ? html`<label class="check small" title="Moving one VM of an application moves all of it"><input type="checkbox" data-change="withApp" ${attr(v.withApp, 'checked')}> Move whole apps</label>${tip('app_together')}` : ''}
         <span class="grow"></span>
         ${v.sel.size ? html`<span class="small"><b>${n(v.sel.size)}</b> selected</span>
           <button class="btn sm primary" data-act="moveSel">${icon('waves')} Move to wave…</button>
-          <button class="btn sm" data-act="clearSel">Clear</button>` : html`<span class="small muted">${icon('lock')} locked VMs are already in a batch or committed</span>`}
+          <button class="btn sm" data-act="clearSel">Clear</button>` : html`<span class="small muted">${icon('lock')} locked VMs are already in a batch or committed</span>${tip('locked')}`}
       </div></div>
       <div class="board" data-scroll="board">
         ${waves.map((w, idx) => waveColumn(v, w, idx, waves, hitSet, q))}
@@ -826,7 +826,7 @@ VIEWS.execute = view({
       [c.awaiting_commit ? 'warn' : '', 'Commit', s.commit_action === 'Auto' ? 'Automatic (commitAction Auto)' : n(c.awaiting_commit || 0) + ' held for approval'],
     ];
     return html`
-      <div class="steps">${steps.map(([st, t, d], i) => html`<div class="step ${st}"><span class="n">${st === 'done' ? icon('check') : i + 1}</span><div><h4>${t}</h4><p>${d}</p></div></div>`)}</div>
+      <div class="steps">${steps.map(([st, t, d], i) => html`<div class="step ${st}"><span class="n">${st === 'done' ? icon('check') : i + 1}</span><div><h4>${t} ${tip(['preflight', 'precheck', 'import', 'commit'][i])}</h4><p>${d}</p></div></div>`)}</div>
       <div class="mt">${FX.streamHtml(o, { compact: true })}</div>
       ${job && ['execute', 'rollback', 'watch', 'commit'].includes(job.kind) ? html`<div class="callout mt"><div class="ic"><span class="spinner"></span></div>
         <div class="grow"><h3>${job.title}</h3><p>${job.stop_requested ? 'Stopping: in-flight batches are being polled to completion.' : 'Running for ' + fmtDur(elapsed(job)) + '. Waves update live below; the full log is in the panel at the bottom.'}</p></div>
@@ -839,41 +839,41 @@ VIEWS.execute = view({
             <div class="note ${imp ? 'warn' : 'info'}">${imp
               ? html`<b>Import</b> migrates VMs that passed precheck${opt.no_precheck ? html` <b>-- and, with the gate off, pending VMs too</b>` : ''}. ${s.commit_action === 'Auto' ? html`With <b>commitAction Auto</b> a successful import commits at once and <b>cannot be handed back to vCenter</b>.` : html`With <b>commitAction Wait</b> each batch holds at the commit gate for your approval.`}`
               : html`<b>Precheck</b> applies <code>precheckOnly</code> batches: the operator validates each VM against the target without migrating anything. Safe to repeat.`}</div>
-            <div><div class="section-title" style="margin-top:0">Waves</div><div class="chips">
+            <div><div class="section-title" style="margin-top:0">Waves ${tip('wave')}</div><div class="chips">
               <span class="chip ${opt.waves.size ? '' : 'on'}" data-act="wave" data-w="all">All waves <span class="n">${n(Object.values(pl.eligible_by_wave).reduce((a, b) => a + b, 0))}</span></span>
               ${Object.entries(pl.eligible_by_wave).map(([w, cnt]) => html`<span class="chip ${opt.waves.has(+w) ? 'on' : ''}" data-act="wave" data-w="${w}">Wave ${w} <span class="n">${n(cnt)}</span></span>`)}
             </div><div class="tiny faint mt-s">Counts are VMs eligible for ${opt.stage} in each wave. Waves run one after another, lowest first.</div></div>
             <div class="form-grid">
-              <label class="field"><span>Folder scope (optional)</span><input class="input" id="ex-folder" list="ex-folders" data-input="opt" data-k="folder" value="${opt.folder}" placeholder="every folder">
+              <label class="field"><span>Folder scope (optional) ${tip('folder_scope')}</span><input class="input" id="ex-folder" list="ex-folders" data-input="opt" data-k="folder" value="${opt.folder}" placeholder="every folder">
                 <datalist id="ex-folders">${(v.folders || []).map((f) => html`<option value="${f}">`)}</datalist></label>
               <label class="check" style="align-self:end;padding-bottom:8px"><input type="checkbox" data-change="opt" data-k="folder_exact" ${attr(opt.folder_exact, 'checked')}> That folder only, not its subfolders</label>
             </div>
             <details ${attr(v.adv, 'open')} data-toggle="adv"><summary class="small" style="cursor:pointer;font-weight:600">Advanced options</summary>
               <div class="form-grid mt-s">
-                <label class="field"><span>Batch size</span><input class="input" id="ex-bs" type="number" min="1" data-input="opt" data-k="batch_size" value="${opt.batch_size}" placeholder="${s.batch_size}"></label>
-                <label class="field"><span>Parallel batches</span><input class="input" id="ex-par" type="number" min="1" data-input="opt" data-k="parallel" value="${opt.parallel}" placeholder="${s.max_parallel_batches}"></label>
-                <label class="field"><span>Max VMs per wave</span><input class="input" id="ex-lim" type="number" min="0" data-input="opt" data-k="limit" value="${opt.limit}" placeholder="no limit"></label>
+                <label class="field"><span>Batch size ${tip('batch_size')}</span><input class="input" id="ex-bs" type="number" min="1" data-input="opt" data-k="batch_size" value="${opt.batch_size}" placeholder="${s.batch_size}"></label>
+                <label class="field"><span>Parallel batches ${tip('parallel')}</span><input class="input" id="ex-par" type="number" min="1" data-input="opt" data-k="parallel" value="${opt.parallel}" placeholder="${s.max_parallel_batches}"></label>
+                <label class="field"><span>Max VMs per wave ${tip('limit')}</span><input class="input" id="ex-lim" type="number" min="0" data-input="opt" data-k="limit" value="${opt.limit}" placeholder="no limit"></label>
               </div>
               <div class="stack mt-s" style="gap:8px">
-                <label class="check"><input type="checkbox" data-change="opt" data-k="include_failed" ${attr(opt.include_failed, 'checked')}> Also retry VMs that ${imp ? 'failed import' : 'failed precheck'}</label>
-                <label class="check"><input type="checkbox" data-change="opt" data-k="dry_run" ${attr(opt.dry_run, 'checked')}> Dry run — render manifests, apply nothing</label>
-                ${imp ? html`<label class="check"><input type="checkbox" data-change="opt" data-k="rollback_failed" ${attr(opt.rollback_failed, 'checked')}> After the run, hand failed imports back to vCenter</label>
-                  <label class="check"><input type="checkbox" data-change="opt" data-k="no_precheck" ${attr(opt.no_precheck, 'checked')}> <span class="warn-text">Import VMs that have not passed precheck</span></label>` : ''}
+                <label class="check"><input type="checkbox" data-change="opt" data-k="include_failed" ${attr(opt.include_failed, 'checked')}> Also retry VMs that ${imp ? 'failed import' : 'failed precheck'} ${tip('include_failed')}</label>
+                <label class="check"><input type="checkbox" data-change="opt" data-k="dry_run" ${attr(opt.dry_run, 'checked')}> Dry run — render manifests, apply nothing ${tip('dry_run')}</label>
+                ${imp ? html`<label class="check"><input type="checkbox" data-change="opt" data-k="rollback_failed" ${attr(opt.rollback_failed, 'checked')}> After the run, hand failed imports back to vCenter ${tip('rollback_failed')}</label>
+                  <label class="check"><input type="checkbox" data-change="opt" data-k="no_precheck" ${attr(opt.no_precheck, 'checked')}> <span class="warn-text">Import VMs that have not passed precheck</span> ${tip('no_precheck')}</label>` : ''}
               </div></details>
             <div id="ex-plan">${planTable(v)}</div>
           </div>
           <div class="card-f" id="ex-go">${goButton(v)}</div></div>
         <div class="stack">
-          <div class="card"><div class="card-h"><h3>Preflight</h3><span class="sub">context, CRDs, operator, namespaces, RBAC, subnets</span></div>
+          <div class="card"><div class="card-h"><h3>Preflight ${tip('preflight')}</h3><span class="sub">context, CRDs, operator, namespaces, RBAC, subnets</span></div>
             <div class="card-b">${pf ? preflightResult(pf) : html`<p class="muted small" style="margin:0">Checks the cluster before anything is applied. Read-only.</p>`}</div>
             <div class="card-f"><button class="btn ${pf && pf.result.ok ? '' : 'primary'}" data-act="preflight" ${attr(!!job, 'disabled')}>${icon('shield')} Run preflight</button>
-              <label class="check small"><input type="checkbox" data-change="skipTargets" ${attr(v.skipTargets, 'checked')}> skip namespace/subnet checks</label></div></div>
-          ${c.awaiting_commit || s.commit_action === 'Wait' ? html`<div class="card"><div class="card-h"><h3>Commit gate</h3><span class="sub">commitAction ${s.commit_action}</span></div>
+              <label class="check small"><input type="checkbox" data-change="skipTargets" ${attr(v.skipTargets, 'checked')}> skip namespace/subnet checks</label>${tip('skip_targets')}</div></div>
+          ${c.awaiting_commit || s.commit_action === 'Wait' ? html`<div class="card"><div class="card-h"><h3>Commit gate ${tip('commit')}</h3><span class="sub">commitAction ${s.commit_action}</span></div>
             <div class="card-b">${c.awaiting_commit ? html`<p style="margin:0"><b>${plural(c.awaiting_commit, 'VM')}</b> imported and held. Commit to finish, or roll back to hand them to vCenter.</p>`
               : html`<p class="muted small" style="margin:0">Nothing is waiting for approval.</p>`}</div>
             <div class="card-f"><button class="btn primary" data-act="commit" ${attr(!c.awaiting_commit || !!job, 'disabled')}>${icon('commit')} Commit ${n(c.awaiting_commit || 0)}</button>
               <button class="btn danger-ghost" data-act="rollbackHeld" ${attr(!c.awaiting_commit || !!job, 'disabled')}>${icon('rollback')} Roll back instead</button></div></div>` : ''}
-          ${c.committed ? html`<div class="card"><div class="card-h"><h3>Post-import verification</h3><span class="sub">power, Tools, IP kept, ping${(o.verify_ports || []).length ? ', ports' : ''}</span></div>
+          ${c.committed ? html`<div class="card"><div class="card-h"><h3>Post-import verification ${tip('verification')}</h3><span class="sub">power, Tools, IP kept, ping${(o.verify_ports || []).length ? ', ports' : ''}</span></div>
             <div class="card-b">${o.verify ? html`<div class="row wrap" style="gap:14px"><span>${verifyTag('ok')} <b>${n(o.verify.ok || 0)}</b></span><span>${verifyTag('fail')} <b>${n(o.verify.fail || 0)}</b></span>
               <span>${verifyTag('warn')} <b>${n(o.verify.warn || 0)}</b></span><span class="muted">not checked <b>${n(o.verify.none || 0)}</b></span></div>` : ''}
               <p class="small muted mb-0">${S.info.features.verify_after_import ? 'Runs automatically after each import.' : 'Turn on "Verify after import" in Settings to run it after every import.'}
@@ -884,8 +884,8 @@ VIEWS.execute = view({
             ${o.live_batches.length ? html`<div class="table-wrap"><table class="t compact"><tbody>${o.live_batches.slice(0, 8).map((b) => html`<tr class="click" data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">
               <td class="mono small">${b.name}</td><td>${batchTag(b.state)}</td><td class="msg"><div>${b.message || ''}</div></td></tr>`)}</tbody></table></div>`
               : html`<div class="card-b small muted">Nothing in flight.</div>`}
-            <div class="card-f"><button class="btn sm" data-act="watch" ${attr(!!job || !o.live_batches.length, 'disabled')}>${icon('refresh')} Watch until done</button>
-              <button class="btn sm ghost" data-act="refreshCluster" ${attr(!!job, 'disabled')}>Refresh once</button></div></div>
+            <div class="card-f"><button class="btn sm" data-act="watch" ${attr(!!job || !o.live_batches.length, 'disabled')}>${icon('refresh')} Watch until done</button>${tip('watch')}
+              <button class="btn sm ghost" data-act="refreshCluster" ${attr(!!job, 'disabled')}>Refresh once</button>${tip('refresh')}</div></div>
         </div></div>
       <div class="card mt"><div class="card-h"><h3>Waves</h3><span class="sub">live</span></div>
         ${o.waves.length ? html`<div class="table-wrap"><table class="t"><tbody>${o.waves.map((w) => html`<tr><td style="width:90px"><b>Wave ${w.wave}</b></td><td>${segbar(w.counts, w.total)}</td>
@@ -959,7 +959,7 @@ function planTable(v) {
     return html`<div class="note">${why}</div>`;
   }
   const basis = pl.plan[0] && pl.plan[0].basis === 'measured' ? 'measured batch times from this campaign' : 'a default batch time, until batches have run here';
-  return html`<table class="t compact" style="border:1px solid var(--line);border-radius:8px"><thead><tr><th>Wave</th><th class="right">VMs</th><th class="right">Batches</th><th>Namespaces</th><th class="right" title="Estimated from ${basis}">Time</th></tr></thead><tbody>
+  return html`<table class="t compact" style="border:1px solid var(--line);border-radius:8px"><thead><tr><th>Wave</th><th class="right">VMs</th><th class="right">Batches</th><th>Namespaces</th><th class="right">Time ${tip('eta')}</th></tr></thead><tbody>
     ${pl.plan.map((p) => html`<tr><td><b>${p.wave}</b></td><td class="right num">${n(p.vms)}${p.vms !== p.eligible ? html` <span class="faint">of ${n(p.eligible)}</span>` : ''}</td><td class="right num">${n(p.batches)}</td>
       <td class="small mono">${p.namespaces.join(', ')}</td><td class="right small nowrap">${eta(p.seconds)}</td></tr>`)}
     <tr><td><b>Total</b></td><td class="right num"><b>${n(pl.total)}</b></td><td class="right num"><b>${n(pl.plan.reduce((a, p) => a + p.batches, 0))}</b></td><td></td><td class="right nowrap"><b>${eta(pl.seconds)}</b></td></tr></tbody></table>
@@ -1030,7 +1030,7 @@ VIEWS.queue = view({
         <span class="grow"></span><button class="btn sm ghost" data-act="bClear">Clear</button></div>` : ''}
       <div class="table-wrap"><table class="t"><thead><tr>
         <th class="chk"><input type="checkbox" data-act="chkPage" ${attr(allOn, 'checked')}></th>
-        ${th(v, 'vm_name', 'VM')}${th(v, 'state', 'State')}${th(v, 'verify_state', 'Verified')}${th(v, 'app', 'App')}${th(v, 'wave', 'Wave')}${th(v, 'namespace', 'Namespace')}${th(v, 'folder', 'Folder')}${th(v, 'batch_name', 'Batch')}${th(v, 'attempts', 'Att.')}${th(v, 'message', 'Message')}${th(v, 'updated_at', 'Updated')}</tr></thead>
+        ${th(v, 'vm_name', 'VM')}${th(v, 'state', 'State')}${th(v, 'verify_state', html`Verified ${tip('verification')}`)}${th(v, 'app', 'App')}${th(v, 'wave', 'Wave')}${th(v, 'namespace', 'Namespace')}${th(v, 'folder', 'Folder')}${th(v, 'batch_name', 'Batch')}${th(v, 'attempts', 'Att.')}${th(v, 'message', 'Message')}${th(v, 'updated_at', 'Updated')}</tr></thead>
         <tbody>${pageRows.map((x) => html`<tr class="click ${v.checked.has(x.moref) ? 'on' : ''}" data-act="vm" data-moref="${x.moref}">
           <td class="chk"><input type="checkbox" data-act="chk" data-moref="${x.moref}" ${attr(v.checked.has(x.moref), 'checked')}></td>
           <td><span class="vm-name">${x.vm_name}<small>${x.moref}</small></span></td><td>${pill(x.state)}</td><td>${verifyTag(x.verify_state, x.verified_at)}</td><td>${appTag(x.app)}</td><td class="num">${x.wave}</td>
@@ -1077,14 +1077,14 @@ VIEWS.triage = view({
         ${kpi('Awaiting commit', d.awaiting_commit.length, '', d.awaiting_commit.length ? 'execute' : null, 'var(--s-awaiting_commit)')}</div>
       <div class="stack mt">
         ${d.groups.map((g, i) => issueCard(v, g, i))}
-        ${d.stalled.length ? html`<div class="card issue warn"><div class="card-h"><h3>Stalled in a timed-out batch</h3><span class="tag warn">${plural(d.stalled.length, 'VM')}</span></div>
+        ${d.stalled.length ? html`<div class="card issue warn"><div class="card-h"><h3>Stalled in a timed-out batch ${tip('stalled')}</h3><span class="tag warn">${plural(d.stalled.length, 'VM')}</span></div>
           <div class="card-b"><p class="muted small" style="margin-top:0">The operator never reported a result within batch_timeout_minutes, so nobody is polling these. Refresh to pick up a late result; if they stay stuck, roll the batch back.</p>${vmChips(d.stalled, 30)}</div>
           <div class="card-f"><button class="btn" data-act="refreshCluster">${icon('refresh')} Refresh from cluster</button>
             <button class="btn danger-ghost" data-act="rbList" data-list="stalled">${icon('rollback')} Roll back</button></div></div>` : ''}
-        ${d.rolled_back.length ? html`<div class="card issue info"><div class="card-h"><h3>Handed back to vCenter</h3><span class="tag info">${plural(d.rolled_back.length, 'VM')}</span></div>
+        ${d.rolled_back.length ? html`<div class="card issue info"><div class="card-h"><h3>Handed back to vCenter ${tip('rollback')}</h3><span class="tag info">${plural(d.rolled_back.length, 'VM')}</span></div>
           <div class="card-b"><p class="muted small" style="margin-top:0">Ownership is back with vCenter. Once the cause is fixed, requeue them and precheck again.</p>${vmChips(d.rolled_back, 30)}</div>
           <div class="card-f"><button class="btn primary" data-act="retryList" data-list="rolled_back">${icon('refresh')} Retry ${n(d.rolled_back.length)}</button></div></div>` : ''}
-        ${d.cleanup.length ? html`<div class="card issue info"><div class="card-h"><h3>Batch objects left on the cluster</h3><span class="tag">${plural(d.cleanup.length, 'batch', 'batches')}</span></div>
+        ${d.cleanup.length ? html`<div class="card issue info"><div class="card-h"><h3>Batch objects left on the cluster ${tip('cleanup')}</h3><span class="tag">${plural(d.cleanup.length, 'batch', 'batches')}</span></div>
           <div class="card-b"><p class="muted small" style="margin-top:0">Their rollback is confirmed, so they are safe to delete. Deleting also frees the child ImportOperation names for a retry.</p>
             <div class="vmlist">${d.cleanup.map((b) => html`<a data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">${b.name}</a>`)}</div></div>
           <div class="card-f"><button class="btn" data-act="cleanup">${icon('trash')} Delete ${n(d.cleanup.length)}</button></div></div>` : ''}

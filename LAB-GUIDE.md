@@ -118,6 +118,10 @@ ssh -L 8765:127.0.0.1:8765 <jumpbox>             # from your desk, then open the
 Job logs from the console are kept under `run/jobs/`. Include them when you
 report back (step 11).
 
+The console carries this guide: **Help & guides → Lab guide**, and every **?**
+next to a setting links to the step it matters in. The first visit also offers
+a two-minute tour of the console that changes nothing.
+
 ### Campaign controls: off unless you turn them on
 
 This build adds change windows, the two-person rule, named users,

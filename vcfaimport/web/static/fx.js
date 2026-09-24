@@ -713,6 +713,7 @@ const FX = (() => {
     add('Look & feel', 'Density: ' + (P.density === 'compact' ? 'comfortable' : 'compact'), 'queue', 'row height', () => set({ density: P.density === 'compact' ? 'comfortable' : 'compact' }));
     for (const [k, l] of GROUP_BY) add('Look & feel', 'Stream lanes by ' + l.toLowerCase(), 'waves', 'Migration Stream', () => streamBy(k));
     if (window.GOV) for (const it of GOV.paletteItems()) add(it.sec, it.label, it.ic, it.hint, it.run);
+    if (window.HELP) for (const it of HELP.paletteItems()) add(it.sec, it.label, it.ic, it.hint, it.run);
     const q = PAL.q.trim().toLowerCase();
     if (PAL.vms && q.length >= 2) {
       PAL.vms.filter((v) => score(v.vm_name + ' ' + v.moref, q) >= 50).slice(0, 8)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pkgutil
 import re
 import tempfile
 import threading
@@ -49,6 +50,25 @@ from ..engine import STAGE_IMPORT, STAGE_PRECHECK, Engine
 from ..kube import Kubectl
 from ..vcenter import ENV_PASSWORD, ENV_SERVER, ENV_USER, VCenterClient, VCenterError, discover
 from .jobs import FAILED, STOPPED, WARNING, Job, JobManager
+
+
+# The guides the console shows under Help. Bundled into the .pyz/.exe as package
+# data (tools/build.py); read from the source tree when running from a checkout.
+DOCS = {"lab": ("LAB-GUIDE.md", "Lab guide"), "readme": ("README.md", "README")}
+
+
+def doc_text(name: str) -> Optional[str]:
+    fname = DOCS[name][0]
+    data = None
+    try:
+        data = pkgutil.get_data("vcfaimport.web", "docs/" + fname)
+    except (OSError, ValueError):
+        data = None
+    if data is None:
+        src = Path(__file__).resolve().parents[2] / fname
+        if src.is_file():
+            data = src.read_bytes()
+    return data.decode("utf-8", "replace") if data is not None else None
 
 
 # The user a request thread is serving; set by the HTTP layer for each request.
@@ -998,6 +1018,14 @@ class WebApp:
                     access.touch(self.store, user["name"])
         return user
 
+    def docs(self, q, body, name: str) -> Dict[str, Any]:
+        if name not in DOCS:
+            raise ApiError(404, "no such guide")
+        text = doc_text(name)
+        if text is None:
+            raise ApiError(404, "{} is not bundled with this build".format(DOCS[name][0]))
+        return {"name": name, "file": DOCS[name][0], "title": DOCS[name][1], "markdown": text}
+
     def me(self, q, body) -> Dict[str, Any]:
         return {"user": current_user()}
 
@@ -1328,6 +1356,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("POST", r"/api/run/(?P<kind>discover|preflight|execute|refresh|watch|commit|rollback|"
                  r"abandon|cleanup|verify)", "run_job"),
         ("GET", r"/api/me", "me"),
+        ("GET", r"/api/docs/(?P<name>[a-z]+)", "docs"),
         ("GET", r"/api/readiness", "readiness_summary"),
         ("GET", r"/api/apps", "apps"),
         ("GET", r"/api/approvals", "approvals"),

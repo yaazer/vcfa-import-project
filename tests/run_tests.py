@@ -4482,7 +4482,50 @@ def t_e2e_cli_governance():
         server.shutdown()
 
 
+@test("web console: the bundled guides are served for Help, to every role")
+def t_web_docs():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            lab = c.ok("GET", "/api/docs/lab")
+            eq((lab["file"], lab["title"]), ("LAB-GUIDE.md", "Lab guide"))
+            assert lab["markdown"].startswith("# vcfa-import"), lab["markdown"][:60]
+            readme = c.ok("GET", "/api/docs/readme")
+            assert "## Campaign controls" in readme["markdown"]
+            eq(c.call("GET", "/api/docs/secrets")[0], 404)
+            eq(c.call("GET", "/api/docs/..%2Fconfig")[0], 404)
+            eq(c.call("GET", "/api/docs/lab", token=False)[0], 401)
+            viewer = c.ok("POST", "/api/users", {"name": "vic", "role": "viewer"})["token"]
+            eq(c.call("GET", "/api/docs/lab", token=viewer)[0], 200, "a viewer can read the guides")
+        finally:
+            c.close()
+
+
+@test("help: every tooltip and tour link names a heading that exists in the guides")
+def t_help_doc_anchors():
+    import re
+    def slug(t):
+        return re.sub(r"[^\w\- ]", "", t.strip().lower()).replace(" ", "-")
+    ids = {}
+    for key, name in (("lab", "LAB-GUIDE.md"), ("readme", "README.md")):
+        found, fence = set(), False
+        for line in (ROOT / name).read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("```"):
+                fence = not fence
+                continue
+            m = None if fence else re.match(r"(#{1,6})\s+(.*?)\s*#*\s*$", line)
+            if m:
+                found.add(slug(m.group(2)))
+        ids[key] = found
+    js = (ROOT / "vcfaimport" / "web" / "static" / "help.js").read_text(encoding="utf-8")
+    refs = re.findall(r"\b(LAB|RM)\('([^']+)'\)", js)
+    assert len(refs) > 20, len(refs)
+    broken = ["{}#{}".format(k, h) for k, h in refs if h not in ids["lab" if k == "LAB" else "readme"]]
+    eq(broken, [], "renaming a heading in the guides breaks these links")
+
+
 UNIT = [
+    t_web_docs, t_help_doc_anchors,
     t_readiness_rules, t_estimate, t_verify_checks, t_notify_channels, t_access_rules,
     t_schedule_rules, t_settings_overlay, t_tag_map_stage, t_apps_together, t_readiness_exclusion,
     t_web_roles_settings,

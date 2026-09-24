@@ -86,6 +86,8 @@ const ICONS = {
   down: '<path d="M6 9l6 6 6-6"/>',
   key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M16 7l3 3M18 5l2 2"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>',
+  book: '<path d="M4 5a2 2 0 012-2h13v16H6a2 2 0 00-2 2z"/><path d="M4 19V5M8 7h7"/>',
+  help: '<circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.5 2.5 0 014.9.6c0 1.7-2.5 2.1-2.5 3.7M12 16.8h.01"/>',
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
   gear: '<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M2.5 12h3M18.5 12h3M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/>',
@@ -158,7 +160,7 @@ const FAILED = new Set(['failed', 'precheck_failed']);
 const RETRYABLE = new Set(['failed', 'precheck_failed', 'rolled_back']);
 const ROLLBACKABLE = new Set(['failed', 'awaiting_commit', 'importing']);
 const label = (s) => (S.info && S.info.state_labels && S.info.state_labels[s]) || String(s || '').replace(/_/g, ' ');
-const pill = (s) => html`<span class="pill ${BUSY.has(s) ? 'busy' : ''}" style="--c:var(--s-${s})">${label(s)}</span>`;
+const pill = (s) => html`<span class="pill ${BUSY.has(s) ? 'busy' : ''}" style="--c:var(--s-${s})" data-tip="state:${s}">${label(s)}</span>`;
 const dot = (s) => html`<span class="dot" style="--c:var(--s-${s})" title="${label(s)}"></span>`;
 const BATCH_TONE = { succeeded: 'ok', rolled_back: 'info', failed: 'bad', partial: 'warn', timedout: 'warn',
   applied: 'info', running: 'info', rolling_back: 'info', planned: '', deleted: '' };
@@ -668,6 +670,8 @@ const NAV = [
   { group: 'Govern' },
   { id: 'schedule', label: 'Change control', icon: 'calendar' },
   { id: 'settings', label: 'Settings', icon: 'gear' },
+  { group: 'Learn' },
+  { id: 'help', label: 'Help & guides', icon: 'book' },
 ];
 function navBadge(id, p) {
   if (!p) return '';
@@ -707,9 +711,10 @@ function renderTopbar() {
   mount($('#topbar'), html`<div><h1>${v ? v.title : ''}</h1>${v && v.sub ? html`<div class="sub">${v.sub}</div>` : ''}</div>
     <span class="spacer"></span>
     ${p && p.job ? html`<button class="jobchip" data-act="showJob" data-id="${p.job.id}"><span class="spinner"></span><span>${p.job.title}</span></button>` : ''}
-    ${i ? html`<span class="ctxchip" title="kubectl context">ctx <b>${i.context || 'current'}</b></span>
-      <span class="ctxchip" title="commitAction for imports">commit <b class="${i.settings.commit_action === 'Auto' ? 'warn-text' : ''}">${i.settings.commit_action}</b></span>` : ''}
+    ${i ? html`<span class="ctxchip" data-tip="context" tabindex="0">ctx <b>${i.context || 'current'}</b></span>
+      <span class="ctxchip" data-tip="commit_action" tabindex="0">commit <b class="${i.settings.commit_action === 'Auto' ? 'warn-text' : ''}">${i.settings.commit_action}</b></span>` : ''}
     <button class="btn ghost sm" data-act="palette" title="Command palette (Ctrl+K)">${icon('search')}<span class="kbd">ctrl k</span></button>
+    <button class="btn ghost icon" data-act="help" title="Help & guides: the tour, the lab guide, the glossary" aria-label="Help">${icon('help')}</button>
     <button class="btn ghost icon" data-act="theme" title="Theme Studio">${icon('palette')}</button>
     ${userChip()}`);
   const who = typeof me === 'function' ? me() : null;
@@ -921,6 +926,7 @@ async function boot() {
   if (recent) { S.lastActive = recent.id; followJob(recent.id, false); }
   renderNav();
   await route();
+  if (window.HELP) HELP.maybeWelcome();
   if (!S.pulsing) { S.pulsing = true; setTimeout(pulse, 1500); }
 }
 document.addEventListener('DOMContentLoaded', () => { wireEvents(); initToken(); boot(); });
