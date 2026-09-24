@@ -118,6 +118,24 @@ ssh -L 8765:127.0.0.1:8765 <jumpbox>             # from your desk, then open the
 Job logs from the console are kept under `run/jobs/`. Include them when you
 report back (step 11).
 
+### Campaign controls: off unless you turn them on
+
+This build adds change windows, the two-person rule, named users,
+notifications, tags/applications, readiness and post-import verification
+(README, *Campaign controls*). **None of them is on by default**, so the steps
+below run exactly as before. A few are worth a look during the lab, and none
+of them changes the cluster:
+
+- after step 4: `vcfa-import -c vcfa-import.toml readiness --selected` --
+  does `ubuntu-2` grade *ready*? If it says *likely to fail*, note the reason
+  and compare it with what precheck says in step 6.
+- after step 9: `vcfa-import -c vcfa-import.toml verify` -- powered on, Tools
+  running, the same IP as in vCenter before the move, and ping from the jump
+  box. Report the result; it is the first time these checks meet a real
+  imported VM.
+- `discover` now also reads vCenter tags. If it logs *tags not read (...)*, note the
+  message (the account may lack tag read rights); discovery itself carries on.
+
 ---
 
 ## 4. Discover and select the lab VMs

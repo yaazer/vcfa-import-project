@@ -147,6 +147,61 @@ CREATE TABLE IF NOT EXISTS events (
     message  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+
+-- change windows: a stage to run between start_at and end_at (UTC)
+CREATE TABLE IF NOT EXISTS schedules (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage        TEXT NOT NULL,
+    body_json    TEXT NOT NULL,
+    start_at     TEXT NOT NULL,
+    end_at       TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'scheduled',
+    created_by   TEXT,
+    created_at   TEXT NOT NULL,
+    approval_id  INTEGER,
+    job_id       TEXT,
+    message      TEXT,
+    started_at   TEXT,
+    finished_at  TEXT
+);
+
+-- two-person rule: a request, and a different person's decision
+CREATE TABLE IF NOT EXISTS approvals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage        TEXT NOT NULL,
+    body_json    TEXT NOT NULL,
+    summary      TEXT,
+    requested_by TEXT,
+    requested_at TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'pending',
+    decided_by   TEXT,
+    decided_at   TEXT,
+    note         TEXT,
+    job_id       TEXT,
+    schedule_id  INTEGER
+);
+
+-- console users; only a hash of each personal token is kept
+CREATE TABLE IF NOT EXISTS users (
+    name       TEXT PRIMARY KEY,
+    role       TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    disabled   INTEGER NOT NULL DEFAULT 0,
+    last_seen  TEXT
+);
+
+-- post-import verification history (the latest result also sits on the VM)
+CREATE TABLE IF NOT EXISTS verifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    moref       TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    checks_json TEXT NOT NULL,
+    actor       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_verif_moref ON verifications(moref);
 """
 
 
@@ -170,9 +225,24 @@ ADDED_COLUMNS = {
         ("committed_at", "TEXT"),
         ("rolled_back_at", "TEXT"),
         ("src_datacenter", "TEXT NOT NULL DEFAULT ''"),
+        ("app", "TEXT NOT NULL DEFAULT ''"),
+        ("src_ip", "TEXT NOT NULL DEFAULT ''"),
+        ("verify_state", "TEXT NOT NULL DEFAULT ''"),     # '', ok, warn, fail
+        ("verified_at", "TEXT"),
+        ("verify_json", "TEXT NOT NULL DEFAULT '[]'"),
     ],
     "discovered": [
         ("datacenter", "TEXT NOT NULL DEFAULT ''"),
+        ("tags_json", "TEXT NOT NULL DEFAULT '[]'"),      # ["Category:Tag", ...]
+        ("facts_json", "TEXT NOT NULL DEFAULT '{}'"),     # readiness facts from VM detail
+        ("ip", "TEXT NOT NULL DEFAULT ''"),
+        ("app", "TEXT NOT NULL DEFAULT ''"),              # set by hand; wins over the tag
+    ],
+    "transitions": [
+        ("actor", "TEXT"),                                # who (or what) caused the change
+    ],
+    "events": [
+        ("actor", "TEXT"),
     ],
 }
 
@@ -215,6 +285,9 @@ class Store:
             else Path(self.path).parent / "ledger.jsonl"
         )
         self.conn = sqlite3.connect(self.path, timeout=30, check_same_thread=check_same_thread)
+        # Who is acting: an OS user for the CLI, a console user for web jobs.
+        # Recorded on every transition and event, and in the ledger.
+        self.actor: Optional[str] = None
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -281,16 +354,22 @@ class Store:
             if existing is None:
                 self.conn.execute(
                     "INSERT INTO vms(moref, vm_name, namespace, mode, wave, grp, nics_json, notes,"
-                    " src_row, state, created_at, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " src_row, state, created_at, updated_at, app)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (rec.moref, rec.vm_name, rec.namespace, rec.mode, rec.wave,
-                     rec.group, nics_json, rec.notes, rec.row, S_PENDING, _now(), _now()),
+                     rec.group, nics_json, rec.notes, rec.row, S_PENDING, _now(), _now(),
+                     getattr(rec, "app", "") or ""),
                 )
                 self._queued_transition(rec)
                 self._provenance_from_discovery(rec.moref)
                 summary["added"] += 1
                 continue
 
+            app = getattr(rec, "app", "") or ""
+            if existing["app"] != app and existing["state"] not in WAVE_LOCKED_STATES:
+                # An app label is bookkeeping, not a target: safe to refresh any time
+                # the VM is not already in a batch.
+                self.conn.execute("UPDATE vms SET app=? WHERE moref=?", (app, rec.moref))
             changed = (
                 existing["namespace"] != rec.namespace
                 or existing["nics_json"] != nics_json
@@ -325,14 +404,14 @@ class Store:
             "ts": ts, "moref": rec.moref, "vm_name": rec.vm_name, "namespace": rec.namespace,
             "from_state": None, "to_state": S_PENDING, "stage": "queue", "batch": None,
             "operation": None, "phase": None, "message": "queued for import",
-            "wave": rec.wave, "attempt": 0, "held_secs": None,
+            "wave": rec.wave, "attempt": 0, "held_secs": None, "actor": self.actor,
         }
         self.conn.execute(
             "INSERT INTO transitions(ts, moref, vm_name, namespace, from_state, to_state,"
-            " stage, batch, operation, phase, message, wave, attempt, held_secs)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " stage, batch, operation, phase, message, wave, attempt, held_secs, actor)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ts, rec.moref, rec.vm_name, rec.namespace, None, S_PENDING, "queue", None,
-             None, None, "queued for import", rec.wave, 0, None),
+             None, None, "queued for import", rec.wave, 0, None, self.actor),
         )
         self._append_ledger(entry)
 
@@ -345,10 +424,10 @@ class Store:
         self.conn.execute(
             "UPDATE vms SET src_vcenter=?, src_cluster=?, src_folder=?, src_host=?,"
             " src_networks=?, src_power=?, src_cpu=?, src_memory_mb=?, src_tools=?,"
-            " src_datacenter=? WHERE moref=?",
+            " src_datacenter=?, src_ip=? WHERE moref=?",
             (str(self.get_meta("vcenter") or ""), row["cluster"], row["folder"], row["host"],
              row["networks"], row["power_state"], row["cpu_count"], row["memory_mb"],
-             row["tools_status"], row["datacenter"], moref),
+             row["tools_status"], row["datacenter"], row["ip"] or "", moref),
         )
 
     def get_vm(self, moref: str) -> Optional[sqlite3.Row]:
@@ -492,15 +571,16 @@ class Store:
             "wave": before["wave"],
             "attempt": attempt,
             "held_secs": round(held, 1) if held is not None else None,
+            "actor": self.actor,
         }
         self.conn.execute(
             "INSERT INTO transitions(ts, moref, vm_name, namespace, from_state, to_state,"
-            " stage, batch, operation, phase, message, wave, attempt, held_secs)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " stage, batch, operation, phase, message, wave, attempt, held_secs, actor)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (entry["ts"], entry["moref"], entry["vm_name"], entry["namespace"],
              entry["from_state"], entry["to_state"], entry["stage"], entry["batch"],
              entry["operation"], entry["phase"], entry["message"], entry["wave"],
-             entry["attempt"], entry["held_secs"]),
+             entry["attempt"], entry["held_secs"], entry["actor"]),
         )
         self._append_ledger(entry)
 
@@ -616,6 +696,37 @@ class Store:
         self.conn.commit()
         return moved, refused
 
+    def app_members(self, apps: Sequence[str]) -> List[str]:
+        """morefs of every queued VM belonging to any of these applications."""
+        apps = [a for a in apps if a]
+        if not apps:
+            return []
+        return [r["moref"] for r in self.conn.execute(
+            "SELECT moref FROM vms WHERE app IN ({})".format(",".join("?" * len(apps))), apps)]
+
+    def record_verification(self, moref: str, verdict: str, checks: List[Dict[str, Any]]) -> None:
+        """A post-import check result. Not a state change: a committed VM stays committed."""
+        now = _now()
+        blob = json.dumps(checks)
+        self.conn.execute(
+            "INSERT INTO verifications(moref, ts, verdict, checks_json, actor) VALUES(?,?,?,?,?)",
+            (moref, now, verdict, blob, self.actor))
+        self.conn.execute("UPDATE vms SET verify_state=?, verified_at=?, verify_json=? WHERE moref=?",
+                          (verdict, now, blob, moref))
+        self.conn.commit()
+
+    def set_app(self, morefs: Sequence[str], app: str) -> int:
+        """Name the application of discovered (and queued, not in-flight) VMs by hand."""
+        app = (app or "").strip()
+        n = 0
+        locked = ",".join("?" * len(WAVE_LOCKED_STATES))
+        for moref in morefs:
+            n += self.conn.execute("UPDATE discovered SET app=? WHERE moref=?", (app, moref)).rowcount
+            self.conn.execute("UPDATE vms SET app=? WHERE moref=? AND state NOT IN ({})".format(locked),
+                              [app, moref] + list(WAVE_LOCKED_STATES))
+        self.conn.commit()
+        return n
+
     def swap_waves(self, a: int, b: int) -> Tuple[bool, List[str]]:
         """Exchange two waves' positions in the running order, all or nothing."""
         a, b = int(a), int(b)
@@ -645,8 +756,8 @@ class Store:
         return True, []
 
     def state_matrix(self, column: str) -> Dict[Any, Dict[str, int]]:
-        """{wave or namespace: {state: count}} in one query."""
-        if column not in ("wave", "namespace"):
+        """{wave, namespace or app: {state: count}} in one query."""
+        if column not in ("wave", "namespace", "app"):
             raise ValueError(column)
         out: Dict[Any, Dict[str, int]] = {}
         for r in self.conn.execute(
@@ -769,29 +880,34 @@ class Store:
             nics = d.get("nics", [])
             networks = ",".join(
                 n.get("network_name") or n.get("network_id") or "" for n in nics)
+            extra = (json.dumps(d.get("tags") or []), json.dumps(d.get("facts") or {}),
+                     d.get("ip") or "")
             existing = self.conn.execute(
                 "SELECT moref FROM discovered WHERE moref=?", (d["moref"],)).fetchone()
             if existing:
                 self.conn.execute(
                     "UPDATE discovered SET name=?, power_state=?, cpu_count=?, memory_mb=?,"
                     " folder=?, datacenter=?, cluster=?, host=?, guest_os=?, tools_status=?,"
-                    " nics_json=?, networks=?, discovered_at=? WHERE moref=?",
+                    " nics_json=?, networks=?, discovered_at=?, tags_json=?, facts_json=?, ip=?"
+                    " WHERE moref=?",
                     (d.get("name", ""), d.get("power_state", ""), d.get("cpu_count", 0),
                      d.get("memory_mb", 0), d.get("folder", ""), d.get("datacenter", ""),
                      d.get("cluster", ""), d.get("host", ""), d.get("guest_os", ""),
-                     d.get("tools_status", ""), json.dumps(nics), networks, _now(), d["moref"]),
+                     d.get("tools_status", ""), json.dumps(nics), networks, _now()) + extra
+                    + (d["moref"],),
                 )
                 summary["updated"] += 1
             else:
                 self.conn.execute(
                     "INSERT INTO discovered(moref, name, power_state, cpu_count, memory_mb,"
                     " folder, datacenter, cluster, host, guest_os, tools_status, nics_json,"
-                    " networks, discovered_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " networks, discovered_at, tags_json, facts_json, ip)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (d["moref"], d.get("name", ""), d.get("power_state", ""),
                      d.get("cpu_count", 0), d.get("memory_mb", 0), d.get("folder", ""),
                      d.get("datacenter", ""), d.get("cluster", ""), d.get("host", ""),
                      d.get("guest_os", ""), d.get("tools_status", ""), json.dumps(nics),
-                     networks, _now()),
+                     networks, _now()) + extra,
                 )
                 summary["added"] += 1
         self.conn.commit()
@@ -904,10 +1020,11 @@ class Store:
         level: str = "info",
         moref: Optional[str] = None,
         batch: Optional[str] = None,
+        actor: Optional[str] = None,
     ) -> None:
         self.conn.execute(
-            "INSERT INTO events(ts, level, moref, batch, message) VALUES(?,?,?,?,?)",
-            (_now(), level, moref, batch, message),
+            "INSERT INTO events(ts, level, moref, batch, message, actor) VALUES(?,?,?,?,?,?)",
+            (_now(), level, moref, batch, message, actor or self.actor),
         )
         self.conn.commit()
 

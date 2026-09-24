@@ -27,7 +27,7 @@ const FX = (() => {
     { id: 'glacier', label: 'Glacier', tag: 'ice blue, light', mode: 'light', h1: 238, h2: 200, h3: 285, hb: 235, c: 1 },
     { id: 'daylight', label: 'Daylight', tag: 'warm paper, light', mode: 'light', h1: 268, h2: 22, h3: 172, hb: 75, c: 0.9 },
   ];
-  const DEFAULTS = { theme: 'aurora', shift: 0, glow: 100, motion: null, reactive: true };
+  const DEFAULTS = { theme: 'aurora', shift: 0, glow: 100, motion: null, reactive: true, density: 'comfortable', streamBy: 'stage' };
   const P = Object.assign({}, DEFAULTS, readPrefs());
   if (!P.motion) P.motion = matchMedia('(prefers-reduced-motion: reduce)').matches ? 'off' : 'full';
 
@@ -100,6 +100,7 @@ const FX = (() => {
     root.style.colorScheme = t.mode;
     root.dataset.theme = t.mode;
     document.body.dataset.motion = P.motion;
+    document.body.dataset.density = P.density === 'compact' ? 'compact' : 'comfortable';
     readColors();
     applyMood();
   }
@@ -210,31 +211,81 @@ const FX = (() => {
     counts: {}, animating: false, ro: null, host: null };
   const stats = { frames: 0, drawMs: 0, dots: 0 };
 
+  // Grouped streams (by wave, namespace or application): each lane is a group,
+  // and its tank stacks by state -- done at the bottom, trouble on top.
+  const STACK = ['committed', 'awaiting_commit', 'importing', 'rolling_back', 'precheck_passed', 'precheck_running',
+    'pending', 'rolled_back', 'precheck_failed', 'failed', 'skipped'];
+  const GROUP_BY = [['stage', 'Stage'], ['wave', 'Wave'], ['namespace', 'Namespace'], ['app', 'App']];
+  const MAX_LANES = 8;
+  const sumOf = (o) => Object.values(o || {}).reduce((a, b) => a + (b || 0), 0);
+  const keyState = (k) => k.slice(k.lastIndexOf('|') + 1);
+  const keyLane = (k) => (ST.model && ST.model.by !== 'stage' ? k.slice(0, k.lastIndexOf('|')) : LANE_OF[k]);
+
   function streamCounts(d) {
     const c = Object.assign({}, d.counts || {});
     c.discovered = Math.max(0, ((d.discovered || {}).total || 0) - (d.total || 0));
     return c;
   }
+  /** {by, lanes: [{id, label, total, done}], counts: {key: n}}; key = state, or lane|state when grouped. */
+  function streamModel(d) {
+    let by = P.streamBy || 'stage';
+    let groups = [];
+    if (by === 'wave') groups = (d.waves || []).map((w) => ({ id: 'w' + w.wave, label: 'Wave ' + w.wave, counts: w.counts }));
+    else if (by === 'namespace') groups = (d.namespaces || []).map((x) => ({ id: 'n:' + x.namespace, label: x.namespace, counts: x.counts }));
+    else if (by === 'app' && d.apps && d.apps.length) {
+      groups = d.apps.map((a) => ({ id: 'a:' + a.app, label: a.app, counts: a.counts }));
+      const rest = {};
+      for (const s in d.counts || {}) {
+        const left = d.counts[s] - groups.reduce((a, g) => a + (g.counts[s] || 0), 0);
+        if (left > 0) rest[s] = left;
+      }
+      if (sumOf(rest)) groups.push({ id: 'a:', label: 'No app', counts: rest });
+    }
+    if (by !== 'stage' && !groups.length) by = 'stage';
+    if (by === 'stage') {
+      const c = streamCounts(d), counts = {};
+      for (const s of ORDER) if (c[s]) counts[s] = c[s];
+      return { by, counts, lanes: LANES.map((l) => ({ id: l.id, label: l.label,
+        total: ORDER.filter((s) => LANE_OF[s] === l.id).reduce((a, s) => a + (c[s] || 0), 0) })) };
+    }
+    groups.forEach((g) => { g.total = sumOf(g.counts); });
+    if (groups.length > MAX_LANES) {
+      const keep = by === 'wave' ? groups.slice(0, MAX_LANES - 1)
+        : groups.slice().sort((a, b) => b.total - a.total).slice(0, MAX_LANES - 1);
+      const ids = new Set(keep.map((g) => g.id));
+      const rest = { id: 'other', label: '+' + (groups.length - keep.length) + ' more', counts: {}, total: 0 };
+      for (const g of groups) {
+        if (ids.has(g.id)) continue;
+        for (const s in g.counts) rest.counts[s] = (rest.counts[s] || 0) + g.counts[s];
+        rest.total += g.total;
+      }
+      groups = keep.concat([rest]);
+    }
+    const counts = {};
+    for (const g of groups) for (const s in g.counts) if (g.counts[s]) counts[g.id + '|' + s] = g.counts[s];
+    return { by, counts, lanes: groups.map((g) => ({ id: g.id, label: g.label, total: g.total, done: g.counts.committed || 0 })) };
+  }
   function streamHtml(d, opts) {
     const compact = !!(opts && opts.compact);
-    const c = streamCounts(d);
-    const laneTotal = (id) => ORDER.filter((s) => LANE_OF[s] === id).reduce((a, s) => a + (c[s] || 0), 0);
-    const attn = laneTotal('attn');
-    const unit = unitFor(c);
-    const empty = !ORDER.some((s) => c[s]);
+    const m = streamModel(d);
+    const staged = m.by === 'stage';
+    const attn = staged ? ['failed', 'precheck_failed', 'rolled_back'].reduce((a, s) => a + (m.counts[s] || 0), 0) : 0;
+    const total = sumOf(m.counts);
+    const unit = Math.max(1, Math.ceil(total / 1500));
+    const hasApps = !!(d.apps && d.apps.length);
+    const choices = GROUP_BY.filter(([k]) => k !== 'app' || hasApps);
     return html`<div class="card hero ${compact ? 'compact' : ''}">
       ${compact ? '' : html`<div class="hero-ring">${ring(d)}</div>`}
-      <div class="stream" id="fx-stream" data-counts="${JSON.stringify(c)}">
+      <div class="stream ${staged ? '' : 'grouped'}" id="fx-stream" data-model="${JSON.stringify(m)}">
         <canvas aria-hidden="true"></canvas>
-        <div class="lanes" style="grid-template-columns:repeat(${LANES.length},minmax(0,1fr))">${LANES.map((l) => html`<div class="lane-h">
-          <div class="ln-n" data-count="${laneTotal(l.id)}" data-key="lane:${l.id}">${n(laneTotal(l.id))}</div><div class="ln-l">${l.label}</div></div>`)}</div>
-        <div class="stream-foot"><span>${empty ? 'Discover your vCenter to see the estate flow' : (unit > 1 ? 'each particle = ' + unit + ' VMs' : 'each particle is a VM')}</span>
-          ${attn ? html`<span class="att">${plural(attn, 'VM')} need attention ↓</span>` : html`<span>live</span>`}</div>
+        <div class="lanes" style="grid-template-columns:repeat(${m.lanes.length},minmax(0,1fr))">${m.lanes.map((l) => html`<div class="lane-h">
+          <div class="ln-n" data-count="${l.total}" data-key="lane:${l.id}">${n(l.total)}</div><div class="ln-l" title="${l.label}">${l.label}</div>
+          ${staged ? '' : html`<div class="ln-d">${pct(l.done, l.total)} done</div>`}</div>`)}</div>
+        <div class="stream-foot"><span>${!total ? 'Discover your vCenter to see the estate flow' : (unit > 1 ? 'each particle = ' + unit + ' VMs' : 'each particle is a VM')}</span>
+          <span class="stream-by" role="group" aria-label="Group the stream by"><span class="lbl">lanes</span>${choices.map(([k, l]) =>
+            html`<button class="${m.by === k ? 'on' : ''}" data-fx="streamBy" data-k="${k}" aria-pressed="${m.by === k}">${l}</button>`)}</span>
+          ${attn ? html`<span class="att">${plural(attn, 'VM')} need attention ↓</span>` : html`<span>${staged ? 'live' : 'by ' + m.by + ', colour = state'}</span>`}</div>
       </div></div>`;
-  }
-  function unitFor(c) {
-    const total = ORDER.reduce((a, s) => a + (c[s] || 0), 0);
-    return Math.max(1, Math.ceil(total / 1500));
   }
   function ring(d) {
     const c = d.counts || {};
@@ -261,8 +312,9 @@ const FX = (() => {
   function mountStream(root) {
     const host = root.querySelector('#fx-stream');
     if (!host) return;
-    let counts = {};
-    try { counts = JSON.parse(host.dataset.counts || '{}'); } catch (e) { counts = {}; }
+    let model = null;
+    try { model = JSON.parse(host.dataset.model || 'null'); } catch (e) { model = null; }
+    if (!model) model = { by: 'stage', lanes: LANES, counts: {} };
     const fresh = host.querySelector('canvas');
     if (!ST.canvas) {
       ST.canvas = fresh;
@@ -276,7 +328,7 @@ const FX = (() => {
       if (window.ResizeObserver) { ST.ro = new ResizeObserver(() => { sizeStream(); layout(); }); ST.ro.observe(host); }
       sizeStream();
     }
-    setStreamData(counts);
+    setStreamData(model);
   }
   function sizeStream() {
     if (!ST.host) return;
@@ -285,29 +337,42 @@ const FX = (() => {
     ST.w = Math.max(10, r.width); ST.h = Math.max(10, r.height);
     ST.canvas.width = Math.round(ST.w * ST.dpr); ST.canvas.height = Math.round(ST.h * ST.dpr);
   }
-  function setStreamData(counts) {
-    ST.unit = unitFor(counts);
+  function setStreamData(model) {
+    const counts = model.counts || {};
+    ST.model = model;
+    ST.unit = Math.max(1, Math.ceil(sumOf(counts) / 1500));
+    const keys = Object.keys(counts);
     const want = {};
-    for (const s of ORDER) want[s] = counts[s] ? Math.max(1, Math.round(counts[s] / ST.unit)) : 0;
-    // Reconcile: dots whose state lost members are freed; states that gained
-    // members take freed dots first — so they visibly flow to the new lane.
-    const byState = {};
-    for (const d of ST.dots) if (!d.dying) (byState[d.state] = byState[d.state] || []).push(d);
-    const free = [];
-    for (const s of ORDER) {
-      const have = byState[s] || [];
-      if (have.length > want[s]) free.push(...have.splice(want[s]));
-      byState[s] = have;
+    for (const k of keys) want[k] = Math.max(1, Math.round(counts[k] / ST.unit));
+    // Reconcile by key (a state, or lane|state when grouped): dots whose key lost
+    // members are freed, and keys that gained take freed dots first -- so VMs
+    // visibly flow to their new lane, and a regroup re-sorts the same particles.
+    // A freed dot of the same state is preferred, so a regroup keeps colours.
+    const byKey = {};
+    for (const d of ST.dots) if (!d.dying) (byKey[d.key] = byKey[d.key] || []).push(d);
+    const freeBy = {};
+    let freeN = 0;
+    for (const k in byKey) {
+      const have = byKey[k], w = want[k] || 0;
+      if (have.length > w) for (const d of have.splice(w)) { (freeBy[d.state] = freeBy[d.state] || []).push(d); freeN++; }
     }
+    const take = (state) => {
+      if (!freeN) return null;
+      let list = freeBy[state];
+      if (!list || !list.length) list = Object.values(freeBy).find((l) => l.length);
+      freeN--;
+      return list.shift();
+    };
     const first = !ST.dots.length;
-    for (const s of ORDER) {
-      const have = byState[s];
-      while (have.length < want[s]) {
-        let d = free.shift();
-        if (d) { d.state = s; d.delay = performance.now() + Math.random() * 700; }
+    for (const k of keys) {
+      const have = byKey[k] || (byKey[k] = []);
+      const state = keyState(k);
+      while (have.length < want[k]) {
+        let d = take(state);
+        if (d) { d.key = k; d.state = state; d.delay = performance.now() + Math.random() * 700; }
         else {
           const still = P.motion === 'off';     // no frames will follow: arrive fully formed
-          d = { id: ST.id++, state: s, x: 0, y: 0, tx: 0, ty: 0, a: still ? 1 : 0,
+          d = { id: ST.id++, key: k, state, x: 0, y: 0, tx: 0, ty: 0, a: still ? 1 : 0,
             born: still ? 0 : performance.now() + Math.random() * (first ? 900 : 300),
             ph: Math.random() * 6.28, delay: 0, fresh: true };
           ST.dots.push(d);
@@ -315,7 +380,7 @@ const FX = (() => {
         have.push(d);
       }
     }
-    for (const d of free) d.dying = performance.now();
+    for (const list of Object.values(freeBy)) for (const d of list) d.dying = performance.now();
     ST.counts = counts;
     layout();
     stats.dots = ST.dots.length;
@@ -323,11 +388,14 @@ const FX = (() => {
   function layout() {
     const w = ST.w, h = ST.h;
     if (!w || !h) return;
-    const top = 74, attnH = Math.max(44, h * 0.18), bottom = h - attnH - 30, colW = w / LANES.length;
-    ST.lanes = LANES.map((l, i) => ({ id: l.id, x0: i * colW + 10, x1: (i + 1) * colW - 10, y0: top, y1: bottom }));
-    ST.lanes.push({ id: 'attn', x0: 16, x1: w - 16, y0: bottom + 14, y1: h - 30 });
+    const staged = !ST.model || ST.model.by === 'stage';
+    const defs = ST.model ? ST.model.lanes : LANES;
+    const top = staged ? 74 : 88, attnH = staged ? Math.max(44, h * 0.18) : 0;
+    const bottom = staged ? h - attnH - 30 : h - 32, colW = w / Math.max(1, defs.length);
+    ST.lanes = defs.map((l, i) => ({ id: l.id, x0: i * colW + 10, x1: (i + 1) * colW - 10, y0: top, y1: bottom }));
+    if (staged) ST.lanes.push({ id: 'attn', x0: 16, x1: w - 16, y0: bottom + 14, y1: h - 30 });
     const members = {};
-    for (const d of ST.dots) if (!d.dying) (members[LANE_OF[d.state]] = members[LANE_OF[d.state]] || []).push(d);
+    for (const d of ST.dots) if (!d.dying) { const l = keyLane(d.key); (members[l] = members[l] || []).push(d); }
     // one particle size for every lane, so lanes compare at a glance
     let size = 12;
     for (const lane of ST.lanes) {
@@ -339,7 +407,8 @@ const FX = (() => {
     size = Math.max(2.4, size);
     ST.size = size;
     for (const lane of ST.lanes) {
-      const list = (members[lane.id] || []).sort((a, b) => ORDER.indexOf(a.state) - ORDER.indexOf(b.state) || a.id - b.id);
+      const rank = staged ? ORDER : STACK;
+      const list = (members[lane.id] || []).sort((a, b) => rank.indexOf(a.state) - rank.indexOf(b.state) || a.id - b.id);
       const lw = lane.x1 - lane.x0;
       if (lane.id === 'attn') {
         const rows = Math.max(1, Math.floor((lane.y1 - lane.y0) / size));
@@ -359,7 +428,7 @@ const FX = (() => {
     }
     for (const d of ST.dots) {
       if (d.fresh) {
-        const lane = ST.lanes.find((l) => l.id === LANE_OF[d.state]) || ST.lanes[0];
+        const lane = ST.lanes.find((l) => l.id === keyLane(d.key)) || ST.lanes[0];
         d.x = d.tx; d.y = P.motion === 'off' ? d.ty : lane.y0 - 10 - Math.random() * 40; d.fresh = false;
       }
       if (P.motion === 'off') { d.x = d.tx; d.y = d.ty; }
@@ -376,11 +445,13 @@ const FX = (() => {
     ctx.strokeStyle = colors.line || 'rgba(255,255,255,.1)';
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 6]);
-    for (let i = 1; i < LANES.length; i++) {
-      const x = (ST.w / LANES.length) * i;
+    const staged = !ST.model || ST.model.by === 'stage';
+    const nLanes = staged ? LANES.length : Math.max(1, ST.lanes.length);
+    for (let i = 1; i < nLanes; i++) {
+      const x = (ST.w / nLanes) * i;
       ctx.beginPath(); ctx.moveTo(x, 70); ctx.lineTo(x, ST.lanes.length ? ST.lanes[0].y1 : ST.h - 60); ctx.stroke();
     }
-    const attn = ST.lanes[ST.lanes.length - 1];
+    const attn = staged ? ST.lanes[ST.lanes.length - 1] : null;
     if (attn) { ctx.beginPath(); ctx.moveTo(16, attn.y0 - 7); ctx.lineTo(ST.w - 16, attn.y0 - 7); ctx.stroke(); }
     ctx.setLineDash([]);
     const moving = P.motion !== 'off';
@@ -425,7 +496,7 @@ const FX = (() => {
     }
     ST.dots = survivors;
     // sparks: flow between lanes while a job runs, and the finale burst
-    if (moving && M.busy && ST.lanes.length && Math.random() < 0.5) {
+    if (moving && M.busy && staged && ST.lanes.length > 4 && Math.random() < 0.5) {
       const i = 1 + Math.floor(Math.random() * 3);
       const a = ST.lanes[i], b = ST.lanes[i + 1];
       ST.sparks.push({ x: (a.x0 + a.x1) / 2, y: a.y1 - 8, tx: (b.x0 + b.x1) / 2, ty: b.y1 - 8, p: 0, v: 0.008 + Math.random() * 0.01, col: colors.accent });
@@ -639,6 +710,9 @@ const FX = (() => {
     add('Look & feel', 'Open Theme Studio', 'sun', 'colours, glow, motion', () => openStudio());
     for (const t of THEMES) add('Look & feel', 'Theme: ' + t.label, 'sun', t.tag, () => { set({ theme: t.id }); toast('Theme: ' + t.label, t.tag, 'ok', 2500); });
     add('Look & feel', 'Motion: ' + (P.motion === 'off' ? 'turn on' : 'turn off'), 'activity', 'animations', () => set({ motion: P.motion === 'off' ? 'full' : 'off' }));
+    add('Look & feel', 'Density: ' + (P.density === 'compact' ? 'comfortable' : 'compact'), 'queue', 'row height', () => set({ density: P.density === 'compact' ? 'comfortable' : 'compact' }));
+    for (const [k, l] of GROUP_BY) add('Look & feel', 'Stream lanes by ' + l.toLowerCase(), 'waves', 'Migration Stream', () => streamBy(k));
+    if (window.GOV) for (const it of GOV.paletteItems()) add(it.sec, it.label, it.ic, it.hint, it.run);
     const q = PAL.q.trim().toLowerCase();
     if (PAL.vms && q.length >= 2) {
       PAL.vms.filter((v) => score(v.vm_name + ' ' + v.moref, q) >= 50).slice(0, 8)
@@ -706,6 +780,12 @@ const FX = (() => {
         <div class="field"><span>Motion</span><div class="seg">${[['full', 'Full'], ['calm', 'Calm'], ['off', 'Off']].map(([k, l]) =>
           html`<button class="${P.motion === k ? 'on' : ''}" data-fx="motion" data-k="${k}">${l}</button>`)}</div>
           <small>Off also stops the background and the particle stream. Your OS "reduce motion" setting picks Off by default.</small></div>
+        <div class="field"><span>Density</span><div class="seg">${[['comfortable', 'Comfortable'], ['compact', 'Compact']].map(([k, l]) =>
+          html`<button class="${(P.density || 'comfortable') === k ? 'on' : ''}" data-fx="density" data-k="${k}">${l}</button>`)}</div>
+          <small>Compact fits more rows on a screen: tables, cards and the queue tighten up.</small></div>
+        <div class="field"><span>Migration Stream lanes</span><div class="seg">${GROUP_BY.map(([k, l]) =>
+          html`<button class="${(P.streamBy || 'stage') === k ? 'on' : ''}" data-fx="streamBy" data-k="${k}">${l}</button>`)}</div>
+          <small>By stage shows the flow; by wave, namespace or app shows each group's progress, coloured by state.</small></div>
         <div class="opt-row"><div><b>Reactive ambience</b><div class="d">The glow tints with campaign health: hazard for failures, amber for held commits, green when done.</div></div>
           <button class="switch ${P.reactive ? 'on' : ''}" data-fx="reactive" role="switch" aria-checked="${P.reactive}" aria-label="Reactive ambience"></button></div>
         <div class="row"><button class="btn sm" data-fx="resetFx">Reset to defaults</button><span class="grow"></span>
@@ -713,6 +793,12 @@ const FX = (() => {
       </div>`);
   }
   function closeStudio() { document.getElementById('fx-root').innerHTML = ''; }
+  function streamBy(k) {
+    P.streamBy = k;
+    savePrefs();
+    renderStudio();
+    if (S.view && S.view.render) S.view.render();
+  }
   function set(changes) {
     Object.assign(P, changes);
     savePrefs();
@@ -728,6 +814,8 @@ const FX = (() => {
     pickTheme: (t) => set({ theme: t.dataset.id }),
     motion: (t) => set({ motion: t.dataset.k }),
     reactive: () => set({ reactive: !P.reactive }),
+    density: (t) => { set({ density: t.dataset.k }); if (S.view && S.view.render) S.view.render(); },
+    streamBy: (t) => streamBy(t.dataset.k),
     resetFx: () => set(Object.assign({}, DEFAULTS, { motion: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'off' : 'full' })),
   };
 
@@ -781,7 +869,7 @@ const FX = (() => {
 
   return {
     THEMES, prefs: P, stats, init, applyTheme, onPulse, beforeRoute, afterRoute, afterRender, navGlider,
-    streamHtml, ring, logActivity, spark, openPalette, openStudio, set, kick,
+    streamHtml, streamModel, ring, logActivity, spark, openPalette, openStudio, set, kick,
     // one stream frame on demand (tests drive time; browsers use requestAnimationFrame)
     drawNow: () => drawStream(performance.now()),
   };

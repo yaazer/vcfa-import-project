@@ -40,6 +40,20 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - Animation is time-based, never per-frame, and every effect must degrade to a
   complete static render under Motion: Off (the OS reduce-motion default). `fx.js`
   hooks fail soft: the console must work if the look breaks.
+- **Campaign controls are opt-in and default-off** (readiness exclusion, tag map, apps
+  kept together, change windows, two-person rule, users, notifications, verification).
+  An empty setting must mean "behave exactly as before".
+- Settings precedence: defaults < TOML < workspace settings (`settings.py`, meta
+  `settings`) < per-run CLI flags. `settings.apply()` runs once per cfg (marker attr).
+- Approvals are an **audit control, not a security boundary**: the requester can never
+  decide their own request, an approval is consumed once for its stage, dry runs are exempt.
+- A change window never *starts* a batch that could not finish by its end
+  (`Engine.deadline`); in-flight batches are still polled to completion.
+- Verification never changes a VM's state (a committed import stays committed); it
+  writes `verifications` rows and `vms.verify_*` only.
+- Secrets never hit disk: SMTP passwords via `password_env`, user tokens stored as
+  sha256, remembered vCenter credentials live in memory for the console's lifetime.
+- Notifications must never break a run: delivery runs in threads and failures are events.
 
 ## Layout
 
@@ -56,9 +70,16 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/web/server.py` | `serve`: stdlib HTTP server, token + Host checks, static assets via `pkgutil` (works in .pyz/.exe) |
 | `vcfaimport/web/api.py` | JSON API; `ROUTES` table; cluster-touching actions start jobs, DB-only ones run inline |
 | `vcfaimport/web/jobs.py` | background jobs: one at a time, own `Store`, log streamed + kept in `<workdir>/jobs/` |
-| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `views.js` (pages), `app.css` (token design system) |
+| `vcfaimport/readiness.py` | advisory pre-precheck rules over discovery facts: ready / warn / block |
+| `vcfaimport/estimate.py` | batch-time median (measured or default) + parallel-limit simulation -> ETA |
+| `vcfaimport/schedule.py` | change windows: states, due / missed, deadline |
+| `vcfaimport/access.py` | users + roles (token hashes), approvals (request / decide / consume) |
+| `vcfaimport/settings.py` | workspace settings overlay: `FIELDS` with ranges, `apply`, `update`, `describe` |
+| `vcfaimport/notify.py` | Teams / Slack / webhook / email channels, `EVENTS`, retrying delivery |
+| `vcfaimport/verify.py` | post-import checks: power, Tools, IP kept, ping, TCP ports |
+| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `views.js` (pages), `gov.js` (Change control, Settings, badges, saved views), `app.css` (token design system) |
 | `tools/web_demo.py` | the console against the fakes: `--keep ./webdemo` |
-| `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge |
+| `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge (`govern` runs in its own workspace) |
 | `tools/fake_kubectl.py` | simulated kubectl + operator (emits the real condition vocabulary) |
 | `tools/fake_vcenter.py` | simulated vCenter REST API |
 | `tools/demo.py` | full offline campaign; `--keep ./rehearsal` |

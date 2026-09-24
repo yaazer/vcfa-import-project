@@ -10,6 +10,7 @@ Mobility Operator; those need PyYAML (a test-only dependency).
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import os
@@ -2270,7 +2271,8 @@ class _Console:
         if cfg.workdir == "./run":
             cfg.workdir = os.path.join(tmp, "run")
         self.app = WebApp(cfg, config_path=None, folder_map=os.path.join(tmp, "folder-map.csv"),
-                          network_map=os.path.join(tmp, "portgroup-map.csv"))
+                          network_map=os.path.join(tmp, "portgroup-map.csv"),
+                          tag_map=os.path.join(tmp, "tag-map.csv"))
         self.server = make_server(self.app, "127.0.0.1", 0, token=token)
         self.base = "http://127.0.0.1:{}".format(self.server.server_address[1])
         self.token = token
@@ -3765,7 +3767,725 @@ def t_e2e_web_scale():
 
 
 # -------------------------------------------------------------------- main
+# ------------------------------------------------------------------ campaign features
+class _Capture:
+    """A local HTTP endpoint that records every JSON POST (webhook / Teams / Slack)."""
+
+    def __init__(self, status=200):
+        import http.server
+        import threading
+        got = self.got = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                got.append((self.path, json.loads(self.rfile.read(n) or b"{}")))
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = "http://127.0.0.1:{}".format(self.server.server_address[1])
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def wait_for(self, pred, timeout=15):
+        import time
+        end = time.time() + timeout
+        while time.time() < end:
+            if any(pred(p, b) for p, b in list(self.got)):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class _FakeSmtp:
+    """Just enough SMTP to accept one message (no TLS, no auth)."""
+
+    def __init__(self):
+        import socketserver
+        import threading
+        got = self.got = []
+
+        class H(socketserver.StreamRequestHandler):
+            def handle(self):
+                def w(t):
+                    self.wfile.write((t + "\r\n").encode())
+                w("220 fake")
+                data = None
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        return
+                    cmd = line.decode("utf-8", "replace").rstrip("\r\n")
+                    if data is not None:
+                        if cmd == ".":
+                            got.append("\n".join(data))
+                            data = None
+                            w("250 queued")
+                        else:
+                            data.append(cmd)
+                        continue
+                    u = cmd.upper()
+                    if u.startswith("EHLO"):
+                        w("250-fake")
+                        w("250 SIZE 1000000")
+                    elif u.startswith(("HELO", "MAIL", "RCPT", "RSET", "NOOP")):
+                        w("250 ok")
+                    elif u == "DATA":
+                        data = []
+                        w("354 go ahead")
+                    elif u == "QUIT":
+                        w("221 bye")
+                        return
+                    else:
+                        w("502 not here")
+
+        socketserver.ThreadingTCPServer.daemon_threads = True
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@test("readiness: vCenter facts grade VMs ready / worth a look / likely to fail")
+def t_readiness_rules():
+    from vcfaimport import readiness
+    good = dict(ip="10.0.0.5", facts_json=json.dumps(
+        {"hw_version": "VMX_19", "disk_backings": ["VMDK_FILE"], "nic_states": ["CONNECTED"]}))
+    eq(readiness.grade(readiness.assess(_disc_row(**good))), "ready")
+    codes = lambda **kw: {f["code"] for f in readiness.assess(_disc_row(**dict(good, **kw)))}  # noqa: E731
+    eq(codes(tools_status="toolsNotRunning"), {"tools_not_running"})
+    eq(readiness.grade(readiness.assess(_disc_row(**dict(good, tools_status="NOT_RUNNING")))), "block")
+    assert "non_vmdk_disk" in codes(facts_json=json.dumps({"disk_backings": ["VMDK_FILE", "RDM"]}))
+    assert "iso_connected" in codes(facts_json=json.dumps({"iso_connected": True}))
+    assert "nic_disconnected" in codes(facts_json=json.dumps({"nic_states": ["CONNECTED", "NOT_CONNECTED"]}))
+    assert "old_hardware" in codes(facts_json=json.dumps({"hw_version": "VMX_08"}))
+    assert "no_nics" in codes(nics_json="[]")
+    assert "no_ip" in codes(ip="")
+    # Powered off: a warning, not "Tools not running" (Tools cannot run while it is off).
+    off = codes(power_state="POWERED_OFF", tools_status="NOT_RUNNING")
+    assert "powered_off" in off and "tools_not_running" not in off, off
+    eq(readiness.grade([{"level": "info"}]), "ready", "info alone does not lower the grade")
+    # Rows from before this release (no facts, no ip column) never crash.
+    assert isinstance(readiness.assess(_Row(moref="vm-9", power_state="POWERED_ON")), list)
+    summ = readiness.summary([_disc_row(**good), _disc_row(moref="vm-2", **dict(good, tools_status="NOT_RUNNING"))])
+    eq(summ["grades"], {"ready": 1, "warn": 0, "block": 1})
+    eq(summ["findings"][0]["morefs"], ["vm-2"])
+
+
+@test("estimates: rounds honour parallel limits; measured batch time replaces the default")
+def t_estimate():
+    from vcfaimport import estimate as est
+    eq(est.simulate({"a": 4, "b": 1}, parallel=3, per_ns=2), 2)
+    eq(est.simulate({"a": 4}, parallel=8, per_ns=1), 4, "one namespace, one at a time")
+    eq(est.simulate({}, parallel=3, per_ns=2), 0)
+    eq(est.human(45), "45s")
+    eq(est.human(360), "6m")
+    eq(est.human(3700), "1h 01m")
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        cfg = Config()
+        cfg.batch_size, cfg.max_parallel_batches, cfg.max_parallel_batches_per_namespace = 4, 3, 2
+        cfg.settle_seconds = 0
+        e = est.estimate(store, cfg, "precheck", {"a": 16, "b": 4})
+        eq((e["batches"], e["rounds"], e["basis"]), (5, 2, "default"))
+        eq(e["seconds"], 2 * est.DEFAULT_BATCH_SECONDS["precheck"])
+        eq(est.estimate(store, cfg, "import", {})["seconds"], 0)
+        # Two finished import batches of 100s and 300s here -> the median, 200s.
+        for i, secs in enumerate((100, 300)):
+            store.conn.execute(
+                "INSERT INTO batches(name, namespace, stage, wave, state, created_at, applied_at, finished_at,"
+                " run_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("b{}".format(i), "a", "import", 1, "succeeded", "2026-09-20T09:59:00Z", "2026-09-20T10:00:00Z",
+                 "2026-09-20T10:{:02d}:{:02d}Z".format(secs // 60, secs % 60), "r1"))
+        store.conn.commit()
+        e = est.estimate(store, cfg, "import", {"a": 4})
+        eq((e["basis"], e["samples"], e["seconds"]), ("measured", 2, 200))
+        store.close()
+
+
+@test("verification: TCP and vCenter checks, IP preserved or changed, verdicts")
+def t_verify_checks():
+    import socket
+    from vcfaimport import verify
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    open_port = listener.getsockname()[1]
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+    try:
+        eq(verify.tcp("127.0.0.1", open_port, 2)[0], "ok")
+        eq(verify.tcp("127.0.0.1", closed_port, 2)[0], "fail")
+
+        class Client:
+            def __init__(self, ip, power="POWERED_ON", tools="RUNNING"):
+                self.ip, self.power, self.tools = ip, power, tools
+
+            def vm_detail(self, moref):
+                return {"power_state": self.power}
+
+            def vm_tools(self, moref):
+                return self.tools
+
+            def guest_ip(self, moref):
+                return self.ip
+
+        cfg = Config()
+        cfg.verify_ping, cfg.verify_ports, cfg.verify_timeout_seconds = False, [open_port], 2
+        row = _Row(moref="vm-1", src_ip="127.0.0.1")
+        verdict, checks = verify.verify_one(row, cfg, Client("127.0.0.1"))
+        eq(verdict, "ok", checks)
+        eq([c["check"] for c in checks], ["powered on", "VMware Tools", "IP preserved", "tcp {}".format(open_port)])
+        verdict, checks = verify.verify_one(_Row(moref="vm-1", src_ip="10.9.9.9"), cfg, Client("127.0.0.1"))
+        eq(verdict, "fail", "the guest came up on a different IP")
+        assert "was 10.9.9.9" in checks[2]["detail"], checks
+        eq(verify.verify_one(row, cfg, Client("127.0.0.1", power="POWERED_OFF"))[0], "fail")
+        cfg.verify_ports = []
+        eq(verify.verify_one(row, cfg, None)[0], "warn", "nothing could be checked")
+        cfg.verify_ports = [closed_port]
+        eq(verify.verify_one(row, cfg, None)[0], "fail")
+        # ping: success or "no ping command here" -- never an exception
+        assert verify.ping("127.0.0.1", 2)[0] in ("ok", "skip")
+        # one surprise does not stop the rest
+        class Boom(Client):
+            def vm_detail(self, moref):
+                if moref == "vm-2":
+                    raise RuntimeError("kaboom")
+                return super().vm_detail(moref)
+        out = verify.verify_many([row, _Row(moref="vm-2", src_ip="")], cfg, Boom("127.0.0.1"))
+        eq([o[1] for o in out], ["fail", "fail"])
+        assert "kaboom" in out[1][2][0]["detail"]
+    finally:
+        listener.close()
+
+
+@test("notifications: channel checks, Teams/Slack/webhook payloads, email, event filters")
+def t_notify_channels():
+    from vcfaimport import notify
+    for bad, why in [({"type": "pager", "url": "http://x"}, "type"),
+                     ({"type": "teams", "url": "ftp://x"}, "url"),
+                     ({"type": "webhook", "url": "http://x", "events": ["nope"]}, "unknown event"),
+                     ({"type": "email", "smtp_host": "h", "from": "a@x", "to": "b@x", "password": "s"}, "password_env"),
+                     ({"type": "email", "smtp_host": "h", "to": "b@x"}, "from")]:
+        try:
+            notify.validate([bad])
+            raise AssertionError("accepted " + why)
+        except ValueError as exc:
+            assert why in str(exc), (why, exc)
+    cap, smtp = _Capture(), _FakeSmtp()
+    try:
+        channels = notify.validate([
+            {"type": "teams", "name": "ops-teams", "url": cap.url + "/teams"},
+            {"type": "slack", "url": cap.url + "/slack"},
+            {"type": "webhook", "url": cap.url + "/hook", "events": "job_failed, verify_failed"},
+            {"type": "webhook", "url": cap.url + "/quiet", "events": ["job_succeeded"]},
+            {"type": "webhook", "url": cap.url + "/off", "enabled": False},
+            {"type": "email", "smtp_host": "127.0.0.1", "smtp_port": smtp.port, "starttls": False,
+             "from": "vcfa@lab", "to": "ops@lab, oncall@lab"},
+        ])
+        eq(channels[5]["to"], ["ops@lab", "oncall@lab"])
+        log = []
+        notify.send(channels, "job_failed", "Import wave 2 failed", "3 VMs failed", {"wave": 2, "empty": ""},
+                    {"context": "Supervisor"}, record=lambda lvl, msg: log.append((lvl, msg)), wait=True)
+        paths = sorted(p for p, _ in cap.got)
+        eq(paths, ["/hook", "/slack", "/teams"])
+        body = dict(cap.got)
+        eq(body["/teams"]["@type"], "MessageCard")
+        eq(body["/teams"]["themeColor"], notify.COLOR["bad"])
+        eq(body["/teams"]["sections"][0]["facts"], [{"name": "wave", "value": "2"}])
+        assert body["/slack"]["text"].startswith("*Import wave 2 failed*"), body["/slack"]
+        eq((body["/hook"]["event"], body["/hook"]["context"], body["/hook"]["fields"]["wave"]),
+           ("job_failed", "Supervisor", 2))
+        eq(len(smtp.got), 1)
+        assert "Subject: [vcfa-import] Import wave 2 failed" in smtp.got[0], smtp.got[0]
+        eq(sum(1 for lvl, _ in log if lvl == "info"), 4, log)
+        # a test message reaches every enabled channel, whatever its events filter
+        cap.got.clear()
+        notify.send(channels[:5], "test", "hello", wait=True)
+        eq(sorted(p for p, _ in cap.got), ["/hook", "/quiet", "/slack", "/teams"])
+        # delivery retries, then reports -- it never raises out of send()
+        dead = notify.validate([{"type": "webhook", "url": "http://127.0.0.1:9/x"}])[0]
+        try:
+            notify.deliver(dead, "test", "t", "", {}, {}, attempts=2, pause=0)
+            raise AssertionError("delivered to a closed port")
+        except OSError:
+            pass
+    finally:
+        cap.close()
+        smtp.close()
+
+
+@test("users and approvals: tokens, roles, the two-person rule, one use per approval")
+def t_access_rules():
+    from vcfaimport import access
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        tok = access.create_user(store, "alice", "operator", "owner")
+        eq(access.authenticate(store, tok), {"name": "alice", "role": "operator"})
+        eq(access.authenticate(store, tok + "x"), None)
+        eq(access.authenticate(store, ""), None)
+        assert tok not in json.dumps([dict(r) for r in store.conn.execute("SELECT * FROM users")]), \
+            "only a hash of the token is stored"
+        for name, role in (("owner", "admin"), ("bad name", "viewer"), ("carol", "root")):
+            try:
+                access.create_user(store, name, role, "owner")
+                raise AssertionError("accepted {}/{}".format(name, role))
+            except access.AccessError:
+                pass
+        tok2 = access.create_user(store, "alice", "viewer", "owner")
+        eq(access.authenticate(store, tok), None, "a re-issued link retires the old one")
+        eq(access.authenticate(store, tok2)["role"], "viewer")
+        access.set_disabled(store, "alice", True, "owner")
+        eq(access.authenticate(store, tok2), None)
+        access.set_disabled(store, "alice", False, "owner")
+        assert access.authenticate(store, tok2)
+        assert access.allows("admin", "operator") and access.allows("viewer", "viewer")
+        assert not access.allows("viewer", "operator") and not access.allows(None, "viewer")
+
+        cfg = Config()
+        cfg.require_approval = ["import", "rollback"]
+        assert access.needs_approval(cfg, "import", {"waves": [1]})
+        assert not access.needs_approval(cfg, "import", {"dry_run": True}), "a dry run changes nothing"
+        assert not access.needs_approval(cfg, "precheck", {})
+        a = access.request(store, "import", {"waves": [2], "confirm": True}, "alice")
+        eq((a["state"], a["summary"], "confirm" in a["body"]), ("pending", "import wave 2", False))
+        try:
+            access.decide(store, a["id"], True, "alice")
+            raise AssertionError("approved own request")
+        except access.AccessError:
+            pass
+        a = access.decide(store, a["id"], True, "bob", "window agreed")
+        eq((a["state"], a["decided_by"], a["note"]), ("approved", "bob", "window agreed"))
+        for stage in ("rollback", "import"):
+            if stage == "rollback":
+                try:
+                    access.consume(store, a["id"], stage)
+                    raise AssertionError("an import approval used for a rollback")
+                except access.AccessError:
+                    pass
+        eq(access.consume(store, a["id"], "import", "job-1")["state"], "executed")
+        try:
+            access.consume(store, a["id"], "import")
+            raise AssertionError("an approval used twice")
+        except access.AccessError:
+            pass
+        rows = [dict(r) for r in store.conn.execute("SELECT actor FROM events WHERE message LIKE 'approval%'")]
+        eq({r["actor"] for r in rows}, {"alice", "bob"})
+        store.close()
+
+
+@test("change windows: times, validation, approval gating, due and missed windows")
+def t_schedule_rules():
+    from datetime import timedelta
+    from vcfaimport import access
+    from vcfaimport import schedule as sch
+    eq(sch.iso(sch.parse_when("2026-09-26T22:00:00Z")), "2026-09-26T22:00:00Z")
+    eq(sch.iso(sch.parse_when("2026-09-26T22:00:00+02:00")), "2026-09-26T20:00:00Z")
+    assert sch.parse_when("2026-09-26 22:00").tzinfo is not None, "local time is made explicit"
+    for bad in ("", "tomorrow", "26/09/2026"):
+        try:
+            sch.parse_when(bad)
+            raise AssertionError("parsed " + bad)
+        except sch.ScheduleError:
+            pass
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        now = sch.now_utc()
+        for stage, start, end in (("commit", now, now + timedelta(hours=1)),
+                                  ("import", now + timedelta(hours=1), now),
+                                  ("import", now - timedelta(hours=2), now - timedelta(hours=1)),
+                                  ("import", now, now + timedelta(minutes=3))):
+            try:
+                sch.create(store, stage, {}, start, end, "alice")
+                raise AssertionError("accepted {} {} {}".format(stage, start, end))
+            except sch.ScheduleError:
+                pass
+        s1 = sch.create(store, "precheck", {"waves": [1], "confirm": True}, now - timedelta(minutes=1),
+                        now + timedelta(hours=1), "alice")
+        eq((s1["state"], s1["body"], s1["created_by"]), ("scheduled", {"waves": [1], "stage": "precheck"}, "alice"))
+        s2 = sch.create(store, "import", {"waves": [1]}, now + timedelta(hours=2), now + timedelta(hours=3),
+                        "alice", needs_approval=True)
+        eq(s2["state"], "awaiting_approval")
+        eq([s["id"] for s in sch.due(store)], [s1["id"]], "only an open, approved window is due")
+        eq(sch.next_open(store)["id"], s1["id"])
+        a = access.request(store, "import", s2["body"], "alice", schedule_id=s2["id"])
+        sch.on_approval(store, access.decide(store, a["id"], True, "bob"))
+        eq(sch.get(store, s2["id"])["state"], "scheduled")
+        eq(len(sch.due(store, at=now + timedelta(hours=2, minutes=5))), 1)
+        # Nobody ran the scheduler: both windows are missed once they close.
+        missed = sch.sweep_missed(store, at=now + timedelta(hours=4))
+        eq(sorted(m["id"] for m in missed), sorted([s1["id"], s2["id"]]))
+        assert all("closed" in m["message"] for m in missed)
+        try:
+            sch.cancel(store, s1["id"], "alice")
+            raise AssertionError("cancelled a missed window")
+        except sch.ScheduleError:
+            pass
+        s3 = sch.create(store, "import", {}, now + timedelta(hours=5), now + timedelta(hours=6), "alice", True)
+        a = access.request(store, "import", {}, "alice", schedule_id=s3["id"])
+        sch.on_approval(store, access.decide(store, a["id"], False, "bob"))
+        eq(sch.get(store, s3["id"])["state"], "cancelled", "a rejected window never runs")
+        store.close()
+
+
+@test("settings: workspace overrides layer over the file, with guardrails and reset")
+def t_settings_overlay():
+    from vcfaimport import settings as settings_mod
+    from vcfaimport.config import ConfigError
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        store.actor = "alice"
+        file_cfg = Config()
+        file_cfg.batch_size = 10
+        settings_mod.update(store, {"batch_size": "25", "verify_ports": "22, 443", "require_approval": "commit,import",
+                                    "app_together": "yes"}, "alice")
+        cfg = settings_mod.apply(Config(), store)
+        eq((cfg.batch_size, cfg.verify_ports, cfg.require_approval, cfg.app_together),
+           (25, [22, 443], ["import", "commit"], True))
+        settings_mod.apply(cfg, store)   # applying twice is a no-op
+        for bad in ({"batch_size": 0}, {"batch_size": 5000}, {"failure_rate_abort": "lots"},
+                    {"verify_ports": "70000"}, {"require_approval": "precheck"}, {"kubectl": "rm"},
+                    {"commit_action": "Sometimes"}, {"app_together": "maybe"},
+                    {"notify": [{"type": "email", "smtp_host": "h", "from": "a@x", "to": "b@x", "password": "p"}]}):
+            try:
+                settings_mod.update(store, bad, "alice")
+                raise AssertionError("accepted {}".format(bad))
+            except (ConfigError, ValueError):
+                pass
+        eq(settings_mod.overlay(store)["batch_size"], 25, "a refused change changes nothing")
+        rows = {r["key"]: r for r in settings_mod.describe(file_cfg, store)}
+        eq((rows["batch_size"]["value"], rows["batch_size"]["file_value"], rows["batch_size"]["overridden"]),
+           (25, 10, True))
+        eq(rows["poll_interval_seconds"]["overridden"], False)
+        settings_mod.update(store, {"batch_size": None}, "alice")
+        eq(settings_mod.apply(copy.deepcopy(file_cfg), store).batch_size, 10, "reset falls back to the file")
+        logged = [r["message"] for r in store.conn.execute("SELECT message FROM events WHERE actor='alice'")]
+        assert any("batch_size = 25" in m for m in logged) and any("reset" in m for m in logged), logged
+        store.close()
+
+
+@test("tag map: exact tags beat globs; tag placement sits between the row and the folder map")
+def t_tag_map_stage():
+    from vcfaimport.discovery import match_tag_map, stage, tag_map_from_rows
+    m = tag_map_from_rows([{"tag": "Application:*", "namespace": "ns-apps", "wave": "3"},
+                           {"tag": "Application:Payroll", "namespace": "ns-pay", "wave": "1"}])
+    eq(match_tag_map(["Tier:Web", "application:payroll"], m)[0], "Application:Payroll")
+    eq(match_tag_map(["Application:CRM"], m)[1].namespace, "ns-apps")
+    eq(match_tag_map(["Tier:Web"], m), None)
+    try:
+        tag_map_from_rows([{"tag": "A:B", "namespace": "x", "wave": "soon"}])
+        raise AssertionError("bad wave accepted")
+    except Exception as exc:  # noqa: BLE001
+        assert "wave" in str(exc)
+    from vcfaimport.discovery import folder_map_from_rows, network_map_from_rows
+    nets = network_map_from_rows([{"portgroup": "*", "subnet": "sub-a"}])
+    folders = folder_map_from_rows([{"folder": "Production", "namespace": "ns-folder", "wave": "5"}])
+    rows = [_disc_row(moref="vm-1", tags_json='["Application:Payroll"]'),
+            _disc_row(moref="vm-2", tags_json='["Application:CRM"]', namespace="ns-picked", wave=7),
+            _disc_row(moref="vm-3", tags_json='[]')]
+    res = stage(rows, Config(), mapping=nets, folder_mapping=folders, tag_mapping=m)
+    got = {r.moref: (r.namespace, r.wave) for r in res.records}
+    eq(got, {"vm-1": ("ns-pay", 1), "vm-2": ("ns-picked", 7), "vm-3": ("ns-folder", 5)})
+
+
+@test("apps: an application is aligned to one wave, and only imported whole")
+def t_apps_together():
+    from vcfaimport import service
+    from vcfaimport.discovery import network_map_from_rows, stage
+    from vcfaimport.engine import Engine
+    from vcfaimport import state as st
+    cfg = Config()
+    cfg.app_category, cfg.app_together = "Application", True
+    nets = network_map_from_rows([{"portgroup": "*", "subnet": "sub-a"}])
+    rows = [_disc_row(moref="vm-1", tags_json='["Application:Payroll"]', namespace="ns-a", wave=2),
+            _disc_row(moref="vm-2", tags_json='["application:Payroll", "Tier:DB"]', namespace="ns-a", wave=1),
+            _disc_row(moref="vm-3", tags_json='["Application:CRM"]', namespace="ns-a", wave=3)]
+    res = stage(rows, cfg, mapping=nets)
+    eq({r.moref: (r.wave, r.app) for r in res.records},
+       {"vm-1": (1, "Payroll"), "vm-2": (1, "Payroll"), "vm-3": (3, "CRM")})
+    assert res.app_moves and "Payroll" in res.app_moves[0], res.app_moves
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg.kubectl = "vcfa-test-no-such-kubectl"
+        cfg.workdir = tmp
+        store = _store(tmp)
+        store.sync_inventory(res.records)
+        store.set_vm_state("vm-1", st.S_PRECHECK_PASSED, message="test")
+        store.set_vm_state("vm-3", st.S_PRECHECK_PASSED, message="test")
+        engine = Engine(cfg, store, None, lambda m: None)
+        eq([r["moref"] for r in engine.eligible("import", 1)], [], "Payroll waits for vm-2's precheck")
+        assert "Payroll" in engine.holdbacks[0] and "pending" in engine.holdbacks[0], engine.holdbacks
+        notes = service.holdbacks(engine, "import")
+        eq(len(notes), 1)
+        assert notes[0].startswith("wave 1:"), notes
+        eq([r["moref"] for r in engine.eligible("import", 3)], ["vm-3"])
+        store.set_vm_state("vm-2", st.S_PRECHECK_PASSED, message="test")
+        eq(sorted(r["moref"] for r in engine.eligible("import", 1)), ["vm-1", "vm-2"])
+        cfg.app_together = False
+        store.set_vm_state("vm-2", st.S_PRECHECK_FAILED, message="test")
+        eq([r["moref"] for r in engine.eligible("import", 1)], ["vm-1"], "off: VMs move on their own")
+        # Moving one member moves the app when apps are kept together.
+        cfg.app_together = True
+        moved = service.move_wave(store, cfg, ["vm-1"], 4)
+        eq((moved["moved"], moved["pulled_with_app"]), (2, 1))
+        eq(service.app_splits(store), [])
+        moved = service.move_wave(store, cfg, ["vm-1"], 5, with_app=False)
+        eq((moved["moved"], moved["pulled_with_app"]), (1, 0))
+        eq([s["app"] for s in service.app_splits(store)], ["Payroll"])
+        store.close()
+
+
+@test("readiness exclusion keeps blocked VMs out of precheck, and says so")
+def t_readiness_exclusion():
+    from vcfaimport.engine import Engine
+    from vcfaimport import service
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _seed_store_with_vms(store, 4, waves=(1,))
+        store.conn.execute("UPDATE discovered SET tools_status='NOT_RUNNING' WHERE moref='vm-1001'")
+        store.conn.commit()
+        cfg = Config()
+        cfg.kubectl, cfg.workdir = "vcfa-test-no-such-kubectl", tmp
+        engine = Engine(cfg, store, None, lambda m: None)
+        eq(len(engine.eligible("precheck", 1)), 4, "off by default")
+        cfg.readiness_exclude_blocked = True
+        eligible = [r["moref"] for r in engine.eligible("precheck", 1)]
+        assert "vm-1001" not in eligible and len(eligible) == 3, eligible
+        eq(service.holdbacks(engine, "precheck"), ["wave 1: 1 VM(s) held back: readiness marks them blocked"])
+        store.close()
+
+
+@test("web console: named users and roles; settings, apps, readiness and notify-test endpoints")
+def t_web_roles_settings():
+    cap = _Capture()
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            eq(c.ok("GET", "/api/me")["user"], {"name": "owner", "role": "admin"})
+            toks = {}
+            for name, role in (("vic", "viewer"), ("olga", "operator"), ("otto", "operator"), ("ada", "admin")):
+                toks[name] = c.ok("POST", "/api/users", {"name": name, "role": role})["token"]
+            eq(c.call("POST", "/api/users", {"name": "owner", "role": "admin"})[0], 400)
+            eq(c.call("GET", "/api/me", token=toks["olga"])[1]["user"], {"name": "olga", "role": "operator"})
+            eq(c.call("GET", "/api/overview", token=toks["vic"])[0], 200, "a viewer reads")
+            status, body, _ = c.call("POST", "/api/select", {"morefs": ["vm-1"], "selected": True}, token=toks["vic"])
+            eq(status, 403, "a viewer changes nothing")
+            assert "viewer" in body["error"], body
+            eq(c.call("POST", "/api/run/execute", {"stage": "precheck", "confirm": True}, token=toks["vic"])[0], 403)
+            eq(c.call("PUT", "/api/settings", {"changes": {"batch_size": 5}}, token=toks["olga"])[0], 403,
+               "an operator cannot change guardrails")
+            eq(c.call("GET", "/api/users", token=toks["otto"])[0], 403)
+            eq(c.call("GET", "/api/settings", token=toks["olga"])[0], 200)
+            eq(c.call("PUT", "/api/settings", {"changes": {"batch_size": 7}}, token=toks["ada"])[0], 200)
+            # Settings: guardrails refused with 400, accepted ones take effect at once
+            eq(c.call("PUT", "/api/settings", {"changes": {"batch_size": 0}})[0], 400)
+            eq(c.call("PUT", "/api/settings", {"changes": "batch_size=3"})[0], 400)
+            rows = {r["key"]: r for r in c.ok("GET", "/api/settings")["settings"]}
+            eq((rows["batch_size"]["value"], rows["batch_size"]["overridden"]), (7, True))
+            eq(c.ok("GET", "/api/info")["settings"]["batch_size"], 7, "the console uses it right away")
+            # Notification channels: a secret is refused; a test message reaches the webhook
+            bad = [{"type": "email", "smtp_host": "h", "from": "a@x", "to": "b@x", "password": "hunter2"}]
+            eq(c.call("PUT", "/api/settings", {"changes": {"notify": bad}})[0], 400)
+            c.ok("PUT", "/api/settings", {"changes": {"notify": [{"type": "webhook", "url": cap.url + "/h"}]}})
+            res = c.ok("POST", "/api/settings/notify-test", {})["results"]
+            eq([r["level"] for r in res], ["info"], res)
+            eq(cap.got[-1][1]["event"], "test")
+            eq(cap.got[-1][1]["fields"]["sent by"], "owner")
+            # Disabling a user takes effect on their next request
+            c.ok("POST", "/api/users/olga/disable", {})
+            eq(c.call("GET", "/api/me", token=toks["olga"])[0], 401)
+            eq(c.call("POST", "/api/users/nobody/disable", {})[0], 404)
+            users = {u["name"]: u for u in c.ok("GET", "/api/users")["users"]}
+            eq(users["olga"]["disabled"], 1)
+            assert users["vic"]["last_seen"], "use is recorded"
+            eq(c.ok("GET", "/api/readiness")["grades"], {"ready": 0, "warn": 0, "block": 0})
+            eq(c.ok("GET", "/api/apps")["apps"], [])
+            # The audit trail names who did what
+            actors = {e.get("actor") for e in c.ok("GET", "/api/events")["events"]}
+            assert {"owner", "ada"} <= actors, actors
+        finally:
+            c.close()
+            cap.close()
+
+
+@test("e2e web: tags and apps, change window, two-person import, verification, notifications")
+def t_e2e_web_governance():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from datetime import timedelta
+    from vcfaimport import schedule as sch
+    server, port = fake_vcenter.serve(count=24)
+    cap = _Capture()
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ.update(_e2e_env(tmp, "happy", settle="1"))
+            os.environ.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                              VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            _seed_cluster(tmp, ["ns-a", "ns-b"], ["ns-a/sub-a", "ns-b/sub-a"])
+            cfg = Config.load(_write_config(tmp, failure_rate_abort=0.9))
+            c = _Console(tmp, cfg)
+            try:
+                eq(c.wait(c.ok("POST", "/api/run/discover", {})["job"])["status"], "succeeded")
+                vms = c.ok("GET", "/api/discovered")["vms"]
+                assert all(v["tags"] for v in vms), "every fake VM carries tags"
+                assert {v["readiness"] for v in vms} >= {"ready", "block"}, {v["readiness"] for v in vms}
+                eq({v["app"] for v in vms}, {""}, "no app category yet")
+                c.ok("PUT", "/api/settings", {"changes": {
+                    "app_category": "Application", "app_together": True, "verify_ping": False,
+                    "notify": [{"type": "webhook", "url": cap.url + "/h"}]}})
+                vms = c.ok("GET", "/api/discovered")["vms"]
+                assert {v["app"] for v in vms} == set(fake_vcenter.APPS), {v["app"] for v in vms}
+                ready = [v["moref"] for v in vms if v["readiness"] != "block"]
+                c.ok("POST", "/api/select", {"morefs": ready, "selected": True})
+
+                # Tag map: Payroll to ns-b, wave 2; everything else by the default.
+                tag_rows = [{"tag": "Application:Payroll", "namespace": "ns-b", "wave": "2"}]
+                body = {"network_rows": [{"portgroup": "*", "subnet": "sub-a"}], "tag_rows": tag_rows,
+                        "default_namespace": "ns-a", "default_wave": 1}
+                preview = c.ok("POST", "/api/stage/preview", body)
+                eq(preview["problems"], [])
+                for r in preview["records"]:
+                    eq(r["namespace"], "ns-b" if r["app"] == "Payroll" else "ns-a", r["vm_name"])
+                cov = {t["tag"]: t for t in preview["coverage"]["tags"]}
+                eq(cov["Application:Payroll"]["namespace"], "ns-b")
+                c.ok("POST", "/api/stage", dict(body, save_maps=True))
+                eq(c.ok("GET", "/api/maps")["tag"]["rows"][0]["tag"], "Application:Payroll")
+                apps = {a["app"]: a for a in c.ok("GET", "/api/apps")["apps"]}
+                eq(set(map(str, apps["Payroll"]["waves"])), {"2"})
+                eq(apps["Payroll"]["split"], False)
+                ov = c.ok("GET", "/api/overview")
+                assert ov["apps"] and ov["estimates"], ov.keys()
+
+                # A change window: precheck everything, run by the scheduler.
+                now = sch.now_utc()
+                window = {"stage": "precheck", "start_at": sch.iso(now - timedelta(minutes=1)),
+                          "end_at": sch.iso(now + timedelta(minutes=30))}
+                fit = c.ok("POST", "/api/schedules/fit", window)
+                assert fit["fits"] and fit["estimate"]["batches"] > 0, fit
+                sched = c.ok("POST", "/api/schedules", window)["schedule"]
+                eq(sched["state"], "scheduled")
+                job = c.app.scheduler_tick()
+                assert job is not None, "the open window started"
+                eq(c.app.scheduler_tick(), None, "never twice")
+                snap = c.wait(job.summary())
+                eq(snap["status"], "succeeded", snap.get("error"))
+                assert snap["user"].startswith("scheduler"), snap["user"]
+                sched = c.ok("GET", "/api/schedules")["schedules"][0]
+                eq(sched["state"], "done", sched)
+                assert sched["job_id"] == job.id
+
+                # Two-person rule for the import.
+                c.ok("PUT", "/api/settings", {"changes": {"require_approval": ["import"],
+                                                          "verify_after_import": True}})
+                olga = c.ok("POST", "/api/users", {"name": "olga", "role": "operator"})["token"]
+                otto = c.ok("POST", "/api/users", {"name": "otto", "role": "operator"})["token"]
+                pre = c.ok("POST", "/api/execute/preview", {"stage": "import"})
+                assert pre["needs_approval"] and pre["seconds"] > 0, pre
+                st_, dry, _ = c.call("POST", "/api/run/execute",
+                                     {"stage": "import", "dry_run": True, "confirm": True}, token=olga)
+                assert "job" in dry, "a dry run needs no approval"
+                c.wait(dry["job"])
+                st_, req, _ = c.call("POST", "/api/run/execute", {"stage": "import", "confirm": True}, token=olga)
+                eq(st_, 200)
+                assert "approval" in req and "job" not in req, req
+                aid = req["approval"]["id"]
+                eq(c.call("POST", "/api/approvals/{}/decide".format(aid), {"approve": True}, token=olga)[0], 403)
+                st_, dec, _ = c.call("POST", "/api/approvals/{}/decide".format(aid), {"approve": True}, token=otto)
+                eq(st_, 200, dec)
+                snap = c.wait(dec["job"])
+                eq(snap["status"], "succeeded", snap.get("error"))
+                assert "olga" in snap["user"] and "otto" in snap["user"], snap["user"]
+                eq(c.ok("GET", "/api/approvals")["approvals"][0]["state"], "executed")
+                assert any("verification:" in line[2] for line in snap["log"]), "verified after the import"
+
+                committed = [v for v in c.ok("GET", "/api/vms")["vms"] if v["state"] == "committed"]
+                assert committed and all(v["verify_state"] in ("ok", "warn", "fail") for v in committed)
+                detail = c.ok("GET", "/api/vms/" + committed[0]["moref"])["vm"]
+                eq(detail["verify"][0]["check"], "powered on")
+                assert detail["verify_history"], detail.keys()
+
+                # Re-verify on demand, as a job.
+                snap = c.wait(c.ok("POST", "/api/run/verify", {"wave": 1})["job"])
+                eq(snap["status"] in ("succeeded", "warning"), True, snap)
+                assert snap["result"]["checked"] > 0
+
+                assert cap.wait_for(lambda p, b: b.get("event") == "approval_requested")
+                assert cap.wait_for(lambda p, b: b.get("event") in ("job_succeeded", "job_warning")
+                                    and "Import" in b.get("title", "")), [b.get("event") for _, b in cap.got]
+                assert cap.wait_for(lambda p, b: b.get("event") == "schedule_finished")
+            finally:
+                c.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+        cap.close()
+
+
+@test("e2e cli: settings, readiness, tag filter, approvals between two OS users, verify")
+def t_e2e_cli_governance():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    server, port = fake_vcenter.serve(count=16)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy", settle="1")
+            env.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                       VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            as_user = lambda name: dict(env, LOGNAME=name, USER=name, LNAME=name, USERNAME=name)  # noqa: E731
+            alice, bob = as_user("alice"), as_user("bob")
+            _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-a"])
+            cfg = _write_config(tmp)
+            _run_cli(["-c", cfg, "discover"], alice, tmp)
+            out = _run_cli(["-c", cfg, "readiness"], alice, tmp, expect=None)
+            assert out.returncode in (0, 4) and "readiness of 16 VM(s)" in out.stdout, out.stdout
+            _run_cli(["-c", cfg, "settings", "set", "app_category=Application", "require_approval=import",
+                      "verify_ping=false"], alice, tmp)
+            out = _run_cli(["-c", cfg, "settings", "show"], alice, tmp).stdout
+            assert "app_category" in out and "Application" in out, out
+            _run_cli(["-c", cfg, "settings", "set", "batch_size=0"], alice, tmp, expect=2)
+            _run_cli(["-c", cfg, "select", "--tag", "Application:Payroll"], alice, tmp)
+            write_csv(str(Path(tmp, "pg.csv")), [["*", "ns-a", "sub-a", "1", "", "", ""]],
+                      ["portgroup", "namespace", "subnet", "wave", "device_key", "subnet_kind", "subnet_api_group"])
+            _run_cli(["-c", cfg, "stage", "--map", str(Path(tmp, "pg.csv"))], alice, tmp)
+            vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], alice, tmp).stdout)
+            assert 0 < len(vms) < 16, len(vms)
+            _run_cli(["-c", cfg, "precheck", "--yes"], alice, tmp)
+            out = _run_cli(["-c", cfg, "run", "--yes"], alice, tmp, expect=None)
+            assert out.returncode != 0 and "approval" in (out.stdout + out.stderr), out.stdout
+            _run_cli(["-c", cfg, "approvals", "request", "--stage", "import"], alice, tmp)
+            out = _run_cli(["-c", cfg, "approvals", "approve", "1"], alice, tmp, expect=2)
+            assert "person who made it" in (out.stdout + out.stderr)
+            _run_cli(["-c", cfg, "approvals", "approve", "1"], bob, tmp)
+            _run_cli(["-c", cfg, "run", "--yes", "--approval", "1"], alice, tmp)
+            _run_cli(["-c", cfg, "run", "--yes", "--approval", "1"], alice, tmp, expect=None)
+            out = _run_cli(["-c", cfg, "verify"], alice, tmp, expect=None)
+            assert "verified" in out.stdout, out.stdout
+            out = _run_cli(["-c", cfg, "approvals", "list", "--all"], alice, tmp).stdout
+            assert "executed" in out and "bob" in out, out
+            ledger = Path(tmp, "run", "ledger.jsonl").read_text(encoding="utf-8")
+            assert '"actor": "alice"' in ledger or '"actor":"alice"' in ledger, "the ledger names the operator"
+    finally:
+        server.shutdown()
+
+
 UNIT = [
+    t_readiness_rules, t_estimate, t_verify_checks, t_notify_channels, t_access_rules,
+    t_schedule_rules, t_settings_overlay, t_tag_map_stage, t_apps_together, t_readiness_exclusion,
+    t_web_roles_settings,
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,
     t_precheck_no_commit,
     t_inventory_aliases, t_inventory_dupes, t_inventory_multinic, t_inventory_skip,
@@ -3794,6 +4514,7 @@ UNIT = [
 ]
 
 E2E = [
+    t_e2e_web_governance, t_e2e_cli_governance,
     t_fake_operator_name_collision,
     t_e2e_happy, t_e2e_precheck_gate, t_e2e_preflight_missing, t_e2e_flaky,
     t_e2e_init_maps, t_e2e_preflight_subnet_hint, t_e2e_preflight_vpc_subnet, t_e2e_preflight_operator_pod,

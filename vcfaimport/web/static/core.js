@@ -85,6 +85,13 @@ const ICONS = {
   up: '<path d="M6 15l6-6 6 6"/>',
   down: '<path d="M6 9l6 6 6-6"/>',
   key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M16 7l3 3M18 5l2 2"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  gear: '<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M4.6 4.6l2.1 2.1M17.3 17.3l2.1 2.1M2.5 12h3M18.5 12h3M4.6 19.4l2.1-2.1M17.3 6.7l2.1-2.1"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/>',
+  bell: '<path d="M6 8a6 6 0 1112 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 004 0"/>',
+  tag: '<path d="M3 12V4a1 1 0 011-1h8l9 9-9 9z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   palette: '<path d="M12 3a9 9 0 100 18c1.1 0 1.7-.9 1.4-1.9-.3-.8.3-1.6 1.1-1.6H17a4 4 0 004-4c0-5-4-8.5-9-8.5z"/><circle cx="7.5" cy="11.5" r="1.2"/><circle cx="10.5" cy="7.5" r="1.2"/><circle cx="15.5" cy="8" r="1.2"/>',
 };
 function icon(name, cls) {
@@ -428,6 +435,13 @@ function renderDock(full, fresh) {
 async function startJob(kind, body, quiet) {
   try {
     const r = await POST('/api/run/' + kind, body || {});
+    if (r.approval) {
+      // The two-person rule: nothing started; someone else decides.
+      toast('Approval #' + r.approval.id + ' requested', r.approval.summary + ' — someone other than you approves it under Change control, and it starts then.', 'warn', 9000);
+      if (S.pulse) S.pulse.approvals_pending = (S.pulse.approvals_pending || 0) + 1;
+      renderNav();
+      return null;
+    }
     followJob(r.job.id, true);
     S.lastActive = r.job.id;
     if (!quiet) toast('Started: ' + r.job.title, 'Follow it in the log panel below.', 'info', 3500);
@@ -476,7 +490,8 @@ async function doMoveWave(morefs, current) {
   try {
     const r = await POST('/api/vms/wave', { morefs, wave });
     toast('Moved ' + plural(r.moved, 'VM') + ' to wave ' + wave,
-      r.refused.length ? r.refused.length + ' refused: ' + r.refused.slice(0, 2).join('; ') : '', r.refused.length ? 'warn' : 'ok');
+      (r.pulled_with_app ? plural(r.pulled_with_app, 'app member') + ' came along (apps move together). ' : '') +
+      (r.refused.length ? r.refused.length + ' refused: ' + r.refused.slice(0, 2).join('; ') : ''), r.refused.length ? 'warn' : 'ok');
     return true;
   } catch (e) { fail(e); return false; }
 }
@@ -549,8 +564,9 @@ function vmDrawer(moref) {
     const retry = RETRYABLE.has(vm.state), canRb = ROLLBACKABLE.has(vm.state) && vm.batch_name;
     const hasBatch = vm.batch_name || vm.precheck_batch;
     const facts = (rows) => html`<dl class="facts">${rows.filter((r) => r[1] !== '' && r[1] !== null && r[1] !== undefined).map((r) => html`<dt>${r[0]}</dt><dd>${r[1]}</dd>`)}</dl>`;
+    const blocked = (vm.readiness || []).filter((f) => f.level !== 'info');
     return {
-      head: html`<div class="row wrap"><h2>${vm.vm_name}</h2>${pill(vm.state)}</div>
+      head: html`<div class="row wrap"><h2>${vm.vm_name}</h2>${pill(vm.state)}${appTag(vm.app)}${verifyTag(vm.verify_state, vm.verified_at)}</div>
         <div class="small muted mono">${vm.moref} · wave ${vm.wave} · ${vm.namespace}</div>`,
       body: html`
         ${d.issue ? html`<div class="callout ${vm.state === 'failed' ? 'bad' : 'warn'}"><div class="ic">${icon('triage')}</div><div><h3>${d.issue.title}</h3><p>${d.issue.advice}</p></div></div>` : ''}
@@ -559,13 +575,17 @@ function vmDrawer(moref) {
           <div><div class="section-title">Source (vCenter)</div>${facts([
             ['vCenter', vm.src_vcenter], ['Datacenter', vm.src_datacenter], ['Cluster', vm.src_cluster],
             ['Folder', vm.src_folder || '/'], ['Host', vm.src_host], ['Power', (vm.src_power || '').replace('POWERED_', '').toLowerCase()],
-            ['Sizing', vm.src_cpu ? vm.src_cpu + ' vCPU · ' + n(vm.src_memory_mb) + ' MiB' : ''], ['VM Tools', vm.src_tools], ['Networks', vm.src_networks]])}</div>
+            ['Sizing', vm.src_cpu ? vm.src_cpu + ' vCPU · ' + n(vm.src_memory_mb) + ' MiB' : ''], ['VM Tools', vm.src_tools], ['Networks', vm.src_networks],
+            ['IP', vm.src_ip], ['Application', vm.app], ['Tags', (vm.tags || []).length ? tagChips(vm.tags, 6) : '']])}</div>
           <div><div class="section-title">Target (VCF Automation)</div>${facts([
             ['Namespace', vm.namespace], ['Wave', vm.wave], ['Batch group', vm.grp], ['Mode', vm.mode],
             ['Interfaces', vm.nics.map((x) => x.device_key + ' → ' + (x.subnet || '(no subnet)')).join(', ') || '(none)'],
             ['Resource', vm.target_resource || '(not reported yet)'], ['Attempts', vm.attempts], ['Last phase', vm.last_phase],
             ['Precheck batch', vm.precheck_batch], ['Import batch', vm.batch_name], ['Operation', vm.operation_name]])}</div>
         </div>
+        ${vm.state === 'committed' ? html`<div class="section-title">Post-import verification ${vm.verified_at ? html`<span class="tiny faint">${fmtTime(vm.verified_at, true)}</span>` : ''}</div>
+          ${(vm.verify || []).length ? verifyChecks(vm.verify) : html`<div class="small muted">Not verified yet. Verification checks power, VMware Tools, that the IP was kept, ping and any TCP ports set in Settings.</div>`}` : ''}
+        ${['pending', 'precheck_failed', 'precheck_running'].includes(vm.state) || blocked.length ? html`<div class="section-title">Readiness (from vCenter)</div>${findingsList(vm.readiness)}` : ''}
         ${d.batches.length ? html`<div class="section-title">Batches</div><div class="stack" style="gap:6px">${d.batches.map((b) => html`
           <div class="covrow" style="cursor:pointer" data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">
             <span class="p mono">${b.name}</span><span class="tag">${b.stage}</span>${batchTag(b.state)}<span class="arrow">${icon('chevron')}</span></div>`)}</div>` : ''}
@@ -580,6 +600,7 @@ function vmDrawer(moref) {
         <button class="btn" data-act="d_retry" ${attr(!retry, 'disabled')}>${icon('refresh')} Retry</button>
         ${vm.state === 'skipped' ? html`<button class="btn" data-act="d_unskip">Unskip</button>` : html`<button class="btn" data-act="d_skip" ${attr(s.locked, 'disabled')}>${icon('skip')} Skip</button>`}
         <button class="btn" data-act="d_wave" ${attr(s.locked, 'disabled')}>${icon('waves')} Move wave</button>
+        ${vm.state === 'committed' ? html`<button class="btn" data-act="d_verify">${icon('check')} Verify</button>` : ''}
         <span class="grow"></span>
         <button class="btn danger-ghost" data-act="d_abandon" ${attr(!hasBatch || vm.state === 'committed', 'disabled')}>${icon('trash')} Abandon batch</button>
         <button class="btn danger-ghost" data-act="d_rollback" ${attr(!canRb, 'disabled')}>${icon('rollback')} Roll back</button>`,
@@ -589,6 +610,7 @@ function vmDrawer(moref) {
         d_unskip: async () => { await doSkip([vm.moref], true); reloadDrawer(); refreshView(); },
         d_wave: async () => { if (await doMoveWave([vm.moref], vm.wave)) { reloadDrawer(); refreshView(); } },
         d_rollback: () => doRollback({ morefs: [vm.moref] }),
+        d_verify: () => startJob('verify', { morefs: [vm.moref] }),
         d_abandon: () => doAbandon({ morefs: [vm.moref] }),
       },
     };
@@ -643,6 +665,9 @@ const NAV = [
   { group: 'Investigate' },
   { id: 'triage', label: 'Triage', icon: 'triage' },
   { id: 'activity', label: 'Activity & logs', icon: 'activity' },
+  { group: 'Govern' },
+  { id: 'schedule', label: 'Change control', icon: 'calendar' },
+  { id: 'settings', label: 'Settings', icon: 'gear' },
 ];
 function navBadge(id, p) {
   if (!p) return '';
@@ -654,6 +679,7 @@ function navBadge(id, p) {
     case 'batches': return p.live_batches ? b(n(p.live_batches), 'busy') : '';
     case 'triage': return p.failed ? b(n(p.failed), 'bad') : '';
     case 'activity': return p.job ? b('1', 'busy') : '';
+    case 'schedule': return p.approvals_pending ? b(n(p.approvals_pending), 'warn') : (p.next_window && p.next_window.state === 'running' ? b('live', 'busy') : '');
     default: return '';
   }
 }
@@ -684,7 +710,16 @@ function renderTopbar() {
     ${i ? html`<span class="ctxchip" title="kubectl context">ctx <b>${i.context || 'current'}</b></span>
       <span class="ctxchip" title="commitAction for imports">commit <b class="${i.settings.commit_action === 'Auto' ? 'warn-text' : ''}">${i.settings.commit_action}</b></span>` : ''}
     <button class="btn ghost sm" data-act="palette" title="Command palette (Ctrl+K)">${icon('search')}<span class="kbd">ctrl k</span></button>
-    <button class="btn ghost icon" data-act="theme" title="Theme Studio">${icon('palette')}</button>`);
+    <button class="btn ghost icon" data-act="theme" title="Theme Studio">${icon('palette')}</button>
+    ${userChip()}`);
+  const who = typeof me === 'function' ? me() : null;
+  if (who) document.body.dataset.role = who.role;
+}
+function userChip() {
+  if (typeof me !== 'function') return '';
+  const u = me();
+  return html`<span class="userchip role-${u.role}" title="${u.role === 'viewer' ? 'Read-only link: you can look at everything and change nothing' : 'Signed in as ' + u.name + ' (' + u.role + '); your actions are recorded under this name'}">
+    ${icon(u.role === 'viewer' ? 'eye' : 'user')}<b>${u.name}</b><small>${u.role}</small></span>`;
 }
 function applyTheme() {
   if (window.FX) FX.applyTheme();

@@ -41,6 +41,8 @@ DEFAULT_PHASE_PATTERNS: List[List[str]] = [
     [r"(pending|running|inprogress|in_progress|progress|migrating|importing|precheck|initializ|creating|working|active|reconcil|objectnotready|notready)", BUCKET_RUNNING],
 ]
 
+APPROVABLE_STAGES = ("import", "commit", "rollback")
+
 DEFAULT_CONDITION_TYPES = ["Succeeded", "Ready", "Complete", "Completed", "Committed", "Imported"]
 
 
@@ -82,6 +84,24 @@ class Config:
     failure_rate_min_sample: int = 8   # ...but only after this many results
     max_vms_per_run: int = 0           # 0 = unlimited
     require_precheck: bool = True      # refuse to import VMs with no passing precheck
+    readiness_exclude_blocked: bool = False  # keep VMs readiness marks "blocked" out of precheck
+
+    # ---- governance --------------------------------------------------------
+    # Stages that need a second person: any of "import", "commit", "rollback".
+    require_approval: List[str] = field(default_factory=list)
+
+    # ---- applications -------------------------------------------------------
+    app_category: str = ""        # vCenter tag category that names the application
+    app_together: bool = False    # import an application only when all its VMs are ready
+
+    # ---- verification after import ------------------------------------------
+    verify_after_import: bool = False
+    verify_ping: bool = True
+    verify_ports: List[int] = field(default_factory=list)
+    verify_timeout_seconds: int = 2
+
+    # ---- notifications ([[notify]] tables; see README) -----------------------
+    notify: List[Dict[str, Any]] = field(default_factory=list)
 
     # ---- naming -----------------------------------------------------------
     batch_name_prefix: str = "imp"
@@ -172,6 +192,15 @@ class Config:
             raise ConfigError("poll_interval_seconds must be >= 1")
         if not 0 < float(self.failure_rate_abort) <= 1:
             raise ConfigError("failure_rate_abort must be in (0, 1]")
+        bad = sorted(set(self.require_approval) - set(APPROVABLE_STAGES))
+        if bad:
+            raise ConfigError("require_approval accepts {}; not {}".format(
+                ", ".join(APPROVABLE_STAGES), ", ".join(bad)))
+        for port in self.verify_ports:
+            if not isinstance(port, int) or not 0 < port < 65536:
+                raise ConfigError("verify_ports must be TCP port numbers, not {!r}".format(port))
+        if not isinstance(self.notify, list) or not all(isinstance(c, dict) for c in self.notify):
+            raise ConfigError("notify must be a list of [[notify]] tables")
         if "/" not in self.api_version:
             raise ConfigError("api_version must look like 'group/version'")
         for pat in self.phase_patterns:
@@ -239,6 +268,26 @@ failure_rate_abort      = 0.25   # halt the wave once 25% of results have failed
 failure_rate_min_sample = 8
 max_vms_per_run         = 0      # 0 = unlimited
 require_precheck        = true
+# readiness_exclude_blocked = false   # keep VMs readiness marks "blocked" out of precheck
+
+[governance]
+# require_approval = ["import", "commit"]   # a second person approves these (console and CLI)
+
+[apps]
+# app_category = "Application"   # vCenter tag category that names each VM's application
+# app_together = true            # import an application only when all its VMs passed precheck
+
+[verify]
+# verify_after_import    = true
+# verify_ping            = true
+# verify_ports           = [22, 443, 3389]
+# verify_timeout_seconds = 2
+
+# [[notify]]
+# name   = "ops channel"
+# type   = "teams"            # teams | slack | webhook | email
+# url    = "https://example.webhook.office.com/..."
+# events = ["job_failed", "circuit_breaker", "awaiting_commit", "approval_requested"]
 
 [naming]
 batch_name_prefix = "imp"

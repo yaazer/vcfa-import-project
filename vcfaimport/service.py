@@ -111,16 +111,25 @@ class WorkspaceLock:
 
 
 class Workspace:
-    """A campaign's config, state store, kubectl wrapper and engine, opened together."""
+    """A campaign's config, state store, kubectl wrapper and engine, opened together.
+
+    `actor` names who is acting (OS user for the CLI, console user for web
+    jobs); it is written to every transition, event and ledger line. The
+    workspace settings (console Settings page) are layered onto cfg here.
+    """
 
     def __init__(self, cfg: Config, *, dry_run: bool = False, verbose: bool = False,
-                 log: Optional[Log] = None, check_same_thread: bool = True):
+                 log: Optional[Log] = None, check_same_thread: bool = True,
+                 actor: Optional[str] = None):
         cfg.validate()
         Path(cfg.workdir).expanduser().mkdir(parents=True, exist_ok=True)
         self.cfg = cfg
         self.log: Log = log or (lambda msg: None)
         self.store = st.Store(store_path(cfg), ledger_path=cfg.ledger_path,
                               check_same_thread=check_same_thread)
+        self.store.actor = actor
+        from . import settings as _settings
+        _settings.apply(cfg, self.store)
         self.kube = Kubectl(cfg, dry_run=dry_run, verbose=verbose, log=self.log)
         self.engine = Engine(cfg, self.store, self.kube, self.log)
 
@@ -170,18 +179,39 @@ def eligible_by_wave(engine: Engine, stage: str, waves: Optional[Sequence[int]] 
     return rows
 
 
+def holdbacks(engine: Engine, stage: str, waves: Optional[Sequence[int]] = None,
+              morefs: Optional[Sequence[str]] = None, include_failed: bool = False,
+              folders: Optional[Sequence[str]] = None, folder_exact: bool = False) -> List[str]:
+    """Why VMs in scope are being kept out of this run (readiness, apps kept together).
+
+    Every wave in scope is asked, including one held back entirely -- that wave
+    has nothing eligible, so it would otherwise be silently missing from the plan."""
+    notes: List[str] = []
+    for wave in (waves or engine.store.waves()):
+        engine.eligible(stage, wave, morefs=morefs, include_failed=include_failed,
+                        folders=folders, folder_exact=folder_exact)
+        notes.extend("wave {}: {}".format(wave, h) for h in engine.holdbacks)
+    return notes
+
+
 def run_stage(engine: Engine, stage: str, *, waves: Optional[Sequence[int]] = None,
               limit: int = 0, morefs: Optional[Sequence[str]] = None,
               include_failed: bool = False, folders: Optional[Sequence[str]] = None,
               folder_exact: bool = False, rollback_failed: bool = False,
-              log: Optional[Log] = None) -> Dict[str, Any]:
+              log: Optional[Log] = None, deadline: Optional[float] = None) -> Dict[str, Any]:
     """engine.execute plus the optional --rollback-failed follow-up.
 
     Returns the totals with a "halted" key: the circuit breaker's reason, or None.
+    `deadline` (epoch seconds) is a change window's end: no batch is started
+    that its measured duration says would not finish by then.
     KeyboardInterrupt is left to the caller.
     """
     say = log or engine.log
     halted = None
+    if deadline is not None:
+        from .estimate import batch_seconds
+        engine.deadline = deadline
+        engine.deadline_batch_s = float(batch_seconds(engine.store, stage)["seconds"])
     try:
         totals = engine.execute(stage, waves=waves, limit=limit, morefs=morefs,
                                 include_failed=include_failed, watch_only=False,
@@ -192,6 +222,8 @@ def run_stage(engine: Engine, stage: str, *, waves: Optional[Sequence[int]] = No
     if stage == STAGE_IMPORT and rollback_failed and totals["failed"]:
         rollback_failed_after_run(engine, waves, folders, folder_exact, say)
     totals["halted"] = halted
+    totals["hit_deadline"] = engine.hit_deadline
+    totals["holdbacks"] = list(engine.holdbacks)
     return totals
 
 
@@ -440,3 +472,164 @@ def mapping_coverage(rows: Sequence[sqlite3.Row], folder_mapping: Dict[str, Any]
         "folders": sorted(folders.values(), key=lambda f: f["folder"].lower()),
         "networks": sorted(networks.values(), key=lambda n: n["network"].lower()),
     }
+
+
+# ------------------------------------------------------------------ waves & apps
+def move_wave(store: st.Store, cfg: Config, morefs: Sequence[str], wave: int,
+              with_app: Optional[bool] = None) -> Dict[str, Any]:
+    """Move VMs to a wave; with apps kept together, their whole applications move."""
+    together = cfg.app_together if with_app is None else with_app
+    targets = list(morefs)
+    pulled: List[str] = []
+    if together:
+        apps = sorted({r["app"] for r in store.query_vms(morefs=list(morefs)) if r["app"]})
+        extra = [m for m in store.app_members(apps) if m not in set(targets)]
+        pulled = extra
+        targets += extra
+    moved, refused = store.set_vm_wave(targets, wave)
+    return {"moved": moved, "refused": refused, "pulled_with_app": len(pulled)}
+
+
+def app_splits(store: st.Store) -> List[Dict[str, Any]]:
+    """Applications whose VMs are spread over more than one wave."""
+    waves: Dict[str, Dict[int, int]] = {}
+    for r in store.conn.execute("SELECT app, wave, COUNT(*) AS n FROM vms WHERE app != '' GROUP BY app, wave"):
+        waves.setdefault(r["app"], {})[r["wave"]] = r["n"]
+    return [{"app": a, "waves": w} for a, w in sorted(waves.items()) if len(w) > 1]
+
+
+# ------------------------------------------------------------------ notifications
+def notifier(cfg: Config) -> Callable[..., Any]:
+    """send(event, title, text, fields) for this workspace's channels.
+
+    Delivery results are logged as events through a short-lived connection
+    (the notification threads cannot share the caller's).
+    """
+    from . import notify as _notify
+
+    path, ledger = store_path(cfg), cfg.ledger_path
+
+    def record(level: str, message: str) -> None:
+        try:
+            with st.Store(path, ledger_path=ledger) as s2:
+                s2.log_event(message, level, actor="notify")
+        except Exception:  # noqa: BLE001 -- logging a notification must never fail anything
+            pass
+
+    def send(event: str, title: str, text: str = "", fields: Optional[Dict[str, Any]] = None,
+             wait: bool = False) -> None:
+        channels = getattr(cfg, "notify", None) or []
+        if channels:
+            _notify.send(channels, event, title, text, fields or {},
+                         {"context": cfg.context, "workdir": str(cfg.workdir)}, record=record, wait=wait)
+    return send
+
+
+def notify_run(cfg: Config, kind: str, title: str, status: str, result: Dict[str, Any],
+               actor: Optional[str] = None, wait: bool = False) -> None:
+    """The notifications a finished run (or job) warrants."""
+    send = notifier(cfg)
+    fields = {"by": actor, "applied": result.get("applied"), "succeeded": result.get("succeeded"),
+              "failed": result.get("failed"), "awaiting commit": result.get("awaiting_commit")}
+    if result.get("halted"):
+        send("circuit_breaker", "Run halted: " + title, str(result["halted"]), fields, wait)
+    event = {"succeeded": "job_succeeded", "warning": "job_warning", "failed": "job_failed",
+             "stopped": "job_warning"}.get(status, "job_warning")
+    text = "{} {}".format(title, {"succeeded": "finished cleanly", "warning": "finished with failures",
+                                  "failed": "failed", "stopped": "was stopped"}.get(status, status))
+    if result.get("error"):
+        text += ": " + str(result["error"])[:300]
+    send(event, title + " — " + status, text, fields, wait)
+    if kind in ("execute", "import") and result.get("awaiting_commit"):
+        send("awaiting_commit", "{} import(s) waiting for commit".format(result["awaiting_commit"]),
+             "commitAction is Wait: commit them or roll them back.", fields, wait)
+
+
+# -------------------------------------------------------------------- schedules
+def run_schedule(ws: Workspace, sched: Dict[str, Any], log: Optional[Log] = None,
+                 on_stop: Optional[Callable[[Callable[[], None]], None]] = None) -> Dict[str, Any]:
+    """Run one due change window to completion (or to its end). Caller holds the lock."""
+    from . import schedule as _sched
+    say = log or ws.log
+    body = sched["body"]
+    _sched.mark(ws.store, sched["id"], _sched.RUNNING)
+    send = notifier(ws.cfg)
+    send("schedule_started", "Change window #{} started: {}".format(sched["id"], sched["stage"]),
+         "Runs until {} UTC.".format(sched["end_at"]))
+    say("change window #{}: {} until {} UTC".format(sched["id"], sched["stage"], sched["end_at"]))
+    if on_stop:
+        on_stop(ws.engine.request_stop)
+    try:
+        totals = run_stage(ws.engine, sched["stage"], waves=body.get("waves") or None,
+                           limit=int(body.get("limit") or 0), morefs=body.get("morefs") or None,
+                           include_failed=bool(body.get("include_failed")),
+                           folders=body.get("folders") or None, folder_exact=bool(body.get("folder_exact")),
+                           rollback_failed=bool(body.get("rollback_failed")), log=say,
+                           deadline=_sched.deadline(sched))
+    except Exception as exc:
+        _sched.mark(ws.store, sched["id"], _sched.FAILED, str(exc)[:500])
+        send("schedule_finished", "Change window #{} failed".format(sched["id"]), str(exc)[:300])
+        raise
+    left = sum(n for _w, n in eligible_by_wave(ws.engine, sched["stage"], body.get("waves") or None,
+                                              folders=body.get("folders") or None))
+    if totals.get("hit_deadline") or (ws.engine.stopping and left):
+        state, msg = _sched.STOPPED, "window closed with {} VM(s) still to go".format(left)
+    else:
+        state, msg = _sched.DONE, "applied {} · succeeded {} · failed {}".format(
+            totals["applied"], totals["succeeded"], totals["failed"])
+    _sched.mark(ws.store, sched["id"], state, msg)
+    send("schedule_finished", "Change window #{} {}".format(sched["id"], state), msg,
+         {"applied": totals["applied"], "failed": totals["failed"]})
+    return dict(totals, schedule_state=state, message=msg)
+
+
+# ---------------------------------------------------------------- verification
+def verify_rows(store: st.Store, morefs: Optional[Sequence[str]] = None, wave: Optional[int] = None,
+                only_unverified: bool = False) -> List[Any]:
+    rows = store.query_vms(states=[st.S_COMMITTED], morefs=morefs, wave=wave)
+    if only_unverified:
+        rows = [r for r in rows if not r["verify_state"]]
+    return rows
+
+
+def run_verification(ws: Workspace, rows: Sequence[Any], client: Any = None,
+                     progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
+    """Check committed VMs, record every result, and notify on failures."""
+    from . import verify as _verify
+    results = _verify.verify_many(rows, ws.cfg, client, progress=progress)
+    counts = {"ok": 0, "warn": 0, "fail": 0}
+    failed = []
+    names = {r["moref"]: r["vm_name"] for r in rows}
+    for moref, verdict, checks in results:
+        ws.store.record_verification(moref, verdict, checks)
+        counts[verdict] = counts.get(verdict, 0) + 1
+        if verdict == "fail":
+            bad = [c for c in checks if c["status"] == "fail"]
+            failed.append("{}: {}".format(names.get(moref, moref),
+                                          "; ".join("{} {}".format(c["check"], c["detail"]) for c in bad)))
+            ws.store.log_event("verification failed: " + failed[-1], "error", moref=moref)
+    if failed:
+        notifier(ws.cfg)("verify_failed", "{} VM(s) failed post-import verification".format(len(failed)),
+                         "\n".join(failed[:10]), {"checked": len(results)})
+    return {"checked": len(results), "counts": counts, "failures": failed[:50]}
+
+
+# --------------------------------------------------------------------- estimates
+def wave_estimates(store: st.Store, cfg: Config) -> Dict[int, Dict[str, Any]]:
+    """Per wave: how long its remaining precheck and import would take."""
+    from .estimate import estimate
+    out: Dict[int, Dict[str, Any]] = {}
+    pre: Dict[int, Dict[str, int]] = {}
+    imp: Dict[int, Dict[str, int]] = {}
+    for r in store.conn.execute("SELECT wave, namespace, state, COUNT(*) AS n FROM vms GROUP BY wave, namespace, state"):
+        if r["state"] in (st.S_PENDING, st.S_PRECHECK_FAILED):
+            pre.setdefault(r["wave"], {}).setdefault(r["namespace"], 0)
+            pre[r["wave"]][r["namespace"]] += r["n"]
+        if r["state"] in (st.S_PENDING, st.S_PRECHECK_FAILED, st.S_PRECHECK_PASSED, st.S_FAILED, st.S_ROLLED_BACK):
+            imp.setdefault(r["wave"], {}).setdefault(r["namespace"], 0)
+            imp[r["wave"]][r["namespace"]] += r["n"]
+    for w in store.waves():
+        out[w] = {"precheck": estimate(store, cfg, "precheck", pre.get(w, {})),
+                  "import": estimate(store, cfg, "import", imp.get(w, {}))}
+    return out
+

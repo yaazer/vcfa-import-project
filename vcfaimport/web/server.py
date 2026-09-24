@@ -27,7 +27,8 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from ..config import ConfigError
-from .api import BUSY_ERRORS, ROUTES, USER_ERRORS, ApiError, WebApp
+from .. import access
+from .api import ADMIN_HANDLERS, BUSY_ERRORS, CTX, FORBIDDEN_ERRORS, OWNER, ROUTES, USER_ERRORS, ApiError, WebApp
 from .jobs import JobBusy
 
 MAX_BODY = 8 * 1024 * 1024
@@ -118,11 +119,22 @@ class Handler(BaseHTTPRequestHandler):
             name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
         return _is_loopback(name)
 
-    def _token_ok(self, query: Dict[str, str], allow_query: bool) -> bool:
+    def _user(self, query: Dict[str, str], allow_query: bool) -> Optional[Dict[str, Any]]:
+        """Who is calling: the start-up token is the owner (admin); named users have their own."""
         given = self.headers.get("X-VCFA-Token") or ""
         if not given and allow_query:
             given = query.get("t", "")
-        return bool(given) and hmac.compare_digest(given.encode(), self.token.encode())
+        if not given:
+            return None
+        if hmac.compare_digest(given.encode(), self.token.encode()):
+            return dict(OWNER)
+        return self.app.identify(given)
+
+    @staticmethod
+    def _needed_role(method: str, handler_name: str) -> str:
+        if handler_name in ADMIN_HANDLERS:
+            return "admin"
+        return "viewer" if method == "GET" else "operator"
 
     def _drain(self) -> Optional[str]:
         """Read the request body now, whatever the route and whether or not it is
@@ -197,14 +209,23 @@ class Handler(BaseHTTPRequestHandler):
             if not match or route_method != method:
                 continue
             is_export = handler_name == "export"
-            if not self._token_ok(query, allow_query=is_export):
+            user = self._user(query, allow_query=is_export)
+            if user is None:
                 self._error(401, "missing or wrong access token")
                 return
+            needed = self._needed_role(method, handler_name)
+            if not access.allows(user["role"], needed):
+                self._error(403, "{} is a {}; this needs the {} role".format(user["name"], user["role"], needed))
+                return
+            CTX.user = user
             try:
                 body = self._body() if method in ("POST", "PUT") else {}
                 result = getattr(self.app, handler_name)(query, body, **match.groupdict())
             except ApiError as exc:
                 self._error(exc.status, str(exc))
+                return
+            except FORBIDDEN_ERRORS as exc:
+                self._error(403, str(exc))
                 return
             except (JobBusy,) + BUSY_ERRORS as exc:
                 self._error(409, str(exc))
@@ -216,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
                 traceback.print_exc(file=sys.stderr)
                 self._error(500, "{}: {}".format(type(exc).__name__, exc))
                 return
+            finally:
+                CTX.user = None
             if is_export:
                 data, kind, name = result
                 self._send(200, data, kind + "; charset=utf-8",
@@ -269,6 +292,7 @@ def serve(app: WebApp, host: str, port: int, token: Optional[str] = None,
         log("  token can drive imports. Prefer 127.0.0.1 plus an SSH tunnel.")
     log("  Ctrl-C to stop. Batches already on the cluster keep running; the next")
     log("  run (or Watch) picks them up again.")
+    app.start_scheduler()
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

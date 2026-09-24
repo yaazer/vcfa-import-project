@@ -38,13 +38,40 @@ class Filters:
     with_nics: bool = False
     morefs: List[str] = field(default_factory=list)
     regex: Optional[str] = None
+    tag: List[str] = field(default_factory=list)            # glob on "Category:Tag"
 
     def is_empty(self) -> bool:
         return not any([
             self.name, self.exclude_name, self.cluster, self.folder, self.network,
             self.guest_os, self.datacenter, self.powered_on, self.powered_off,
-            self.tools_running, self.with_nics, self.morefs, self.regex,
+            self.tools_running, self.with_nics, self.morefs, self.regex, self.tag,
         ])
+
+
+def row_tags(row: Any) -> List[str]:
+    """A discovered row's vCenter tags, as "Category:Tag" strings."""
+    try:
+        return list(json.loads(row["tags_json"] or "[]") or [])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return []
+
+
+def app_of(row: Any, cfg: Config) -> str:
+    """The VM's application: set by hand, else its tag in cfg.app_category."""
+    try:
+        own = (row["app"] or "").strip()
+    except (KeyError, IndexError):
+        own = ""
+    if own:
+        return own
+    cat = (getattr(cfg, "app_category", "") or "").strip().lower()
+    if not cat:
+        return ""
+    for tag in row_tags(row):
+        c, _, name = tag.partition(":")
+        if c.strip().lower() == cat and name:
+            return name.strip()
+    return ""
 
 
 def _glob_any(value: str, patterns: Sequence[str]) -> bool:
@@ -88,6 +115,10 @@ def apply_filters(rows: Sequence[sqlite3.Row], f: Filters) -> List[sqlite3.Row]:
             continue
         if f.with_nics and not json.loads(row["nics_json"] or "[]"):
             continue
+        if f.tag:
+            tags = row_tags(row)
+            if not any(_glob_any(t, f.tag) for t in tags):
+                continue
         out.append(row)
     return out
 
@@ -183,6 +214,7 @@ class NetworkMapping:
 NETWORK_MAP_COLUMNS = ["portgroup", "namespace", "subnet", "wave", "device_key",
                        "subnet_kind", "subnet_api_group"]
 FOLDER_MAP_COLUMNS = ["folder", "namespace", "wave", "group"]
+TAG_MAP_COLUMNS = ["tag", "namespace", "wave", "group"]
 _NETWORK_KEY_ALIASES = ("portgroup", "network", "network_name")
 _FOLDER_KEY_ALIASES = ("folder", "vm_folder", "path", "folder_path")
 
@@ -315,6 +347,40 @@ def write_map_rows(path: str, columns: Sequence[str], rows: Sequence[Dict[str, A
     return len(keep)
 
 
+def read_tag_map_rows(path: str) -> List[Dict[str, str]]:
+    return _read_map_csv(path, "tag map", ("tag", "vcenter_tag", "tag_name"), "tag")
+
+
+def tag_map_from_rows(rows: Sequence[Dict[str, Any]], where: str = "tag map") -> Dict[str, FolderMapping]:
+    """ "Category:Tag" (glob allowed) -> namespace/wave/group, in map order."""
+    out: Dict[str, FolderMapping] = {}
+    for row in _map_rows(rows, where):
+        cell = lambda c: str(row.get(c) or "").strip()  # noqa: E731
+        tag = cell("tag")
+        if not tag:
+            continue
+        out[tag] = FolderMapping(namespace=cell("namespace"),
+                                 wave=_int_cell(cell("wave"), "wave", "{} ({})".format(where, tag)),
+                                 group=cell("group") or None)
+    return out
+
+
+def load_tag_map(path: str) -> Dict[str, FolderMapping]:
+    return tag_map_from_rows(read_tag_map_rows(path), where=str(path))
+
+
+def match_tag_map(tags: Sequence[str], mapping: Dict[str, FolderMapping]) -> Optional[Tuple[str, FolderMapping]]:
+    """An exact tag entry beats a glob; otherwise the first entry in the map wins."""
+    low = [t.lower() for t in tags]
+    for pattern, entry in mapping.items():
+        if pattern.lower() in low:
+            return pattern, entry
+    for pattern, entry in mapping.items():
+        if any(ch in pattern for ch in "*?[") and any(fnmatch.fnmatch(t, pattern.lower()) for t in low):
+            return pattern, entry
+    return None
+
+
 def match_folder_map(path: str, mapping: Dict[str, FolderMapping]) -> Optional[FolderMapping]:
     """Most specific folder wins: Production/Web beats Production for a VM in Production/Web/x."""
     best: Optional[Tuple[int, FolderMapping]] = None
@@ -342,6 +408,7 @@ class StageResult:
     problems: List[str] = field(default_factory=list)
     unmapped_networks: Dict[str, int] = field(default_factory=dict)
     unmapped_folders: Dict[str, int] = field(default_factory=dict)
+    app_moves: List[str] = field(default_factory=list)    # VMs pulled into their app's wave
 
 
 def stage(
@@ -351,16 +418,22 @@ def stage(
     default_namespace: Optional[str] = None,
     default_wave: int = 1,
     folder_mapping: Optional[Dict[str, FolderMapping]] = None,
+    tag_mapping: Optional[Dict[str, FolderMapping]] = None,
 ) -> StageResult:
     """Turn selected discovered VMs into importable inventory records.
 
     A VM's namespace comes from, in order: the namespace set on the discovered
-    row (from the picker or `select --namespace`), the folder map, the network
-    map, then --default-namespace. Wave follows the same order. A VM with no
-    namespace is reported, never guessed.
+    row (from the picker or `select --namespace`), the tag map, the folder map,
+    the network map, then --default-namespace. Wave follows the same order. A
+    VM with no namespace is reported, never guessed.
+
+    Each record carries its application (see app_of). With cfg.app_together,
+    an application's VMs are staged into one wave -- the earliest any of them
+    resolved to -- and each such move is reported in app_moves.
     """
     mapping = mapping or {}
     folder_mapping = folder_mapping or {}
+    tag_mapping = tag_mapping or {}
     result = StageResult()
 
     for row in rows:
@@ -379,13 +452,23 @@ def stage(
         # the folder map overrides this.
         group = _norm_folder(row["folder"] or "") or "root"
 
+        by_tag = match_tag_map(row_tags(row), tag_mapping) if tag_mapping else None
+        if by_tag:
+            entry = by_tag[1]
+            if not namespace and entry.namespace:
+                namespace = entry.namespace
+            if entry.wave:
+                mapped_wave = entry.wave
+            if entry.group:
+                group = entry.group
+
         by_folder = match_folder_map(row["folder"] or "", folder_mapping) if folder_mapping else None
         if by_folder:
             if not namespace and by_folder.namespace:
                 namespace = by_folder.namespace
-            if by_folder.wave:
+            if by_folder.wave and mapped_wave is None:      # a tag map wave already won
                 mapped_wave = by_folder.wave
-            if by_folder.group:
+            if by_folder.group and not (by_tag and by_tag[1].group):
                 group = by_folder.group
         elif folder_mapping:
             result.unmapped_folders[row["folder"] or "(root)"] = \
@@ -434,8 +517,20 @@ def stage(
                 group=group,
                 notes="; ".join(notes) or (row["notes"] or ""),
                 row=0,
+                app=app_of(row, cfg),
             )
         )
+
+    if getattr(cfg, "app_together", False):
+        first: Dict[str, int] = {}
+        for rec in result.records:
+            if rec.app:
+                first[rec.app] = min(first.get(rec.app, rec.wave), rec.wave)
+        for rec in result.records:
+            if rec.app and rec.wave != first[rec.app]:
+                result.app_moves.append("{} ({}): wave {} -> {} to stay with app {}".format(
+                    rec.vm_name, rec.moref, rec.wave, first[rec.app], rec.app))
+                rec.wave = first[rec.app]
     return result
 
 

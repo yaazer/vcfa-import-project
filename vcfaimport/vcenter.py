@@ -69,6 +69,9 @@ class DiscoveredVm:
     tools_status: str = ""
     guest_os: str = ""
     nics: List[DiscoveredNic] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)       # "Category:Tag"
+    facts: Dict[str, Any] = field(default_factory=dict)  # readiness facts
+    ip: str = ""                                         # guest IP, if Tools reports one
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -85,6 +88,9 @@ class DiscoveredVm:
             "guest_os": self.guest_os,
         }
         d["nics"] = [n.to_dict() for n in self.nics]
+        d["tags"] = list(self.tags)
+        d["facts"] = dict(self.facts)
+        d["ip"] = self.ip
         return d
 
 
@@ -204,6 +210,7 @@ class VCenterClient:
         path: str,
         headers: Optional[Dict[str, str]] = None,
         raw: bool = False,
+        body: Any = None,
     ) -> Any:
         url = "{}://{}{}".format(self.scheme, self.server, path)
         hdrs = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -211,7 +218,8 @@ class VCenterClient:
             hdrs.update(headers)
         if self._token:
             hdrs["vmware-api-session-id"] = self._token
-        req = urllib.request.Request(url, method=method, headers=hdrs)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, method=method, headers=hdrs, data=data)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:
                 body = resp.read().decode("utf-8", "replace")
@@ -387,6 +395,49 @@ class VCenterClient:
         except VCenterError:
             return None
 
+    def guest_ip(self, moref: str) -> str:
+        """The guest's primary IP, as VMware Tools reports it ("" if none)."""
+        try:
+            data = self.get("/vcenter/vm/{}/guest/identity".format(urllib.parse.quote(moref)))
+        except VCenterError:
+            return ""
+        return str((data or {}).get("ip_address") or "") if isinstance(data, dict) else ""
+
+    def attached_tags(self, morefs: List[str], log: Optional[Callable[[str], None]] = None) -> Dict[str, List[str]]:
+        """moref -> ["Category:Tag", ...], in a few batched calls, not one per VM.
+
+        Uses the vSphere Automation tagging API. Any failure (an older vCenter,
+        no tagging privilege) returns what was gathered and says so; tags are
+        an optional extra, never a reason for discovery to fail.
+        """
+        say = log or (lambda msg: None)
+        out: Dict[str, List[str]] = {}
+        if self._prefix != "/api" or not morefs:
+            return out
+        tag_names: Dict[str, str] = {}
+        categories: Dict[str, str] = {}
+        try:
+            for i in range(0, len(morefs), 500):
+                chunk = morefs[i:i + 500]
+                res = self._request(
+                    "POST", "/api/cis/tagging/tag-association?action=list-attached-tags-on-objects",
+                    body={"object_ids": [{"type": "VirtualMachine", "id": m} for m in chunk]}) or []
+                for item in res:
+                    oid = ((item or {}).get("object_id") or {}).get("id")
+                    if oid:
+                        out[oid] = list(item.get("tag_ids") or [])
+            for tid in sorted({t for ids in out.values() for t in ids}):
+                tag = self.get("/cis/tagging/tag/{}".format(urllib.parse.quote(tid))) or {}
+                cid = tag.get("category_id", "")
+                if cid and cid not in categories:
+                    categories[cid] = (self.get("/cis/tagging/category/{}".format(
+                        urllib.parse.quote(cid))) or {}).get("name", cid)
+                tag_names[tid] = "{}:{}".format(categories.get(cid, "?"), tag.get("name", tid))
+        except VCenterError as exc:
+            say("  tags not read ({}); continuing without them".format(str(exc)[:160]))
+            return {}
+        return {m: sorted(tag_names.get(t, t) for t in ids) for m, ids in out.items()}
+
     def vm_tools(self, moref: str) -> str:
         try:
             data = self.get("/vcenter/vm/{}/tools".format(urllib.parse.quote(moref)))
@@ -430,12 +481,32 @@ def _parse_nics(detail: Dict[str, Any], networks: Dict[str, str]) -> List[Discov
     return sorted(nics, key=lambda n: n.device_key)
 
 
+def _facts(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """Readiness facts from the VM detail already fetched (no extra calls)."""
+    def entries(key: str) -> List[Dict[str, Any]]:
+        raw = (detail or {}).get(key)
+        if isinstance(raw, dict):
+            return [v for v in raw.values() if isinstance(v, dict)]
+        if isinstance(raw, list):
+            return [i.get("value", i) for i in raw if isinstance(i, dict)]
+        return []
+    cdroms = entries("cdroms")
+    return {
+        "hw_version": ((detail or {}).get("hardware") or {}).get("version", ""),
+        "disk_backings": [((d.get("backing") or {}).get("type") or "") for d in entries("disks")],
+        "iso_connected": any((c.get("backing") or {}).get("type") == "ISO_FILE"
+                             and c.get("state", "CONNECTED") == "CONNECTED" for c in cdroms),
+        "nic_states": [n.get("state", "") for n in entries("nics")],
+    }
+
+
 def discover(
     client: VCenterClient,
     *,
     power_state: Optional[str] = None,
     with_tools: bool = False,
     with_placement: bool = True,
+    with_tags: bool = True,
     concurrency: int = 12,
     progress: Optional[Callable[[int, int], None]] = None,
     log: Optional[Callable[[str], None]] = None,
@@ -494,9 +565,12 @@ def discover(
             host=hosts.get(detail.get("host", ""), ""),
             guest_os=detail.get("guest_OS") or "",
             nics=_parse_nics(detail, networks),
+            facts=_facts(detail),
         )
         if with_tools:
             vm.tools_status = client.vm_tools(moref)
+            if "running" in vm.tools_status.lower() and "not" not in vm.tools_status.lower():
+                vm.ip = client.guest_ip(moref)
         with lock:
             done += 1
             if progress:
@@ -510,5 +584,12 @@ def discover(
             if vm is not None:
                 results.append(vm)
 
+    if with_tags and results:
+        say("  reading vCenter tags...")
+        tags = client.attached_tags([v.moref for v in results], log=say)
+        for vm in results:
+            vm.tags = tags.get(vm.moref, [])
+        if tags:
+            say("  {} VM(s) carry tags".format(sum(1 for v in results if v.tags)))
     results.sort(key=lambda v: (v.name or "").lower())
     return results

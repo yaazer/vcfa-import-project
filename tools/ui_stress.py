@@ -160,7 +160,7 @@ const counts = async () => (await GET('/api/overview')).counts;
 
 const SCENARIOS = {
   async pages() {
-    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'activity']) {
+    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'activity', 'schedule', 'settings']) {
       const ok = await open(id);
       check('renders ' + id, ok);
       check('no error box on ' + id, !brokeView(), brokeView());
@@ -499,6 +499,185 @@ const SCENARIOS = {
     FX.set({ motion: 'full' });
   },
 
+  async govern() {
+    const setting = async (k) => (await GET('/api/settings')).settings.find((x) => x.key === k).value;
+    const toastWith = (cls, re) => waitFor(() => [...document.querySelectorAll('.toast' + cls)].find((x) => re.test(x.textContent)), 30000);
+
+    // ---- settings: guardrails, a save bar, refusals explained
+    await open('settings');
+    const groups = [...document.querySelectorAll('#view .card-h h3')].map((h) => h.textContent);
+    check('settings show every group', ['Pacing', 'Safety', 'Governance', 'Applications', 'Verification'].every((g) => groups.includes(g)), groups.join(','));
+    click('[data-act="toggle"][data-k="app_together"]');
+    check('a change raises the save bar', await waitFor(() => document.querySelector('.stickybar [data-act="save"]')));
+    type('#set-app_category', 'Application');
+    check('typing keeps focus through the re-render', document.activeElement && document.activeElement.id === 'set-app_category');
+    document.querySelector('input[data-k="require_approval"][data-stage="import"]').click();
+    await sleep(100);
+    click('.stickybar [data-act="save"]');
+    check('saved settings take effect', await waitFor(async () => (await setting('app_together')) === true && (await setting('app_category')) === 'Application' && (await setting('require_approval')).includes('import'), 10000));
+    check('the file value stays visible, the override is marked', await waitFor(() => document.querySelector('.setting.over [data-act="reset"][data-k="app_category"]')));
+    type('#set-batch_size', '0');
+    await sleep(50);
+    click('.stickybar [data-act="save"]');
+    check('an out-of-range value is refused with the reason', await toastWith('.bad', /between/));
+    click('.stickybar [data-act="discard"]');
+    check('discard drops unsaved edits', await waitFor(() => !document.querySelector('.stickybar')));
+
+    // ---- notifications: an unreachable channel reports the failure
+    const typeSel = document.querySelector('select[data-k="type"][data-change="chField"]');
+    typeSel.value = 'webhook'; typeSel.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(100);
+    type('#ch-name', 'dead-end');
+    type('#ch-url', 'http://127.0.0.1:9/hook');
+    await sleep(100);
+    click('[data-act="chEvent"][data-ev="job_failed"]');
+    click('[data-act="chAdd"]');
+    check('the new channel is listed', await waitFor(() => /dead-end/.test(document.querySelector('#view').textContent)));
+    click('.stickybar [data-act="save"]');
+    check('channels are saved', await waitFor(async () => (await GET('/api/settings')).notify.length === 1, 8000));
+    click('[data-act="chTest"][data-i="0"]');
+    check('a failed test says which channel failed', await toastWith('.bad', /dead-end/));
+
+    // ---- people: a personal link, shown once
+    type('#u-name', 'vic');
+    document.querySelector('#u-role').value = 'viewer';
+    click('[data-act="userAdd"]');
+    const link = await waitFor(() => document.querySelector('#u-link'));
+    check('creating a user shows their personal link', link && /#t=/.test(link.value), link && link.value);
+    click('.modal [data-m="no"]');
+    check('the user is listed', await waitFor(() => [...document.querySelectorAll('#view td b')].some((b) => b.textContent === 'vic')));
+    const vicToken = link ? decodeURIComponent(link.value.split('#t=')[1]) : '';
+    const asVic = await fetch('/api/select', { method: 'POST', headers: { 'X-VCFA-Token': vicToken, 'Content-Type': 'application/json' }, body: '{"morefs":[],"selected":true}' });
+    check('the viewer link cannot change anything', asVic.status === 403, asVic.status);
+
+    // ---- apps come from tags once staged; the stream regroups
+    await POST('/api/stage', {});
+    await open('overview');
+    click('.stream-by [data-k="wave"]');
+    check('the stream regroups by wave', await waitFor(() => [...document.querySelectorAll('.lane-h .ln-l')].every((x) => /^Wave /.test(x.textContent))));
+    check('a grouped lane shows its progress', document.querySelector('.lane-h .ln-d'));
+    const appBtn = await waitFor(() => document.querySelector('.stream-by [data-k="app"]'));
+    check('an App grouping is offered once VMs have apps', appBtn);
+    if (appBtn) {
+      appBtn.click();
+      check('lanes by application', await waitFor(() => [...document.querySelectorAll('.lane-h .ln-l')].some((x) => /Payroll|CRM|Portal|Billing/.test(x.textContent))));
+      check('particles survive a regroup', FX.stats.dots > 0, FX.stats.dots);
+    }
+    check('the Applications card lists apps', /Applications/.test(document.querySelector('#view').textContent));
+    click('.stream-by [data-k="stage"]');
+    check('and back to the flow by stage', await waitFor(() => document.querySelectorAll('.lane-h').length === 5));
+
+    // ---- density
+    FX.set({ density: 'compact' });
+    await open('queue');
+    const td = document.querySelector('#view table.t td');
+    check('compact density tightens tables', document.body.dataset.density === 'compact' && td && getComputedStyle(td).paddingTop === '5px', td && getComputedStyle(td).paddingTop);
+    FX.set({ density: 'comfortable' });
+
+    // ---- select: readiness filter, saved views
+    await open('select');
+    const ready = document.querySelector('select[data-k="ready"]');
+    ready.value = 'block'; ready.dispatchEvent(new Event('change', { bubbles: true }));
+    check('the readiness filter narrows to likely failures', await waitFor(() => S.view.rows.length > 0 && S.view.rows.every((x) => x.readiness === 'block')), S.view.rows.length);
+    click('[data-act="svSave"]');
+    const nm = await waitFor(() => document.querySelector('.modal input[data-field="name"]'));
+    type(nm, 'likely failures');
+    click('.modal [data-m="yes"]');
+    check('a saved view appears', await waitFor(() => document.querySelector('.chip.sv[data-name="likely failures"]')));
+    const r2 = document.querySelector('select[data-k="ready"]');
+    r2.value = ''; r2.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(100);
+    click('.chip.sv[data-name="likely failures"]');
+    check('applying it restores the filters', await waitFor(() => S.view.f.ready === 'block' && S.view.rows.every((x) => x.readiness === 'block')));
+    click('.chip.sv[data-name="likely failures"] .x');
+    check('and it can be deleted', await waitFor(() => !document.querySelector('.chip.sv')));
+    check('tags are shown per VM', document.querySelector('#view .tag.vtag, #view .tag.app'));
+
+    // ---- stage: the tag map
+    await open('stage');
+    check('tags of the selection are listed', await waitFor(() => document.querySelectorAll('#cov-tags .covrow').length > 0));
+    const mapBtn = document.querySelector('#cov-tags [data-act="addRow"]');
+    if (mapBtn) {
+      const tag = mapBtn.dataset.key;
+      mapBtn.click();
+      const nsIn = await waitFor(() => document.activeElement && /^t-\d+-namespace$/.test(document.activeElement.id) && document.activeElement);
+      check('mapping a tag focuses its namespace', nsIn);
+      if (nsIn) type(nsIn, 'zz-tag-ns');
+      check('the tag map re-previews live', await waitFor(() => S.view.preview.records.some((r) => r.namespace === 'zz-tag-ns'), 8000), tag);
+      click('[data-act="delRow"][data-m="t"]');
+      check('removing it restores the preview', await waitFor(() => !S.view.preview.records.some((r) => r.namespace === 'zz-tag-ns'), 8000));
+    }
+
+    // ---- the two-person rule: request, cannot self-approve, a colleague approves
+    let since = await jobIds();
+    const pre = await POST('/api/run/execute', { stage: 'precheck', waves: [2], confirm: true });
+    await waitJob('execute', since);
+    await open('execute', 'stage=import&waves=2');
+    const go = await waitFor(() => { const b = document.querySelector('[data-act="start"]:not([disabled])'); return b && /Request approval/.test(b.textContent) && b; }, 10000);
+    check('Execute offers "Request approval" when the rule is on', go);
+    check('the plan shows an ETA', /≈/.test(document.querySelector('#ex-plan').textContent));
+    if (go) {
+      go.click();
+      const yes = await waitFor(() => document.querySelector('.modal [data-m="yes"]'));
+      check('no typed word is needed to ask', yes && !yes.disabled && !document.querySelector('#modal-type'));
+      yes.click();
+      check('the request is acknowledged', await toastWith('.warn', /Approval #\d+ requested/));
+    }
+    const pending = (await GET('/api/approvals')).approvals.filter((a) => a.state === 'pending');
+    check('one request is pending', pending.length === 1, pending.length);
+    await open('schedule');
+    check('the requester sees it without an Approve button', await waitFor(() => document.querySelector('.approval')) && !document.querySelector('.approval [data-act="approve"]'));
+    check('the nav badges the waiting request', await waitFor(() => document.querySelector('.nav-item[href="#/schedule"] .nav-badge')));
+    const otto = (await POST('/api/users', { name: 'otto', role: 'operator' })).token;
+    since = await jobIds();
+    const dec = await fetch('/api/approvals/' + pending[0].id + '/decide', { method: 'POST', headers: { 'X-VCFA-Token': otto, 'Content-Type': 'application/json' }, body: '{"approve":true,"note":"CAB ok"}' });
+    check('a colleague approves it', dec.status === 200, dec.status);
+    const imp = await waitJob('execute', since);
+    check('the approved import runs on behalf of both', imp && /otto/.test(imp.user || ''), imp && imp.user);
+    check('the approval is used up', (await GET('/api/approvals')).approvals[0].state === 'executed');
+
+    // ---- change windows
+    await open('schedule');
+    click('[data-act="fStage"][data-k="precheck"]');
+    await sleep(200);
+    const t0 = Date.now() + 2 * 3600e3;
+    const loc = (ms) => { const d = new Date(ms); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
+    type('#w-start', loc(t0));
+    type('#w-end', loc(t0 + 2 * 3600e3));
+    check('the window shows whether the work fits', await waitFor(() => document.querySelector('#w-fit .fit, #w-fit .note'), 8000));
+    click('[data-act="createWindow"]');
+    check('the window is planned', await waitFor(async () => (await GET('/api/schedules')).schedules.some((x) => x.state === 'scheduled'), 8000));
+    const planned = (await GET('/api/schedules')).schedules[0];
+    check('it opens and closes when typed (no field lost)', Math.abs(parseTs(planned.start_at) - t0) < 90e3 && Math.abs(parseTs(planned.end_at) - t0 - 2 * 3600e3) < 90e3, planned.start_at + ' -> ' + planned.end_at);
+    check('it appears on the timeline', await waitFor(() => document.querySelector('.tline .win')));
+    click('[data-act="cancelWindow"]');
+    const c1 = await waitFor(() => document.querySelector('.modal [data-m="yes"]'));
+    if (c1) c1.click();
+    check('and can be cancelled', await waitFor(async () => (await GET('/api/schedules')).schedules.every((x) => x.state === 'cancelled'), 8000));
+
+    // ---- queue: verification
+    await open('queue', 'state=committed');
+    check('the queue has a Verified column', [...document.querySelectorAll('#view th')].some((x) => x.textContent === 'Verified'));
+    click('#view tbody input[data-act="chk"]');
+    await sleep(100);
+    since = await jobIds();
+    click('[data-act="bVerify"]');
+    const vj = await waitJob('verify', since);
+    check('verification runs from the queue', vj && ['succeeded', 'warning'].includes(vj.status), vj && vj.status);
+    check('its verdict shows in the queue', await waitFor(async () => { await S.view.refresh(); return document.querySelector('#view td .tag.ok, #view td .tag.bad'); }, 15000));
+    click('#view tbody tr[data-act="vm"]');
+    check('the drawer lists the checks', await waitFor(() => document.querySelector('.drawer .checks .checkrow')));
+    check('governance pages never broke', !brokeView() && noInjection());
+  },
+
+  async shot() {   // tools only: open one page and let it settle, for a screenshot
+    if (HP.get('by')) FX.set({ streamBy: HP.get('by') });
+    await open(HP.get('page') || 'overview', HP.get('q') || '');
+    if (S.view) S.view.render();
+    await sleep(800);
+    if (window.FX) FX.drawNow();
+  },
+
   async scale() {
     for (const id of ['overview', 'select', 'queue', 'waves', 'batches', 'triage', 'stage', 'execute']) {
       check('renders ' + id + ' at scale', await open(id));
@@ -552,9 +731,11 @@ document.addEventListener('DOMContentLoaded', () => {
 # ------------------------------------------------------------------ plumbing
 def install_harness(harness_dir):
     index = web_server._static("index.html").decode("utf-8")
-    index = index.replace('<script src="/static/views.js" defer></script>',
-                          '<script src="/static/views.js" defer></script>\n'
+    index = index.replace('<script src="/static/gov.js" defer></script>',
+                          '<script src="/static/gov.js" defer></script>\n'
                           '<script src="/static/h_harness.js" defer></script>')
+    assert "h_harness.js" in index, "index.html no longer loads gov.js last"
+
     (harness_dir / "h_index.html").write_text(index, encoding="utf-8")
     (harness_dir / "h_harness.js").write_text(HARNESS_JS, encoding="utf-8")
     original = web_server._static
@@ -660,7 +841,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme", "palette", "stream"]
+             "resilience", "token", "theme", "palette", "stream", "govern"]
 
 
 def main():
@@ -693,7 +874,8 @@ def main():
     wanted = args.only or SCENARIOS
     for s in wanted:
         if s in SCENARIOS:
-            plan.append((s, "main", s, "", (1440, 900)))
+            # govern turns on the two-person rule: its own workspace, so no other scenario sees it
+            plan.append((s, "govern" if s == "govern" else "main", s, "", (1440, 900)))
     if not args.only or "narrow" in (args.only or []):
         plan.append(("pages @ 390px", "main", "pages", "&narrow=1", (390, 844)))
     if not args.only or "empty" in (args.only or []):

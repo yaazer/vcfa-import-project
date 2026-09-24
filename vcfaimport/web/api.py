@@ -14,29 +14,50 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import __version__
+from .. import access
+from .. import estimate as est
+from .. import notify as notify_mod
+from .. import readiness
 from .. import report
+from .. import schedule as sch
 from .. import service
+from .. import settings as settings_mod
 from .. import state as st
-from ..config import Config
+from ..config import Config, ConfigError
 from ..discovery import (
     FOLDER_MAP_COLUMNS,
     NETWORK_MAP_COLUMNS,
+    TAG_MAP_COLUMNS,
     SelectionError,
+    app_of,
     folder_map_from_rows,
     network_map_from_rows,
     read_folder_map_rows,
     read_network_map_rows,
+    read_tag_map_rows,
+    row_tags,
     stage,
+    tag_map_from_rows,
     write_map_rows,
 )
 from ..engine import STAGE_IMPORT, STAGE_PRECHECK, Engine
 from ..kube import Kubectl
 from ..vcenter import ENV_PASSWORD, ENV_SERVER, ENV_USER, VCenterClient, VCenterError, discover
 from .jobs import FAILED, STOPPED, WARNING, Job, JobManager
+
+
+# The user a request thread is serving; set by the HTTP layer for each request.
+CTX = threading.local()
+OWNER = {"name": "owner", "role": "admin"}
+
+
+def current_user() -> Dict[str, Any]:
+    return getattr(CTX, "user", None) or OWNER
 
 
 class ApiError(Exception):
@@ -88,7 +109,8 @@ def _require_confirm(body: Dict[str, Any]) -> None:
 class WebApp:
     def __init__(self, cfg: Config, *, config_path: Optional[str] = None,
                  folder_map: Optional[str] = None, network_map: Optional[str] = None,
-                 verbose: bool = False):
+                 verbose: bool = False, tag_map: Optional[str] = None):
+        self.file_cfg = copy.deepcopy(cfg)       # the TOML baseline, before workspace settings
         self.cfg = cfg
         self.config_path = config_path
         base = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
@@ -96,15 +118,37 @@ class WebApp:
                                    else base / "folder-map.csv")
         self.network_map_path = str(Path(network_map).expanduser() if network_map
                                     else base / "portgroup-map.csv")
+        self.tag_map_path = str(Path(tag_map).expanduser() if tag_map else base / "tag-map.csv")
         self.verbose = verbose
         # One shared connection for request threads, serialised by a lock.
         # Jobs open their own (a connection is not shared across a long run).
-        self._ws = service.Workspace(copy.deepcopy(cfg), check_same_thread=False)
+        self._ws = service.Workspace(copy.deepcopy(cfg), check_same_thread=False, actor="console")
         self.store = self._ws.store
         self.lock = threading.RLock()
-        self.jobs = JobManager(Path(cfg.workdir).expanduser() / "jobs")
+        self.cfg = self._effective_cfg()
+        self.jobs = JobManager(Path(cfg.workdir).expanduser() / "jobs", on_finish=self._on_job_finish)
+        # vCenter credentials kept in memory (never on disk) when the operator
+        # ticks "remember for verification" on Discover; gone when the console stops.
+        self._vc_creds: Optional[Dict[str, Any]] = None
+        self._scheduler: Optional[threading.Thread] = None
+        self._scheduler_stop = threading.Event()
+
+    def _effective_cfg(self) -> Config:
+        """The TOML baseline with the workspace settings layered on."""
+        cfg = copy.deepcopy(self.file_cfg)
+        with self.lock:
+            settings_mod.apply(cfg, self.store)
+        return cfg
+
+    def _actor(self) -> str:
+        return current_user()["name"]
+
+    def _start(self, kind: str, title: str, params: Dict[str, Any], fn, **kw) -> Job:
+        return self.jobs.start(kind, title, params, fn, user=self._actor(), **kw)
 
     def close(self) -> None:
+        self._scheduler_stop.set()
+        self._vc_creds = None
         self._ws.close()
 
     def _engine(self, cfg: Optional[Config] = None) -> Engine:
@@ -118,7 +162,7 @@ class WebApp:
     def _job_workspace(self, job: Job, cfg: Optional[Config] = None,
                        dry_run: bool = False) -> service.Workspace:
         return service.Workspace(copy.deepcopy(cfg or self.cfg), dry_run=dry_run,
-                                 verbose=self.verbose, log=job.log)
+                                 verbose=self.verbose, log=job.log, actor=job.user)
 
     # ================================================================ info
     def info(self, q, body) -> Dict[str, Any]:
@@ -149,7 +193,13 @@ class WebApp:
                 "user": os.environ.get(ENV_USER) or "",
                 "password_from_env": bool(os.environ.get(ENV_PASSWORD)),
             },
-            "maps": {"folder": self.folder_map_path, "network": self.network_map_path},
+            "maps": {"folder": self.folder_map_path, "network": self.network_map_path, "tag": self.tag_map_path},
+            "me": current_user(),
+            "features": {"require_approval": list(c.require_approval), "app_category": c.app_category,
+                         "app_together": c.app_together, "verify_after_import": c.verify_after_import,
+                         "readiness_exclude_blocked": c.readiness_exclude_blocked,
+                         "notify_channels": len(c.notify or []),
+                         "vcenter_remembered": self._vc_creds is not None},
             "states": report.STATE_ORDER,
             "state_labels": report.STATE_LABEL,
         }
@@ -161,6 +211,9 @@ class WebApp:
             disc = self.store.discovered_counts()
             live = len(self.store.query_batches(
                 states=[st.B_APPLIED, st.B_RUNNING, st.B_ROLLING_BACK]))
+            pending = self.store.conn.execute(
+                "SELECT COUNT(*) FROM approvals WHERE state=?", (access.PENDING,)).fetchone()[0]
+            window = sch.next_open(self.store)
         active = self.jobs.active
         latest = self.jobs.list()[:1]
         return {
@@ -173,11 +226,28 @@ class WebApp:
             "live_batches": live,
             "job": active.summary() if active else None,
             "latest_job": latest[0] if latest else None,
+            "approvals_pending": pending,
+            "next_window": window,
+            "me": current_user(),
         }
 
     def overview(self, q, body) -> Dict[str, Any]:
         with self.lock:
-            return service.overview(self.store, self.cfg)
+            out = service.overview(self.store, self.cfg)
+            out["apps"] = [{"app": a, "total": sum(c.values()), "counts": c}
+                           for a, c in sorted(self.store.state_matrix("app").items()) if a]
+            out["app_splits"] = service.app_splits(self.store)
+            out["estimates"] = service.wave_estimates(self.store, self.cfg)
+            out["next_window"] = sch.next_open(self.store)
+            out["pending_approvals"] = len(access.list_approvals(self.store, state=access.PENDING))
+            vc = {"ok": 0, "warn": 0, "fail": 0, "none": 0}
+            for r in self.store.conn.execute(
+                    "SELECT COALESCE(NULLIF(verify_state, ''), 'none') AS v, COUNT(*) AS n FROM vms WHERE state=?"
+                    " GROUP BY 1", (st.S_COMMITTED,)):
+                vc[r["v"]] = r["n"]
+            out["verify"] = vc
+            out["verify_ports"] = list(self.cfg.verify_ports)
+        return out
 
     # =========================================================== discovery
     def discovered(self, q, body) -> Dict[str, Any]:
@@ -190,7 +260,10 @@ class WebApp:
         out = []
         for r in rows:
             nics = json.loads(r["nics_json"] or "[]")
+            found = readiness.assess(r)
             out.append({
+                "tags": row_tags(r), "app": app_of(r, self.cfg), "ip": r["ip"],
+                "readiness": readiness.grade(found), "findings": [f["title"] for f in found],
                 "moref": r["moref"], "name": r["name"], "power_state": r["power_state"],
                 "cpu_count": r["cpu_count"], "memory_mb": r["memory_mb"],
                 "folder": r["folder"], "datacenter": r["datacenter"], "cluster": r["cluster"],
@@ -214,6 +287,8 @@ class WebApp:
         if namespace is not None:
             namespace = str(namespace).strip()
         with self.lock:
+            if body.get("app") is not None:
+                self.store.set_app(morefs, str(body["app"]))
             if "selected" in body:
                 changed = self.store.set_selected(morefs, bool(body["selected"]),
                                                   namespace=namespace, wave=wave)
@@ -239,13 +314,36 @@ class WebApp:
         trim = lambda rows, cols: [{c: r.get(c, "") for c in cols} for r in rows]  # noqa: E731
         return trim(folder_rows, FOLDER_MAP_COLUMNS), trim(network_rows, NETWORK_MAP_COLUMNS)
 
+    def _tag_rows(self) -> List[Dict[str, str]]:
+        if not Path(self.tag_map_path).is_file():
+            return []
+        return [{c: r.get(c, "") for c in TAG_MAP_COLUMNS} for r in read_tag_map_rows(self.tag_map_path)]
+
+    @staticmethod
+    def _tag_coverage(selected, tag_mapping) -> List[Dict[str, Any]]:
+        from ..discovery import match_tag_map
+        counts: Dict[str, int] = {}
+        for r in selected:
+            for t in row_tags(r):
+                counts[t] = counts.get(t, 0) + 1
+        out = []
+        for tag, n in sorted(counts.items(), key=lambda kv: kv[0].lower()):
+            hit = match_tag_map([tag], tag_mapping)
+            out.append({"tag": tag, "vms": n, "pattern": hit[0] if hit else None,
+                        "namespace": hit[1].namespace if hit else None, "wave": hit[1].wave if hit else None})
+        return out
+
     def maps_get(self, q, body) -> Dict[str, Any]:
         folder_rows, network_rows = self._map_rows()
         with self.lock:
             selected = self.store.query_discovered(selected=True)
         coverage = service.mapping_coverage(
             selected, folder_map_from_rows(folder_rows), network_map_from_rows(network_rows))
+        tag_rows = self._tag_rows()
+        coverage["tags"] = self._tag_coverage(selected, tag_map_from_rows(tag_rows))
         return {
+            "tag": {"path": self.tag_map_path, "exists": Path(self.tag_map_path).is_file(),
+                    "columns": TAG_MAP_COLUMNS, "rows": tag_rows},
             "folder": {"path": self.folder_map_path, "exists": Path(self.folder_map_path).is_file(),
                        "columns": FOLDER_MAP_COLUMNS, "rows": folder_rows},
             "network": {"path": self.network_map_path,
@@ -263,6 +361,10 @@ class WebApp:
             rows = body["network_rows"]
             network_map_from_rows(rows)
             write_map_rows(self.network_map_path, NETWORK_MAP_COLUMNS, rows)
+        if body.get("tag_rows") is not None:
+            rows = body["tag_rows"]
+            tag_map_from_rows(rows)
+            write_map_rows(self.tag_map_path, TAG_MAP_COLUMNS, rows)
 
     def maps_put(self, q, body) -> Dict[str, Any]:
         self._save_maps(body)
@@ -278,14 +380,17 @@ class WebApp:
             folder_rows, network_rows = self._map_rows()
         folder_mapping = folder_map_from_rows(folder_rows)
         network_mapping = network_map_from_rows(network_rows)
+        tag_mapping = tag_map_from_rows(body["tag_rows"] if body.get("tag_rows") is not None
+                                        else self._tag_rows())
         default_ns = (body.get("default_namespace") or "").strip() or None
         default_wave = _int(body.get("default_wave"), default=1, minimum=1)
         with self.lock:
             selected = self.store.query_discovered(selected=True)
             result = stage(selected, self.cfg, mapping=network_mapping,
                            folder_mapping=folder_mapping, default_namespace=default_ns,
-                           default_wave=default_wave)
+                           default_wave=default_wave, tag_mapping=tag_mapping)
         coverage = service.mapping_coverage(selected, folder_mapping, network_mapping)
+        coverage["tags"] = self._tag_coverage(selected, tag_mapping)
         return selected, result, coverage
 
     def stage_preview(self, q, body) -> Dict[str, Any]:
@@ -305,7 +410,7 @@ class WebApp:
                 "moref": rec.moref, "vm_name": rec.vm_name, "namespace": rec.namespace,
                 "wave": rec.wave, "group": rec.group, "folder": folder_of.get(rec.moref, ""),
                 "subnets": [n.subnet for n in rec.nics if n.subnet], "notes": rec.notes,
-                "queue_state": state,
+                "queue_state": state, "app": rec.app,
                 "locked": state is not None and state not in (
                     st.S_PENDING, st.S_PRECHECK_FAILED, st.S_FAILED, st.S_SKIPPED),
             })
@@ -318,6 +423,7 @@ class WebApp:
             "by_wave": sorted(by_wave.items()),
             "by_namespace": sorted(by_ns.items()),
             "coverage": coverage,
+            "app_moves": result.app_moves,
         }
 
     def stage_commit(self, q, body) -> Dict[str, Any]:
@@ -335,13 +441,21 @@ class WebApp:
                                  .format(len(result.records), summary["added"], summary["updated"]))
         summary["staged"] = len(result.records)
         summary["problems"] = result.problems
+        summary["app_moves"] = result.app_moves
         return summary
 
     # =============================================================== queue
     def vms(self, q, body) -> Dict[str, Any]:
         with self.lock:
             rows = self.store.query_vms()
-        return {"vms": [service.vm_summary(r) for r in rows]}
+            grades = {r["moref"]: readiness.grade(readiness.assess(r)) for r in self.store.query_discovered()}
+        out = []
+        for r in rows:
+            d = service.vm_summary(r)
+            d.update(app=r["app"], verify_state=r["verify_state"], verified_at=r["verified_at"],
+                     readiness=grades.get(r["moref"], ""))
+            out.append(d)
+        return {"vms": out}
 
     def vm_detail(self, q, body, moref: str) -> Dict[str, Any]:
         with self.lock:
@@ -359,6 +473,17 @@ class WebApp:
         vm["nics"] = json.loads(vm.pop("nics_json") or "[]")
         issue = service.classify_failure(row["message"] or "") if row["state"] in \
             service.FAILED_STATES else None
+        with self.lock:
+            disc = self.store.query_discovered(morefs=[moref])
+            history = [dict(v) for v in self.store.conn.execute(
+                "SELECT ts, verdict, checks_json, actor FROM verifications WHERE moref=? ORDER BY id DESC LIMIT 10",
+                (moref,))]
+        vm["readiness"] = readiness.assess(disc[0]) if disc else []
+        vm["tags"] = row_tags(disc[0]) if disc else []
+        vm["verify"] = json.loads(vm.get("verify_json") or "[]")
+        for h in history:
+            h["checks"] = json.loads(h.pop("checks_json") or "[]")
+        vm["verify_history"] = history
         return {"vm": vm, "summary": service.vm_summary(row), "transitions": transitions,
                 "events": events, "batches": batches, "issue": issue}
 
@@ -367,9 +492,10 @@ class WebApp:
         wave = _int(body.get("wave"), minimum=1)
         if wave is None:
             raise ApiError(400, "wave is required")
+        with_app = body.get("with_app")
         with self.lock:
-            moved, refused = self.store.set_vm_wave(morefs, wave)
-        return {"moved": moved, "refused": refused}
+            return service.move_wave(self.store, self.cfg, morefs, wave,
+                                     with_app=None if with_app is None else bool(with_app))
 
     def waves_swap(self, q, body) -> Dict[str, Any]:
         a, b = _int(body.get("a"), minimum=1), _int(body.get("b"), minimum=1)
@@ -449,19 +575,30 @@ class WebApp:
                                             include_failed=include_failed, folders=folders,
                                             folder_exact=bool(body.get("folder_exact")))
             plan = []
+            holdbacks = service.holdbacks(engine, stage_name, waves, morefs=morefs,
+                                          include_failed=include_failed, folders=folders,
+                                          folder_exact=bool(body.get("folder_exact")))
             for wave, count in rows:
                 batches = engine.plan(stage_name, wave=wave, morefs=morefs, limit=limit,
                                       include_failed=include_failed, write_manifests=False,
                                       folders=folders, folder_exact=bool(body.get("folder_exact")))
+                per_ns: Dict[str, int] = {}
+                for b in batches:
+                    per_ns[b.namespace] = per_ns.get(b.namespace, 0) + b.size
+                eta = est.estimate(self.store, cfg, stage_name, per_ns)
                 plan.append({"wave": wave, "vms": sum(b.size for b in batches),
                              "eligible": count, "batches": len(batches),
-                             "namespaces": sorted({b.namespace for b in batches})})
+                             "namespaces": sorted({b.namespace for b in batches}),
+                             "seconds": eta["seconds"], "basis": eta["basis"]})
             all_waves = self.store.waves()
             per_wave_all = {w: len(engine.eligible(stage_name, w, include_failed=include_failed))
                             for w in all_waves}
         return {
             "stage": stage_name, "plan": plan,
             "total": sum(p["vms"] for p in plan),
+            "seconds": sum(p["seconds"] for p in plan),
+            "holdbacks": holdbacks,
+            "needs_approval": access.needs_approval(cfg, stage_name, body),
             "eligible_by_wave": per_wave_all,
             "settings": {"context": cfg.context, "batch_size": cfg.batch_size,
                          "max_parallel_batches": cfg.max_parallel_batches,
@@ -558,6 +695,14 @@ class WebApp:
     # ================================================================ jobs
     def run_job(self, q, body, kind: str) -> Dict[str, Any]:
         starter = getattr(self, "_job_" + kind)
+        stage_name = body.get("stage") if kind == "execute" else kind
+        if kind in ("execute", "commit", "rollback") and access.needs_approval(self.cfg, stage_name, body):
+            _require_confirm(body)
+            with self.lock:
+                a = access.request(self.store, stage_name, body, self._actor())
+            service.notifier(self.cfg)("approval_requested", "Approval #{} requested".format(a["id"]),
+                                       a["summary"], {"by": a["requested_by"]})
+            return {"approval": a}
         job = starter(body)
         return {"job": job.summary()}
 
@@ -571,10 +716,13 @@ class WebApp:
             raise ApiError(400, "a password is required (or set {} before starting the "
                                 "console)".format(ENV_PASSWORD))
         insecure = bool(body.get("insecure"))
+        if body.get("remember"):
+            self._vc_creds = {"server": server, "user": user, "password": password, "insecure": insecure}
         opts = {
             "power_state": "POWERED_ON" if body.get("powered_on") else None,
             "with_tools": not body.get("no_tools"),
             "with_placement": not body.get("no_placement"),
+            "with_tags": not body.get("no_tags"),
             "concurrency": _int(body.get("concurrency"), default=12, minimum=1),
         }
         timeout = _int(body.get("timeout"), default=60, minimum=5)
@@ -612,7 +760,7 @@ class WebApp:
                     "updated": summary["updated"], "total": counts["total"],
                     "selected": counts["selected"], "no_nics": no_nics, "tools_not_running": stale}
 
-        return self.jobs.start("discover", "Discover {}".format(server), params, run)
+        return self._start("discover", "Discover {}".format(server), params, run)
 
     def _job_preflight(self, body: Dict[str, Any]) -> Job:
         skip_targets = bool(body.get("skip_targets"))
@@ -636,7 +784,7 @@ class WebApp:
                     "problems": result.problems, "warnings": result.warnings,
                     "crds": sorted(result.crds)}
 
-        return self.jobs.start("preflight", "Preflight", {"skip_targets": skip_targets}, run)
+        return self._start("preflight", "Preflight", {"skip_targets": skip_targets}, run)
 
     def _job_execute(self, body: Dict[str, Any]) -> Job:
         _require_confirm(body)
@@ -680,6 +828,16 @@ class WebApp:
                                 totals["failed"], totals["awaiting_commit"]))
                 job.log("")
                 job.log(report.render_status(ws.store, cfg, failures=5))
+                if stage_name == STAGE_IMPORT and not dry_run and cfg.verify_after_import:
+                    rows = service.verify_rows(ws.store, only_unverified=True)
+                    if rows:
+                        job.log("")
+                        job.log("verifying {} newly committed VM(s)...".format(len(rows)))
+                        vr = service.run_verification(ws, rows, self._vcenter_client(job.log))
+                        c = vr["counts"]
+                        job.log("verification: {} ok · {} unverifiable · {} FAILED".format(
+                            c.get("ok", 0), c.get("warn", 0), c.get("fail", 0)))
+                        totals["verify"] = c
             status = None
             if totals["halted"] or totals["failed"]:
                 status = WARNING
@@ -688,7 +846,7 @@ class WebApp:
             return dict(totals, status=status)
 
         lock = None if dry_run else service.WorkspaceLock(cfg, "'{}' from the web console".format(title))
-        return self.jobs.start("execute", title, params, run, stoppable=True, lock=lock)
+        return self._start("execute", title, params, run, stoppable=True, lock=lock)
 
     def _job_refresh(self, body: Dict[str, Any]) -> Job:
         def run(job: Job) -> Dict[str, Any]:
@@ -698,7 +856,7 @@ class WebApp:
                 counts["batches"], counts["updated"]))
             return counts
 
-        return self.jobs.start("refresh", "Refresh from cluster", {}, run, lock=self._lock_for("refresh"))
+        return self._start("refresh", "Refresh from cluster", {}, run, lock=self._lock_for("refresh"))
 
     def _job_watch(self, body: Dict[str, Any]) -> Job:
         interval = _int(body.get("interval"), default=max(self.cfg.poll_interval_seconds, 5),
@@ -722,7 +880,7 @@ class WebApp:
                     stop.wait(interval)
             return {"polls": polls}
 
-        return self.jobs.start("watch", "Watch in-flight batches", {"interval": interval}, run,
+        return self._start("watch", "Watch in-flight batches", {"interval": interval}, run,
                                stoppable=True, lock=self._lock_for("watch"))
 
     def _job_commit(self, body: Dict[str, Any]) -> Job:
@@ -739,7 +897,7 @@ class WebApp:
             job.log("refresh once the operator has processed the commit")
             return dict(result, status=WARNING if result["errors"] else None)
 
-        return self.jobs.start("commit", "Commit held imports", {"morefs": morefs, "wave": wave}, run,
+        return self._start("commit", "Commit held imports", {"morefs": morefs, "wave": wave}, run,
                                lock=self._lock_for("commit"))
 
     def _job_rollback(self, body: Dict[str, Any]) -> Job:
@@ -774,7 +932,7 @@ class WebApp:
             return dict(result, status=WARNING if bad else None)
 
         params = dict(sel, action=action, delete=delete, wait=wait)
-        return self.jobs.start("rollback", "Roll back to vCenter", params, run,
+        return self._start("rollback", "Roll back to vCenter", params, run,
                                lock=self._lock_for("rollback"))
 
     def _job_abandon(self, body: Dict[str, Any]) -> Job:
@@ -800,7 +958,7 @@ class WebApp:
                 job.log("  ! " + err)
             return dict(result, status=WARNING if (result["errors"] or notes) else None)
 
-        return self.jobs.start("abandon", "Abandon batches", sel, run, lock=self._lock_for("abandon"))
+        return self._start("abandon", "Abandon batches", sel, run, lock=self._lock_for("abandon"))
 
     def _job_cleanup(self, body: Dict[str, Any]) -> Job:
         _require_confirm(body)
@@ -823,8 +981,312 @@ class WebApp:
                 job.log("  ! " + err)
             return dict(result, status=WARNING if result["errors"] else None)
 
-        return self.jobs.start("cleanup", "Delete rolled-back batches",
+        return self._start("cleanup", "Delete rolled-back batches",
                                {"batches": sorted(wanted)}, run, lock=self._lock_for("cleanup"))
+
+    # ================================================================ identity
+    def identify(self, token: str) -> Optional[Dict[str, Any]]:
+        """A named user's token -> {name, role}; None when unknown or disabled."""
+        with self.lock:
+            user = access.authenticate(self.store, token)
+            if user:
+                seen = getattr(self, "_seen", {})
+                self._seen = seen
+                now = time.monotonic()
+                if now - seen.get(user["name"], -1e9) > 60:      # at most one write a minute
+                    seen[user["name"]] = now
+                    access.touch(self.store, user["name"])
+        return user
+
+    def me(self, q, body) -> Dict[str, Any]:
+        return {"user": current_user()}
+
+    def _on_job_finish(self, job: Job) -> None:
+        kinds = ("execute", "rollback", "commit", "schedule", "abandon", "cleanup")
+        if job.kind not in kinds and job.status != "failed":
+            return
+        result = dict(job.result or {}, error=job.error)
+        service.notify_run(self.cfg, job.kind, job.title, job.status, result, actor=job.user)
+
+    def _vcenter_client(self, log=None):
+        """A connected vCenter client from the remembered or environment credentials, or None."""
+        from ..vcenter import VCenterClient, VCenterError
+        creds = self._vc_creds or {}
+        server = creds.get("server") or os.environ.get(ENV_SERVER)
+        user = creds.get("user") or os.environ.get(ENV_USER)
+        password = creds.get("password") or os.environ.get(ENV_PASSWORD)
+        if not (server and user and password):
+            return None
+        try:
+            client = VCenterClient(server, user, password, insecure=bool(creds.get("insecure")), log=log)
+            client.connect()
+            return client
+        except VCenterError as exc:
+            if log:
+                log("  (vCenter checks skipped: {})".format(str(exc)[:200]))
+            return None
+
+    # ================================================================ readiness
+    def readiness_summary(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            rows = self.store.query_discovered(selected=True if q.get("selected") else None)
+        return readiness.summary(rows)
+
+    def apps(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            rows = self.store.conn.execute(
+                "SELECT app, wave, state, COUNT(*) AS n FROM vms WHERE app != '' GROUP BY app, wave, state").fetchall()
+        apps: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            a = apps.setdefault(r["app"], {"app": r["app"], "total": 0, "waves": {}, "counts": {}})
+            a["total"] += r["n"]
+            a["waves"][r["wave"]] = a["waves"].get(r["wave"], 0) + r["n"]
+            a["counts"][r["state"]] = a["counts"].get(r["state"], 0) + r["n"]
+        out = sorted(apps.values(), key=lambda a: a["app"].lower())
+        for a in out:
+            a["split"] = len(a["waves"]) > 1
+        return {"apps": out, "category": self.cfg.app_category, "together": self.cfg.app_together}
+
+    # ================================================================ verification
+    def _job_verify(self, body: Dict[str, Any]) -> Job:
+        morefs = _list(body.get("morefs"))
+        wave = _int(body.get("wave"))
+        only_new = bool(body.get("unverified"))
+
+        def run(job: Job) -> Dict[str, Any]:
+            with self._job_workspace(job) as ws:
+                rows = service.verify_rows(ws.store, morefs=morefs, wave=wave, only_unverified=only_new)
+                if not rows:
+                    job.log("no committed VMs to verify")
+                    return {"checked": 0}
+                client = self._vcenter_client(job.log)
+                job.log("verifying {} committed VM(s){}...".format(
+                    len(rows), "" if client else " (network checks only: no vCenter session)"))
+                try:
+                    result = service.run_verification(ws, rows, client,
+                                                      progress=lambda d, t: job.set_progress(d, t, "VMs checked"))
+                finally:
+                    if client:
+                        client.close()
+            c = result["counts"]
+            job.log("verified {}: {} ok · {} unverifiable · {} FAILED".format(
+                result["checked"], c.get("ok", 0), c.get("warn", 0), c.get("fail", 0)))
+            for line in result["failures"][:20]:
+                job.log("  ! " + line)
+            return dict(result, status=WARNING if c.get("fail") else None)
+
+        return self._start("verify", "Verify committed VMs", {"morefs": morefs, "wave": wave}, run)
+
+    # ================================================================ approvals
+    def approvals(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            return {"approvals": access.list_approvals(self.store, state=q.get("state") or None),
+                    "required": list(self.cfg.require_approval), "me": current_user()}
+
+    def approval_decide(self, q, body, aid: str) -> Dict[str, Any]:
+        approve = bool(body.get("approve"))
+        with self.lock:
+            a = access.decide(self.store, int(aid), approve, self._actor(), str(body.get("note") or ""))
+            sch.on_approval(self.store, a)
+        service.notifier(self.cfg)("approval_decided", "Approval #{} {}".format(a["id"], a["state"]),
+                                   a["summary"] or "", {"by": a["decided_by"], "requested by": a["requested_by"]})
+        job = None
+        if approve and not a.get("schedule_id"):
+            job = self._run_approved(a)
+        return {"approval": a, "job": job.summary() if job else None}
+
+    def _run_approved(self, a: Dict[str, Any]) -> Job:
+        """Start an approved request, on behalf of both people."""
+        kind = "execute" if a["stage"] in ("import", "precheck") else a["stage"]
+        body = dict(a["body"], confirm=True)
+        if kind == "execute":
+            body["stage"] = a["stage"]
+        prev = getattr(CTX, "user", None)
+        CTX.user = {"name": "{} (approved by {})".format(a["requested_by"], a["decided_by"]), "role": "operator"}
+        try:
+            job = getattr(self, "_job_" + kind)(body)
+        finally:
+            CTX.user = prev
+        with self.lock:
+            access.consume(self.store, a["id"], a["stage"], job.id)
+        return job
+
+    def approval_cancel(self, q, body, aid: str) -> Dict[str, Any]:
+        with self.lock:
+            a = access.get(self.store, int(aid))
+            if a["requested_by"] != self._actor() and not access.allows(current_user()["role"], "admin"):
+                raise ApiError(403, "only the requester or an admin can withdraw a request")
+            access.cancel(self.store, int(aid), self._actor())
+            a = access.get(self.store, int(aid))
+            sch.on_approval(self.store, a)
+        return {"approval": a}
+
+    # ================================================================ schedules
+    def schedules(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            rows = sch.list_schedules(self.store)
+        return {"schedules": rows, "now": sch.iso(sch.now_utc()),
+                "scheduler": bool(self._scheduler and self._scheduler.is_alive())}
+
+    def _fit(self, stage_name: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        with self.lock:
+            engine = self._engine(self._exec_cfg(body))
+            per_ns: Dict[str, int] = {}
+            for w, _n in service.eligible_by_wave(engine, stage_name, _list(body.get("waves"), int),
+                                                  folders=_list(body.get("folders"))):
+                for vm in engine.eligible(stage_name, w, folders=_list(body.get("folders"))):
+                    per_ns[vm["namespace"]] = per_ns.get(vm["namespace"], 0) + 1
+            return est.estimate(self.store, engine.cfg, stage_name, per_ns)
+
+    def schedule_fit(self, q, body) -> Dict[str, Any]:
+        stage_name = _stage(body.get("stage"))
+        eta = self._fit(stage_name, body)
+        out = {"estimate": eta}
+        if body.get("start_at") and body.get("end_at"):
+            span = (sch.parse_when(body["end_at"]) - sch.parse_when(body["start_at"])).total_seconds()
+            out.update(window_seconds=span, fits=eta["seconds"] <= span)
+        return out
+
+    def schedule_create(self, q, body) -> Dict[str, Any]:
+        stage_name = _stage(body.get("stage"))
+        try:
+            start, end = sch.parse_when(body.get("start_at", "")), sch.parse_when(body.get("end_at", ""))
+        except sch.ScheduleError as exc:
+            raise ApiError(400, str(exc))
+        self._exec_cfg(body)            # validate batch size / parallel overrides now
+        needs = access.needs_approval(self.cfg, stage_name, body)
+        with self.lock:
+            try:
+                s_ = sch.create(self.store, stage_name, body, start, end, self._actor(), needs_approval=needs)
+            except sch.ScheduleError as exc:
+                raise ApiError(400, str(exc))
+            if needs:
+                a = access.request(self.store, stage_name, dict(body, stage=stage_name), self._actor(),
+                                   schedule_id=s_["id"])
+                s_ = sch.mark(self.store, s_["id"], sch.AWAITING, approval_id=a["id"])
+        if needs:
+            service.notifier(self.cfg)("approval_requested", "Approval #{} requested".format(s_["approval_id"]),
+                                       "Change window #{}: {}".format(s_["id"], access.summarize(stage_name, body)),
+                                       {"by": self._actor()})
+        return {"schedule": s_, "fit": self.schedule_fit(q, dict(body, start_at=s_["start_at"], end_at=s_["end_at"]))}
+
+    def schedule_cancel(self, q, body, sid: str) -> Dict[str, Any]:
+        with self.lock:
+            try:
+                return {"schedule": sch.cancel(self.store, int(sid), self._actor())}
+            except sch.ScheduleError as exc:
+                raise ApiError(409, str(exc))
+
+    def scheduler_tick(self) -> Optional[Job]:
+        """Start whatever window is due (one at a time); mark missed ones. Returns a started job."""
+        with self.lock:
+            missed = sch.sweep_missed(self.store)
+            due = sch.due(self.store)
+        for m in missed:
+            service.notifier(self.cfg)("schedule_missed", "Change window #{} missed".format(m["id"]),
+                                       m["message"] or "")
+        if not due or self.jobs.active is not None:
+            return None
+        s_ = due[0]
+        with self.lock:
+            sch.mark(self.store, s_["id"], sch.RUNNING)     # before the job: no tick may start it twice
+
+        def run(job: Job) -> Dict[str, Any]:
+            try:
+                with self._job_workspace(job) as ws:
+                    result = service.run_schedule(ws, s_, job.log, on_stop=job.on_stop)
+            except Exception as exc:
+                with self.lock:
+                    if sch.get(self.store, s_["id"])["state"] == sch.RUNNING:
+                        sch.mark(self.store, s_["id"], sch.FAILED, str(exc)[:500])
+                raise
+            status = STOPPED if result["schedule_state"] == sch.STOPPED else (
+                WARNING if result.get("failed") or result.get("halted") else None)
+            return dict(result, status=status)
+
+        prev = getattr(CTX, "user", None)
+        CTX.user = {"name": "scheduler (window #{} by {})".format(s_["id"], s_["created_by"]), "role": "operator"}
+        try:
+            job = self._start("schedule", "Change window #{}: {}".format(s_["id"], s_["stage"]),
+                              {"schedule": s_["id"]}, run, stoppable=True,
+                              lock=self._lock_for("change window #{}".format(s_["id"])))
+        except Exception:  # noqa: BLE001 -- busy (a CLI run holds the workspace): retry next tick
+            with self.lock:
+                sch.mark(self.store, s_["id"], sch.SCHEDULED, "waiting: the workspace was busy")
+            return None
+        finally:
+            CTX.user = prev
+        with self.lock:
+            self.store.conn.execute("UPDATE schedules SET job_id=? WHERE id=?", (job.id, s_["id"]))
+            self.store.conn.commit()
+        return job
+
+    def start_scheduler(self, interval: float = 15.0) -> None:
+        def loop() -> None:
+            while not self._scheduler_stop.wait(interval):
+                try:
+                    self.scheduler_tick()
+                except Exception:  # noqa: BLE001 -- keep the scheduler alive
+                    pass
+        self._scheduler = threading.Thread(target=loop, name="scheduler", daemon=True)
+        self._scheduler.start()
+
+    # ================================================================ settings & users
+    def settings_get(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            rows = settings_mod.describe(self.file_cfg, self.store)
+            channels = self.cfg.notify
+        return {"settings": rows, "notify": channels, "events": notify_mod.EVENTS,
+                "types": notify_mod.TYPES, "me": current_user()}
+
+    def settings_put(self, q, body) -> Dict[str, Any]:
+        changes = body.get("changes")
+        if not isinstance(changes, dict):
+            raise ApiError(400, "send {\"changes\": {key: value or null}}")
+        with self.lock:
+            try:
+                settings_mod.update(self.store, changes, self._actor())
+            except (ConfigError, ValueError) as exc:
+                raise ApiError(400, str(exc))
+        self.cfg = self._effective_cfg()
+        return self.settings_get(q, {})
+
+    def notify_test(self, q, body) -> Dict[str, Any]:
+        try:
+            channels = notify_mod.validate(body.get("channels") if body.get("channels") is not None
+                                           else self.cfg.notify)
+        except ValueError as exc:
+            raise ApiError(400, str(exc))
+        results = []
+
+        def record(level, message):
+            results.append({"level": level, "message": message})
+        notify_mod.send(channels, "test", "Test from the vcfa-import console",
+                        "If you can read this, notifications reach you.", {"sent by": self._actor()},
+                        {"context": self.cfg.context}, record=record, wait=True)
+        return {"results": results}
+
+    def users_list(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            return {"users": access.list_users(self.store), "roles": list(access.ROLES)}
+
+    def users_add(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            try:
+                token = access.create_user(self.store, str(body.get("name") or ""), str(body.get("role") or ""),
+                                           self._actor())
+            except access.AccessError as exc:
+                raise ApiError(400, str(exc))
+        return {"name": body.get("name"), "token": token}
+
+    def users_toggle(self, q, body, name: str, action: str) -> Dict[str, Any]:
+        with self.lock:
+            try:
+                access.set_disabled(self.store, name, action == "disable", self._actor())
+            except access.AccessError as exc:
+                raise ApiError(404, str(exc))
+            return {"users": access.list_users(self.store)}
+
 
 
 def _local_now() -> str:
@@ -864,13 +1326,32 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/jobs/(?P<job_id>[\w.-]+)", "job"),
         ("POST", r"/api/jobs/(?P<job_id>[\w.-]+)/stop", "job_stop"),
         ("POST", r"/api/run/(?P<kind>discover|preflight|execute|refresh|watch|commit|rollback|"
-                 r"abandon|cleanup)", "run_job"),
+                 r"abandon|cleanup|verify)", "run_job"),
+        ("GET", r"/api/me", "me"),
+        ("GET", r"/api/readiness", "readiness_summary"),
+        ("GET", r"/api/apps", "apps"),
+        ("GET", r"/api/approvals", "approvals"),
+        ("POST", r"/api/approvals/(?P<aid>\d+)/decide", "approval_decide"),
+        ("POST", r"/api/approvals/(?P<aid>\d+)/cancel", "approval_cancel"),
+        ("GET", r"/api/schedules", "schedules"),
+        ("POST", r"/api/schedules", "schedule_create"),
+        ("POST", r"/api/schedules/fit", "schedule_fit"),
+        ("POST", r"/api/schedules/(?P<sid>\d+)/cancel", "schedule_cancel"),
+        ("GET", r"/api/settings", "settings_get"),
+        ("PUT", r"/api/settings", "settings_put"),
+        ("POST", r"/api/settings/notify-test", "notify_test"),
+        ("GET", r"/api/users", "users_list"),
+        ("POST", r"/api/users", "users_add"),
+        ("POST", r"/api/users/(?P<name>[\w.@-]+)/(?P<action>disable|enable)", "users_toggle"),
         ("GET", r"/api/export/(?P<name>tracker\.csv|transitions\.csv|ledger\.jsonl|report\.html)",
          "export"),
     ]
 ]
 
 # Errors that are the user's to fix, reported as 400 rather than 500.
-USER_ERRORS = (SelectionError, ValueError, VCenterError)
+USER_ERRORS = (SelectionError, ValueError, VCenterError, sch.ScheduleError)
+# Who may call what: GETs need a viewer, other calls an operator, these an admin.
+ADMIN_HANDLERS = {"settings_put", "notify_test", "users_list", "users_add", "users_toggle"}
+FORBIDDEN_ERRORS = (access.AccessError,)
 # Errors meaning "not now": reported as 409 Conflict.
 BUSY_ERRORS = (service.WorkspaceBusy,)

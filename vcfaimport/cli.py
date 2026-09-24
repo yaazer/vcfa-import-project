@@ -17,6 +17,7 @@ from .discovery import (
     apply_filters,
     load_folder_map,
     load_network_map,
+    load_tag_map,
     read_selection_file,
     resolve_identifiers,
     stage,
@@ -28,6 +29,7 @@ from .folders import describe as describe_scope
 from .inventory import InventoryError, load_inventory, write_template
 from .kube import KubectlError
 from .planner import summarize
+from . import access
 from . import report
 from . import service
 from . import state as st
@@ -63,16 +65,46 @@ def _load_config(args) -> Config:
 
 
 def _open(args) -> tuple:
+    ws = _open_ws(args)
+    return ws.cfg, ws.store, ws.kube, ws.engine
+
+
+def _open_ws(args) -> "service.Workspace":
     cfg = _load_config(args)
+    ws = service.Workspace(cfg, dry_run=getattr(args, "dry_run", False),
+                           verbose=getattr(args, "verbose", False), log=log,
+                           actor=access.os_user())
+    # per-run flags win over the workspace settings the Workspace just applied
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
     if getattr(args, "parallel", None):
         cfg.max_parallel_batches = args.parallel
     if getattr(args, "no_precheck", False):
         cfg.require_precheck = False
-    ws = service.Workspace(cfg, dry_run=getattr(args, "dry_run", False),
-                           verbose=getattr(args, "verbose", False), log=log)
-    return ws.cfg, ws.store, ws.kube, ws.engine
+    cfg.validate()
+    return ws
+
+
+def _gate(store, cfg, stage: str, args, body: dict) -> Optional[int]:
+    """Two-person rule: a stage in require_approval needs an approved --approval ID.
+
+    Returns an exit code to stop with, or None to proceed (the approval is consumed).
+    """
+    if not access.needs_approval(cfg, stage, body):
+        return None
+    aid = getattr(args, "approval", None)
+    if not aid:
+        log("{} needs a second person's approval (require_approval).".format(stage))
+        log("  ask for it:   vcfa-import approvals request --stage {} ...".format(stage))
+        log("  then re-run with --approval <id> once someone else has approved it")
+        return 2
+    try:
+        access.consume(store, aid, stage)
+    except access.AccessError as exc:
+        log("refused: {}".format(exc))
+        return 2
+    log("using approval #{} ({})".format(aid, stage))
+    return None
 
 
 def _waves(args) -> Optional[List[int]]:
@@ -207,6 +239,7 @@ def _filters_from(args) -> Filters:
         with_nics=getattr(args, "with_nics", False),
         morefs=getattr(args, "vm", None) or [],
         regex=getattr(args, "regex", None),
+        tag=getattr(args, "tag", None) or [],
     )
 
 
@@ -229,6 +262,7 @@ def cmd_discover(args) -> int:
             power_state="POWERED_ON" if args.powered_on else None,
             with_tools=not args.no_tools,
             with_placement=not args.no_placement,
+            with_tags=not args.no_tags,
             concurrency=args.concurrency,
             progress=progress,
             log=log,
@@ -394,6 +428,9 @@ def cmd_select(args) -> int:
     morefs = [r["moref"] for r in targets]
     changed = store.set_selected(morefs, not deselect,
                                  namespace=args.namespace, wave=args.wave_single)
+    if args.app is not None:
+        store.set_app(morefs, args.app)
+        log("application set to '{}' on {} VM(s)".format(args.app, len(morefs)))
 
     # Per-VM namespaces from a picker export take precedence over --namespace.
     if namespaces or waves:
@@ -428,8 +465,12 @@ def cmd_stage(args) -> int:
 
     mapping = load_network_map(args.map) if args.map else {}
     folder_mapping = load_folder_map(args.folder_map) if args.folder_map else {}
+    tag_mapping = load_tag_map(args.tag_map) if args.tag_map else {}
     result = stage(rows, cfg, mapping=mapping, folder_mapping=folder_mapping,
-                   default_namespace=args.default_namespace, default_wave=args.wave_single or 1)
+                   default_namespace=args.default_namespace, default_wave=args.wave_single or 1,
+                   tag_mapping=tag_mapping)
+    for move in result.app_moves[:20]:
+        log("  ~ " + move)
 
     if result.unmapped_folders:
         log("folders with no entry in the folder map:")
@@ -564,13 +605,24 @@ def _execute(args, stage: str) -> int:
     rows = [list(r) for r in service.eligible_by_wave(
         engine, stage, waves, morefs=only, include_failed=args.include_failed,
         folders=scope, folder_exact=exact)]
+    held = service.holdbacks(engine, stage, waves, morefs=only, include_failed=args.include_failed,
+                             folders=scope, folder_exact=exact)
     if not rows:
         log("nothing to do for stage '{}'".format(stage))
+        for note in held:
+            log("  held back: " + note)
         if stage == STAGE_IMPORT and cfg.require_precheck:
             log("(VMs must reach precheck_passed first; run `precheck`, or pass --no-precheck)")
         return 0
 
     total = sum(r[1] for r in rows)
+    per_ns: Dict[str, int] = {}
+    for wave, _n in rows:
+        for vm in engine.eligible(stage, wave, morefs=only, include_failed=args.include_failed,
+                                  folders=scope, folder_exact=exact):
+            per_ns[vm["namespace"]] = per_ns.get(vm["namespace"], 0) + 1
+    from .estimate import estimate, human
+    eta = estimate(store, cfg, stage, per_ns)
     log("about to {} {} VM(s){}:".format(
         "precheck" if stage == STAGE_PRECHECK else "IMPORT", total,
         " in " + describe_scope(scope, exact) if scope else ""))
@@ -584,6 +636,10 @@ def _execute(args, stage: str) -> int:
             cfg.commit_action,
             "  (imports commit automatically and cannot be exported back to vCenter)"
             if cfg.commit_action == "Auto" else "  (each batch will wait for `commit`)"))
+    log("  estimate     : about {} ({} batch(es); {} batch time {})".format(
+        human(eta["seconds"]), eta["batches"], eta["basis"], human(eta["batch_seconds"])))
+    for note in held:
+        log("  held back    : " + note)
     if args.dry_run:
         log("  DRY RUN      : manifests are rendered and validated, nothing is applied")
     log("")
@@ -593,6 +649,10 @@ def _execute(args, stage: str) -> int:
         log("aborted")
         return 1
 
+    body = {"waves": waves, "folders": scope, "morefs": only, "dry_run": args.dry_run}
+    code = _gate(store, cfg, stage, args, body)
+    if code is not None:
+        return code
     started = time.time()
     lock = None if args.dry_run else service.WorkspaceLock(cfg, "`{}` from the CLI".format(stage))
     try:
@@ -610,6 +670,10 @@ def _execute(args, stage: str) -> int:
             lock.release()
 
     halted = totals["halted"]
+    if not args.dry_run:
+        status = "warning" if (halted or totals["failed"]) else "succeeded"
+        service.notify_run(cfg, stage, "{} from the CLI".format(stage), status, totals,
+                           actor=store.actor, wait=True)
     if halted is not None:
         log("\nRUN HALTED: {}".format(halted))
         log("Investigate with `vcfa-import status` and `vcfa-import events --level error`,")
@@ -689,6 +753,9 @@ def cmd_commit(args) -> int:
     if not _confirm("Commit these {} VM(s)?".format(len(waiting)), args.yes):
         log("aborted")
         return 1
+    code = _gate(store, cfg, "commit", args, {"wave": args.wave_single, "morefs": args.vm})
+    if code is not None:
+        return code
     with service.WorkspaceLock(cfg, "`commit` from the CLI"):
         result = engine.commit(morefs=args.vm or None, wave=args.wave_single)
     log("patched {} batch(es) covering {} VM(s)".format(result["batches"], result["vms"]))
@@ -736,6 +803,9 @@ def cmd_rollback(args) -> int:
                     args.yes):
         log("aborted")
         return 1
+    code = _gate(store, cfg, "rollback", args, {"batches": [b["name"] for b in batches]})
+    if code is not None:
+        return code
 
     with service.WorkspaceLock(cfg, "`rollback` from the CLI"):
         result = engine.rollback(batches, action=args.action, wait=not args.no_wait,
@@ -976,13 +1046,202 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_readiness(args) -> int:
+    from . import readiness
+    _cfg, store, _kube, _engine = _open(args)
+    rows = store.query_discovered(selected=True if args.selected else None)
+    rows = apply_filters(rows, _filters_from(args))
+    if not rows:
+        log("nothing discovered (or nothing matches)")
+        return 0
+    summ = readiness.summary(rows)
+    g = summ["grades"]
+    log("readiness of {} VM(s): {} ready · {} worth a look · {} likely to fail precheck".format(
+        len(rows), g["ready"], g["warn"], g["block"]))
+    log("(advisory: the operator's precheck is the authority)")
+    log("")
+    names = {r["moref"]: r["name"] for r in rows}
+    for f in summ["findings"]:
+        log("  [{}] {:<34} {:>5} VM(s)  {}".format(f["level"], f["title"], f["count"],
+                                                  ", ".join(names[m] for m in f["morefs"][:4])
+                                                  + (" ..." if f["count"] > 4 else "")))
+        log("         {}".format(f["advice"]))
+    return 0 if not g["block"] else 4
+
+
+def cmd_verify(args) -> int:
+    ws = _open_ws(args)
+    store = ws.store
+    ws_rows = service.verify_rows(store, morefs=args.vm or None, wave=args.wave_single,
+                                  only_unverified=args.unverified)
+    if not ws_rows:
+        log("no committed VMs to verify")
+        return 0
+    client = None
+    if not args.no_vcenter:
+        try:
+            server, user, password = resolve_credentials(args.vcenter, args.user, args.password)
+            client = VCenterClient(server, user, password, insecure=args.insecure, log=log)
+            client.connect()
+        except VCenterError as exc:
+            log("  (vCenter checks skipped: {})".format(exc))
+            client = None
+    log("verifying {} committed VM(s)...".format(len(ws_rows)))
+    try:
+        result = service.run_verification(ws, ws_rows, client)
+    finally:
+        if client:
+            client.close()
+    c = result["counts"]
+    log("verified {}: {} ok · {} unverifiable · {} FAILED".format(result["checked"], c.get("ok", 0),
+                                                                   c.get("warn", 0), c.get("fail", 0)))
+    for line in result["failures"][:30]:
+        log("  ! " + line)
+    return 0 if not c.get("fail") else 4
+
+
+def cmd_schedule(args) -> int:
+    from . import schedule as sch
+    ws = _open_ws(args)
+    cfg, store, engine = ws.cfg, ws.store, ws.engine
+    actor = store.actor
+    if args.action == "list":
+        rows = sch.list_schedules(store)
+        if not rows:
+            log("no change windows")
+            return 0
+        log(report.table(["id", "stage", "start (UTC)", "end (UTC)", "state", "by", "note"],
+                         [[r["id"], r["stage"], r["start_at"], r["end_at"], r["state"], r["created_by"] or "",
+                           (r["message"] or "")[:50]] for r in rows], indent="  "))
+        return 0
+    if args.action == "cancel":
+        sch.cancel(store, args.id, actor)
+        log("schedule #{} cancelled".format(args.id))
+        return 0
+    if args.action == "add":
+        body = {"waves": args.wave or None, "folders": args.folder or None, "include_failed": args.include_failed,
+                "rollback_failed": getattr(args, "rollback_failed", False)}
+        start, end = sch.parse_when(args.start), sch.parse_when(args.end)
+        needs = access.needs_approval(cfg, args.stage, body)
+        s = sch.create(store, args.stage, body, start, end, actor, needs_approval=needs)
+        if needs:
+            a = access.request(store, args.stage, dict(body, stage=args.stage), actor, schedule_id=s["id"])
+            sch.mark(store, s["id"], sch.AWAITING, approval_id=a["id"])
+            service.notifier(cfg)("approval_requested", "Approval #{} requested".format(a["id"]),
+                                  "Change window #{}: {}".format(s["id"], a["summary"]), {"by": actor}, wait=True)
+            log("schedule #{} created; it needs approval #{} from someone else".format(s["id"], a["id"]))
+        else:
+            log("schedule #{}: {} from {} to {} (UTC)".format(s["id"], args.stage, s["start_at"], s["end_at"]))
+        from .estimate import estimate, human
+        per_ns: Dict[str, int] = {}
+        for w, _n in service.eligible_by_wave(engine, args.stage, args.wave or None, folders=args.folder or None):
+            for vm in engine.eligible(args.stage, w, folders=args.folder or None):
+                per_ns[vm["namespace"]] = per_ns.get(vm["namespace"], 0) + 1
+        eta = estimate(store, cfg, args.stage, per_ns)
+        span = (end - start).total_seconds()
+        log("  estimate {} for what is eligible now; the window is {}{}".format(
+            human(eta["seconds"]), human(span), "" if eta["seconds"] <= span else "  -- it will NOT all fit"))
+        return 0
+    # tick: run whatever is due now, then return (Task Scheduler / cron entry point)
+    for m in sch.sweep_missed(store):
+        log("  missed: schedule #{} ({})".format(m["id"], m["message"]))
+        service.notifier(cfg)("schedule_missed", "Change window #{} missed".format(m["id"]), m["message"] or "",
+                              wait=True)
+    due = sch.due(store)
+    if not due:
+        log("nothing due")
+        return 0
+    s = due[0]
+    try:
+        with service.WorkspaceLock(cfg, "schedule #{} (tick)".format(s["id"])):
+            result = service.run_schedule(ws, s, log)
+    except service.WorkspaceBusy as exc:
+        log("not started this tick: {}".format(exc))
+        return 7
+    log("schedule #{}: {}".format(s["id"], result["message"]))
+    return 0
+
+
+def cmd_settings(args) -> int:
+    from . import settings as settings_mod
+    cfg_file = _load_config(args)
+    _cfg, store, _kube, _engine = _open(args)
+    if args.action == "show":
+        for row in settings_mod.describe(cfg_file, store):
+            log("  {:<36} {:<22} {}".format(row["key"], str(row["value"]),
+                                            "(workspace; file: {})".format(row["file_value"]) if row["overridden"] else ""))
+        log("")
+        log("  notification channels: {}".format(len(_cfg.notify)))
+        return 0
+    if args.action == "set":
+        changes = {}
+        for pair in args.pairs:
+            key, _, value = pair.partition("=")
+            if not _:
+                log("use key=value, e.g. batch_size=20")
+                return 2
+            changes[key.strip()] = value.strip()
+        settings_mod.update(store, changes, store.actor)
+        log("saved: " + ", ".join(changes))
+        return 0
+    settings_mod.update(store, {k: None for k in args.pairs}, store.actor)
+    log("reset to the config file: " + ", ".join(args.pairs))
+    return 0
+
+
+def cmd_users(args) -> int:
+    _cfg, store, _kube, _engine = _open(args)
+    if args.action == "list":
+        rows = access.list_users(store)
+        log(report.table(["user", "role", "created", "by", "disabled", "last seen"],
+                         [[u["name"], u["role"], u["created_at"], u["created_by"] or "", "yes" if u["disabled"] else "",
+                           u["last_seen"] or ""] for u in rows], indent="  ") if rows else "no users yet")
+        return 0
+    if args.action == "add":
+        token = access.create_user(store, args.name, args.role, store.actor)
+        log("{} ({}) -- personal console link (shown once; keep it private):".format(args.name, args.role))
+        log("  http://127.0.0.1:<port>/#t={}".format(token))
+        return 0
+    access.set_disabled(store, args.name, args.action == "disable", store.actor)
+    log("{} {}d".format(args.name, args.action))
+    return 0
+
+
+def cmd_approvals(args) -> int:
+    from . import schedule as sch
+    cfg, store, _kube, _engine = _open(args)
+    actor = store.actor
+    if args.action == "list":
+        rows = access.list_approvals(store, state=None if args.all else "pending")
+        if not rows:
+            log("no approvals" + ("" if args.all else " pending"))
+            return 0
+        log(report.table(["id", "stage", "what", "requested by", "at", "state", "decided by"],
+                         [[a["id"], a["stage"], a["summary"], a["requested_by"], a["requested_at"], a["state"],
+                           a["decided_by"] or ""] for a in rows], indent="  "))
+        return 0
+    if args.action == "request":
+        body = {"waves": args.wave or None, "folders": args.folder or None}
+        a = access.request(store, args.stage, body, actor)
+        service.notifier(cfg)("approval_requested", "Approval #{} requested".format(a["id"]), a["summary"],
+                              {"by": actor}, wait=True)
+        log("approval #{} requested: {} -- someone other than {} must approve it".format(a["id"], a["summary"], actor))
+        return 0
+    a = access.decide(store, args.id, args.action == "approve", actor, args.note or "")
+    sch.on_approval(store, a)
+    service.notifier(cfg)("approval_decided", "Approval #{} {}".format(a["id"], a["state"]),
+                          a["summary"] or "", {"by": actor}, wait=True)
+    log("approval #{} {}".format(a["id"], a["state"]))
+    return 0
+
+
 def cmd_serve(args) -> int:
     from .web.api import WebApp
     from .web.server import serve
 
     cfg = _load_config(args)
     app = WebApp(cfg, config_path=args.config, folder_map=args.folder_map,
-                 network_map=args.map, verbose=args.verbose)
+                 network_map=args.map, verbose=args.verbose, tag_map=args.tag_map)
     try:
         return serve(app, args.host, args.port, token=args.token,
                      open_browser=args.open, log=log)
@@ -1049,6 +1308,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--tools-running", action="store_true")
         sp.add_argument("--with-nics", action="store_true",
                         help="only VMs that have at least one network adapter")
+        sp.add_argument("--tag", action="append", metavar="CATEGORY:TAG",
+                        help="vCenter tag, e.g. Application:Payroll (globs allowed); repeatable")
         if with_moref:
             sp.add_argument("--vm", action="append", metavar="MOREF", help="repeatable")
 
@@ -1065,6 +1326,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip the VM Tools check (one fewer call per VM)")
     sp.add_argument("--no-placement", action="store_true",
                     help="skip folder and cluster attribution")
+    sp.add_argument("--no-tags", action="store_true", help="skip reading vCenter tags")
 
     sp = add("browse", cmd_browse, "list the discovered vCenter inventory")
     add_filters(sp)
@@ -1090,12 +1352,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--deselect", action="store_true", help="unselect the matches instead")
     sp.add_argument("--namespace", help="assign this target namespace to the matches")
     sp.add_argument("--wave", dest="wave_single", type=int, help="assign this wave to the matches")
+    sp.add_argument("--app", help="name the application of the matches ('' clears it)")
 
     sp = add("stage", cmd_stage,
              "turn the selected VMs into the import queue")
     sp.add_argument("--map", help="portgroup -> namespace/subnet mapping CSV")
     sp.add_argument("--folder-map",
                     help="folder -> namespace[,wave][,group] mapping CSV; most specific folder wins")
+    sp.add_argument("--tag-map", help="vCenter tag -> namespace[,wave][,group] mapping CSV")
     sp.add_argument("--default-namespace", help="namespace for VMs no map covers")
     sp.add_argument("--wave", dest="wave_single", type=int, default=1)
     sp.add_argument("--out", help="write an inventory CSV for review instead of staging directly")
@@ -1138,6 +1402,8 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--rollback-failed", action="store_true",
                             help="after the run, hand every failed import back to vCenter "
                                  "(patches rollbackAction onto the failed batches and waits)")
+            sp.add_argument("--approval", type=int, metavar="ID",
+                            help="an approved request, when require_approval covers import")
 
     sp = add("status", cmd_status, "show campaign progress")
     add_scope(sp)
@@ -1150,6 +1416,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--forever", action="store_true")
 
     sp = add("commit", cmd_commit, "release VMs held by commitAction: Wait")
+    sp.add_argument("--approval", type=int, metavar="ID", help="an approved request (require_approval)")
     sp.add_argument("--wave", dest="wave_single", type=int)
     sp.add_argument("--vm", action="append", help="moref; repeatable")
     sp.add_argument("-y", "--yes", action="store_true")
@@ -1170,6 +1437,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="minutes to wait for the revert (default rollback_timeout_minutes)")
     sp.add_argument("--delete", action="store_true",
                     help="delete each batch once its rollback is confirmed")
+    sp.add_argument("--approval", type=int, metavar="ID", help="an approved request (require_approval)")
     sp.add_argument("-y", "--yes", action="store_true")
 
     sp = add("abandon", cmd_abandon,
@@ -1230,6 +1498,47 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--csv", help="output path for the per-VM CSV")
     sp.add_argument("--refresh", action="store_true")
 
+    sp = add("readiness", cmd_readiness, "spot likely precheck failures from vCenter facts (advisory)")
+    add_filters(sp)
+    sp.add_argument("--selected", action="store_true", help="only VMs already selected")
+
+    sp = add("verify", cmd_verify, "check committed VMs: power, Tools, IP preserved, ping, TCP ports")
+    sp.add_argument("--vm", action="append", metavar="MOREF")
+    sp.add_argument("--wave", dest="wave_single", type=int)
+    sp.add_argument("--unverified", action="store_true", help="only VMs not verified yet")
+    sp.add_argument("--no-vcenter", action="store_true", help="network checks only")
+    sp.add_argument("--vcenter"); sp.add_argument("--user"); sp.add_argument("--password")
+    sp.add_argument("--insecure", action="store_true")
+
+    sp = add("schedule", cmd_schedule, "change windows: run a precheck or import between two times")
+    sp.add_argument("action", choices=["add", "list", "cancel", "tick"])
+    sp.add_argument("id", nargs="?", type=int, help="schedule id (cancel)")
+    sp.add_argument("--stage", choices=["precheck", "import"], default="precheck")
+    sp.add_argument("--wave", action="append", type=int)
+    sp.add_argument("--folder", action="append", metavar="PATH")
+    sp.add_argument("--start", help="e.g. '2026-09-26 22:00' (local time) or ISO 8601")
+    sp.add_argument("--end", help="when the window closes; no batch starts that would not finish by then")
+    sp.add_argument("--include-failed", action="store_true")
+    sp.add_argument("--rollback-failed", action="store_true")
+
+    sp = add("settings", cmd_settings, "workspace settings shared with the web console")
+    sp.add_argument("action", choices=["show", "set", "reset"])
+    sp.add_argument("pairs", nargs="*", help="set: key=value ...; reset: key ...")
+
+    sp = add("users", cmd_users, "console users: viewer, operator, admin")
+    sp.add_argument("action", choices=["add", "list", "disable", "enable"])
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--role", choices=list(access.ROLES), default="operator")
+
+    sp = add("approvals", cmd_approvals, "the two-person rule for require_approval stages")
+    sp.add_argument("action", choices=["list", "request", "approve", "reject"])
+    sp.add_argument("id", nargs="?", type=int)
+    sp.add_argument("--stage", choices=["import", "commit", "rollback"], default="import")
+    sp.add_argument("--wave", action="append", type=int)
+    sp.add_argument("--folder", action="append", metavar="PATH")
+    sp.add_argument("--note")
+    sp.add_argument("--all", action="store_true", help="list decided ones too")
+
     sp = add("serve", cmd_serve,
              "run the web console: discover, plan waves, execute and triage from a browser")
     sp.add_argument("--host", default="127.0.0.1",
@@ -1243,6 +1552,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "the config)")
     sp.add_argument("--map", help="portgroup map CSV the console edits (default: "
                                   "portgroup-map.csv next to the config)")
+    sp.add_argument("--tag-map", help="vCenter tag map CSV the console edits (default: "
+                                      "tag-map.csv next to the config)")
 
     return p
 
@@ -1272,6 +1583,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except service.WorkspaceBusy as exc:
         log("refused: {}".format(exc))
         return 7
+    except access.AccessError as exc:
+        log("refused: {}".format(exc))
+        return 2
+    except Exception as exc:  # noqa: BLE001 -- schedule/settings user errors
+        if type(exc).__name__ in ("ScheduleError",):
+            log("error: {}".format(exc))
+            return 2
+        raise
     except KeyboardInterrupt:
         log("\ninterrupted")
         return 130

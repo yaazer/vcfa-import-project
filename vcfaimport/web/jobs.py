@@ -40,11 +40,12 @@ class Job:
     _seq = itertools.count(1)
 
     def __init__(self, kind: str, title: str, params: Dict[str, Any], log_dir: Optional[Path],
-                 stoppable: bool = False):
+                 stoppable: bool = False, user: Optional[str] = None):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         self.id = "{}-{:03d}-{}".format(stamp, next(Job._seq) % 1000, kind)
         self.kind = kind
         self.title = title
+        self.user = user or "owner"
         self.params = params
         self.status = RUNNING
         self.started_at = _now_iso()
@@ -109,7 +110,7 @@ class Job:
     # ----------------------------------------------------------- snapshot
     def summary(self) -> Dict[str, Any]:
         return {
-            "id": self.id, "kind": self.kind, "title": self.title, "params": self.params,
+            "id": self.id, "kind": self.kind, "title": self.title, "params": self.params, "user": self.user,
             "status": self.status, "started_at": self.started_at,
             "finished_at": self.finished_at, "result": self.result, "error": self.error,
             "progress": self.progress, "stoppable": self.stoppable and self.status == RUNNING,
@@ -187,8 +188,9 @@ class PastJob:
 
 
 class JobManager:
-    def __init__(self, log_dir: Optional[Path]):
+    def __init__(self, log_dir: Optional[Path], on_finish: Optional[Callable[[Any], None]] = None):
         self.log_dir = log_dir
+        self.on_finish = on_finish          # called with the Job once it has finished
         self._jobs: Dict[str, Any] = {}
         self._active: Optional[Job] = None
         self._lock = threading.Lock()
@@ -219,7 +221,7 @@ class JobManager:
 
     def start(self, kind: str, title: str, params: Dict[str, Any],
               fn: Callable[[Job], Dict[str, Any]], stoppable: bool = False,
-              lock: Any = None) -> Job:
+              lock: Any = None, user: Optional[str] = None) -> Job:
         """Run fn(job) in a thread. fn returns a result dict; a "status" key in it
         (warning/stopped) overrides the default "succeeded".
 
@@ -232,7 +234,7 @@ class JobManager:
                     self._active.title))
             if lock is not None:
                 lock.acquire()      # raises WorkspaceBusy: another process holds it
-            job = Job(kind, title, params, self.log_dir, stoppable=stoppable)
+            job = Job(kind, title, params, self.log_dir, stoppable=stoppable, user=user)
             # Record the job now, not only when it ends: if the console dies
             # mid-run, a restart must still find it (and mark it stopped).
             job.save_meta()
@@ -259,6 +261,11 @@ class JobManager:
             finally:
                 if lock is not None:
                     lock.release()
+                if self.on_finish is not None:
+                    try:
+                        self.on_finish(job)
+                    except Exception:  # noqa: BLE001 -- a notification hook must never matter
+                        pass
 
         threading.Thread(target=runner, name="job-" + job.id, daemon=True).start()
         return job

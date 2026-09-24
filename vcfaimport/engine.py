@@ -54,6 +54,13 @@ class Engine:
         self.log = log
         self._stopping = False
         self._orig_sigint = None
+        # Change windows: never start a batch that would not finish by `deadline`
+        # (epoch seconds), given one batch takes `deadline_batch_s`.
+        self.deadline: Optional[float] = None
+        self.deadline_batch_s: float = 0.0
+        self.hit_deadline = False
+        # Why VMs were held back from the last eligibility check (apps, readiness).
+        self.holdbacks: List[str] = []
 
     # ------------------------------------------------------------- signals
     def request_stop(self) -> None:
@@ -309,8 +316,45 @@ class Engine:
                 states.append(st.S_PENDING)
             if include_failed:
                 states.append(st.S_FAILED)
-        return self.store.query_vms(states=states, wave=wave, morefs=morefs,
+        rows = self.store.query_vms(states=states, wave=wave, morefs=morefs,
                                     folders=folders, folder_exact=folder_exact)
+        self.holdbacks = []
+        if stage == STAGE_PRECHECK and getattr(self.cfg, "readiness_exclude_blocked", False) and rows:
+            from .readiness import blocked_morefs
+            blocked = set(blocked_morefs(self.store, [r["moref"] for r in rows]))
+            if blocked:
+                self.holdbacks.append("{} VM(s) held back: readiness marks them blocked".format(len(blocked)))
+                rows = [r for r in rows if r["moref"] not in blocked]
+        if stage == STAGE_IMPORT and getattr(self.cfg, "app_together", False) and rows:
+            rows = self._whole_apps(rows)
+        return rows
+
+    def _whole_apps(self, rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+        """Import an application only when every one of its VMs can go now.
+
+        A member that is committed (or skipped) is already settled; any other
+        member that is not eligible in this very run -- not prechecked, failed,
+        or in another wave or scope -- holds the whole application back.
+        """
+        eligible = {r["moref"] for r in rows}
+        keep = []
+        held = {}
+        by_app: Dict[str, List[sqlite3.Row]] = {}
+        for r in rows:
+            (by_app.setdefault(r["app"], []) if r["app"] else keep).append(r)
+        for app, members in by_app.items():
+            blockers = [m for m in self.store.query_vms(morefs=self.store.app_members([app]))
+                        if m["moref"] not in eligible and m["state"] not in (st.S_COMMITTED, st.S_SKIPPED)]
+            if blockers:
+                held[app] = blockers
+            else:
+                keep.extend(members)
+        for app, blockers in sorted(held.items()):
+            self.holdbacks.append("app {} held back: {} VM(s) not ready ({})".format(
+                app, len(blockers), ", ".join("{} {}".format(b["vm_name"], b["state"]) for b in blockers[:3])
+                + (" ..." if len(blockers) > 3 else "")))
+        order = {r["moref"]: i for i, r in enumerate(rows)}
+        return sorted(keep, key=lambda r: order[r["moref"]])
 
     def plan(
         self,
@@ -435,6 +479,9 @@ class Engine:
             pending = self.plan(stage, wave=wave, morefs=morefs, limit=limit,
                                 include_failed=include_failed, run_id=run_id,
                                 folders=scope_folders, folder_exact=scope_exact)
+            for note in self.holdbacks:
+                self.log("  ~ " + note)
+                self.store.log_event(note, "warn")
             if self.cfg.max_vms_per_run:
                 capped: List[PlannedBatch] = []
                 total = 0
@@ -479,6 +526,17 @@ class Engine:
                 nxt = self._next_applyable(queue, in_flight)
                 if nxt is None:
                     break
+                if self.deadline is not None:
+                    left = self.deadline - time.time()
+                    if left < max(1.0, self.deadline_batch_s):
+                        msg = ("change window closes in {:.0f} min; a batch takes about {:.0f} min, "
+                               "so no more batches are started ({} left for the next window)").format(
+                            max(0, left) / 60, self.deadline_batch_s / 60, len(queue))
+                        self.log("\n~ " + msg)
+                        self.store.log_event(msg, "warn")
+                        self.hit_deadline = True
+                        self._stopping = True
+                        break
                 queue.remove(nxt)
                 try:
                     self._apply_batch(nxt, stage)

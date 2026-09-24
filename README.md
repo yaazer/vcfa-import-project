@@ -64,16 +64,18 @@ one workspace, and a batch started from either shows up in both.
 
 | page | what you do there |
 |---|---|
-| **Overview** | Campaign totals, progress by wave and namespace, live batches, recent failures, and a *next step* prompt that tells you what to do now |
+| **Overview** | Campaign totals, progress by wave, namespace and application (with time left per wave), live batches, recent failures, requests waiting for approval, the next change window, and a *next step* prompt that tells you what to do now |
 | **1 Discover** | Connect to vCenter (server/user pre-filled from `VCFA_VC_*`; the password is used once and never stored) and read the inventory, with a live progress bar |
-| **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), search and facet filters, shift-click ranges, bulk namespace/wave |
-| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
-| **4 Waves** | A board with one column per wave. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. VMs already in a batch are locked and cannot move |
-| **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. Includes a commit gate and a *Watch* for batches left over from an earlier session |
-| **Import queue** | Every VM with state filters; bulk retry / skip / move wave / roll back / abandon |
+| **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), search and facet filters (including **readiness**, vCenter **tag** and **application**), shift-click ranges, bulk namespace/wave/app, saved views |
+| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
+| **4 Waves** | A board with one column per wave and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
+| **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. Includes a commit gate, a *Watch* for batches left over from an earlier session, an ETA per wave, what is held back and why, post-import verification, and *Schedule…* to run it in a change window instead |
+| **Import queue** | Every VM with state, application and verification filters and saved views; bulk retry / skip / move wave / verify / roll back / abandon |
 | **Batches** | Every `ImportOperationBatch` with its members, the manifest that was applied, and its events |
 | **Triage** | Failures grouped by cause (VM-specific details are normalised away), each with the likely fix and the right buttons: retry, skip, abandon, roll back. Also stalled VMs, rolled-back VMs, and batches safe to clean up |
-| **Activity & logs** | Every job's full log (searchable, *problems only*), the event log, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
+| **Activity & logs** | Every job's full log (searchable, *problems only*), the event log with who did what, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
+| **Change control** | Change windows on a week timeline (plan one and see whether the work fits before it closes), and the approvals queue for the two-person rule |
+| **Settings** | Guardrails (pacing, safety, governance, applications, verification) with their file values and allowed ranges, notification channels with a *Test* button, and people: personal links for viewers, operators and admins |
 
 **Look and feel.** The Overview opens on the **Migration Stream**: every VM is a
 particle, flowing from vCenter through precheck and import into VCF Automation,
@@ -88,7 +90,10 @@ turn it amber, a running job quickens it, and a finished campaign blooms.
   every hue stays legible, and status colours keep their meaning in every theme.
   Your operating system's *reduce motion* setting selects Off automatically.
 - **Command palette** (`Ctrl+K` or `/`): jump to any page, VM or batch, run
-  preflight/refresh/watch, or switch theme, from the keyboard.
+  preflight/refresh/watch/verify, or switch theme, from the keyboard.
+- **Stream lanes**: the Migration Stream flows by stage, or regroups its
+  particles into one lane per wave, namespace or application, coloured by state.
+- **Density**: *Compact* in the Theme Studio fits more rows on a screen.
 
 Long operations run as background **jobs**. Their log streams into a panel at
 the bottom of every page, and is kept under `<workdir>/jobs/` so it survives a
@@ -101,7 +106,9 @@ token printed at start-up (the link carries it after `#t=`, so it never reaches
 a server log). Every API call sends it in a header, so another web page in the
 same browser cannot drive the console. Requests naming a foreign `Host` are
 refused. Cluster-changing actions need an explicit confirmation, which the
-server enforces as well as the UI. To reach it from your desk, keep it on
+server enforces as well as the UI. The start-up link is the **owner** (an
+admin); give colleagues their own links from Settings -> People (see
+[Campaign controls](#campaign-controls)). To reach it from your desk, keep it on
 loopback and tunnel:
 
 ```bash
@@ -110,7 +117,7 @@ ssh -L 8765:127.0.0.1:8765 jumpbox        # then open the printed link locally
 
 ```
 serve [--host 127.0.0.1] [--port 8765] [--token T] [--open]
-      [--folder-map folder-map.csv] [--map portgroup-map.csv]   # default: next to the config
+      [--folder-map folder-map.csv] [--map portgroup-map.csv] [--tag-map tag-map.csv]   # default: next to the config
 ```
 
 Like the rest of the tool it is standard library only, and the UI is plain
@@ -525,6 +532,12 @@ it never touches batches it did not create.
 | `skip` | exclude or re-include VMs |
 | `events` | the run's event log |
 | `report` | standalone HTML and/or CSV report |
+| `readiness` | grade discovered VMs from their vCenter facts before precheck (advisory); exit 4 when some are likely to fail |
+| `verify` | check committed VMs: powered on, Tools running, IP kept, ping, TCP ports |
+| `schedule` | change windows: `add --start --end`, `list`, `cancel ID`, `tick` (run from Task Scheduler or cron) |
+| `settings` | show, `set key=value ...` or `reset key ...` the workspace settings the console edits |
+| `users` | personal console links: `add NAME --role viewer\|operator\|admin`, `list`, `disable`, `enable` |
+| `approvals` | the two-person rule: `list`, `request --stage`, `approve ID`, `reject ID` |
 | `serve` | the web console: every step above from a browser (see [The web console](#the-web-console)) |
 
 ### Preflight vs precheck
@@ -960,6 +973,197 @@ calls per namespace per interval regardless of VM count.
 Long campaigns: run under `screen`/`tmux`, or drive it from a scheduled job —
 `run` is idempotent and resumable, so re-invoking it after any interruption
 continues the campaign.
+
+---
+
+## Campaign controls
+
+Everything in this section is **off until you turn it on** -- a workspace that
+does not use it behaves exactly as before. Each works the same from the CLI and
+from the console, and each is stored in the same workspace.
+
+### Readiness, before precheck
+
+Discovery also reads what vCenter knows that predicts a precheck failure: VMware
+Tools not running, a disk that is not a plain VMDK (RDM), an ISO left connected,
+a disconnected NIC, no NICs, old virtual hardware, no guest IP. Each VM gets a
+grade -- *ready*, *check first* or *likely to fail* -- with the reason and the fix:
+
+```bash
+vcfa-import readiness --selected          # exit 4 when something is likely to fail
+```
+
+It is advice: the operator's precheck is the authority. To keep VMs graded
+*likely to fail* out of precheck batches, set `readiness_exclude_blocked = true`
+(Settings -> Safety); the run says how many it held back.
+
+### vCenter tags and applications
+
+Discovery reads each VM's vCenter tags (`--no-tags` skips it). Tags can select
+VMs (`select --tag "Application:Payroll"`, glob allowed) and place them, with a
+third map that sits between a VM's own setting and the folder map:
+
+```csv
+tag,namespace,wave,group
+Application:Payroll,prod-pay-ns,1,
+Application:*,prod-apps-ns,,
+```
+
+```bash
+vcfa-import stage --map portgroup-map.csv --folder-map folder-map.csv --tag-map tag-map.csv
+```
+
+An exact tag beats a glob. Name the tag category that identifies applications
+with `app_category = "Application"`, or set an application by hand
+(`select --app Payroll`, or *Set app* in the console). With
+`app_together = true`:
+
+- staging puts every VM of an application in its earliest wave (and says so),
+- moving one VM of an application to another wave moves all of it,
+- an import takes an application only when **every** VM of it has passed
+  precheck and is in scope; otherwise the whole application is held back and
+  the run lists why.
+
+### Time estimates
+
+Every plan shows how long it should take: batches are laid out against the
+parallel limits exactly as the engine will run them, times the median batch
+duration measured in this workspace (a conservative default until batches have
+run). The Overview and Waves pages show the time left per wave; `run` and
+`precheck` print the estimate before asking to confirm.
+
+### Change windows
+
+A change window runs a precheck or an import between two times, unattended.
+No batch is started that would not finish before the window closes, given the
+measured batch time; batches already on the cluster are polled to completion,
+and what is left waits for the next window. Planning one shows whether the
+work fits.
+
+```bash
+vcfa-import schedule add --stage import --wave 2 --start "2026-09-26 22:00" --end "2026-09-27 04:00"
+vcfa-import schedule list
+vcfa-import schedule cancel 3
+```
+
+Times without a zone are the machine's local time. Something must be running
+to start a window: `serve` checks every 15 seconds, or run `schedule tick`
+from Task Scheduler / cron every few minutes (it takes the workspace lock like
+any run, so it never overlaps a CLI or console run):
+
+```powershell
+schtasks /Create /SC MINUTE /MO 5 /TN vcfa-import-tick /TR "python C:\vcfa\vcfa-import.pyz -c C:\vcfa\vcfa-import.toml schedule tick"
+```
+
+A window that closes without starting is marked *missed* (and notified).
+
+### The two-person rule
+
+```toml
+[governance]
+require_approval = ["import", "rollback"]   # any of import, commit, rollback
+```
+
+A gated step becomes a request that someone **other than the requester**
+approves; it then runs once, on behalf of both. A dry run needs no approval.
+In the console, *Import* turns into *Request approval* and Change control
+shows the queue. From the CLI, people are identified by their OS login:
+
+```bash
+vcfa-import approvals request --stage import --wave 2     # alice
+vcfa-import approvals approve 7 --note "CAB-1234"         # bob
+vcfa-import run --wave 2 --approval 7                     # alice or bob
+```
+
+A change window for a gated stage waits for approval, and is cancelled if it
+is rejected. This is an audit control -- it records two names against every
+gated change -- not a security boundary against someone with shell access to
+the jump box.
+
+### People, roles and read-only links
+
+The link `serve` prints is the **owner** (admin). Everyone else gets a
+personal link from Settings -> People, or:
+
+```bash
+vcfa-import users add jsmith --role operator     # prints the link token, once
+vcfa-import users add auditor --role viewer
+vcfa-import users disable jsmith
+```
+
+| role | can |
+|---|---|
+| viewer | look at everything, change nothing -- for managers and change boards |
+| operator | discover, select, stage, run, commit, roll back, approve other people's requests |
+| admin | also change settings and notification channels, and manage people |
+
+Only a hash of each token is stored. Every job, event, state change and ledger
+line records who did it (the CLI records the OS user).
+
+### Workspace settings
+
+Pacing, safety, governance, application and verification settings can be
+changed per workspace -- from Settings in the console, or:
+
+```bash
+vcfa-import settings show
+vcfa-import settings set batch_size=20 max_parallel_batches=6
+vcfa-import settings reset batch_size
+```
+
+Precedence: built-in defaults < the TOML file < workspace settings <
+flags on a single command. Every value is range-checked, loosening a guardrail
+in the console asks first, and every change is an event with who made it.
+
+### Notifications
+
+Nothing is sent anywhere until a channel is configured, in the TOML or in
+Settings -> Notifications (with a *Test* button):
+
+```toml
+[[notify]]
+name   = "migration-ops"
+type   = "teams"                 # teams | slack | webhook | email
+url    = "https://example.webhook.office.com/webhookb2/..."
+events = ["job_failed", "circuit_breaker", "awaiting_commit", "approval_requested", "verify_failed"]
+
+[[notify]]
+name         = "on-call"
+type         = "email"
+smtp_host    = "smtp.corp.local"
+smtp_port    = 587
+from         = "vcfa-import@corp.local"
+to           = ["oncall@corp.local"]
+username     = "svc-vcfa"
+password_env = "VCFA_SMTP_PASSWORD"   # the password itself is never stored
+```
+
+Events: `job_succeeded`, `job_warning`, `job_failed`, `circuit_breaker`,
+`awaiting_commit`, `approval_requested`, `approval_decided`,
+`schedule_started`, `schedule_finished`, `schedule_missed`, `verify_failed`.
+No `events` means all of them. `webhook` posts a JSON document with the event,
+severity, title, text and fields; delivery is retried and a failure is logged,
+never fatal.
+
+### Post-import verification
+
+```toml
+[verify]
+verify_after_import = true    # check automatically when an import finishes
+verify_ping         = true
+verify_ports        = [22, 443, 3389]
+```
+
+Each committed VM is checked for: powered on, VMware Tools running, the same
+IP as before the move, ping, and the TCP ports listed. The vCenter checks need
+a session (`VCFA_VC_*`, or tick *keep credentials in memory* on Discover in the
+console); without one only the network checks run. Results appear in the queue
+and each VM's drawer, and failures are notified. Verification never changes a
+VM's state: a committed import stays committed.
+
+```bash
+vcfa-import verify --wave 2 --unverified
+```
 
 ---
 

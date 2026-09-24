@@ -50,6 +50,14 @@ def folder_path(fid: str) -> str:
         fid = parent
     return "/".join(reversed(parts))
 NETWORKS = ["VLAN197-Prod", "VLAN200-DB", "VLAN210-App", "DMZ-Uplink"]
+
+# vSphere tags: an "Application" category that spans folders (so apps are not
+# just folders by another name) and a "Tier" category derived from the name.
+CATEGORIES = {"cat-app": "Application", "cat-tier": "Tier"}
+APPS = ["Payroll", "CRM", "Portal", "Billing"]
+TIERS = {"app": "App", "web": "Web", "db": "DB", "svc": "App"}
+TAGS = {"tag-app-{}".format(a.lower()): ("cat-app", a) for a in APPS}
+TAGS.update({"tag-tier-{}".format(t.lower()): ("cat-tier", t) for t in set(TIERS.values())})
 GUEST = ["RHEL_8_64", "WINDOWS_SERVER_2019", "UBUNTU_64"]
 
 
@@ -66,13 +74,14 @@ def build_inventory(count: int, seed: int = 7) -> Dict[str, Any]:
         nics = {}
         for n in range(nic_count):
             nics[str(4000 + n)] = {
+                # readiness: a disconnected adapter now and then
+                "state": "NOT_CONNECTED" if (i % 19 == 0 and n == 0) else "CONNECTED",
                 "backing": {
                     "type": "DISTRIBUTED_PORTGROUP",
                     "network": "dvportgroup-{}".format(NETWORKS.index(
                         NETWORKS[(i + n) % len(NETWORKS)]) + 100),
                 },
                 "mac_address": "00:50:56:{:02x}:{:02x}:{:02x}".format(i % 255, n, rng.randint(0, 255)),
-                "state": "CONNECTED",
             }
         vms[moref] = {
             "vm": moref,
@@ -86,8 +95,17 @@ def build_inventory(count: int, seed: int = 7) -> Dict[str, Any]:
                 "guest_OS": GUEST[i % len(GUEST)],
                 "host": "host-{}".format(10 + (i % 4)),
                 "nics": nics,
+                "hardware": {"version": "VMX_08" if i % 23 == 0 else "VMX_19"},
+                "disks": dict({"2000": {"backing": {"type": "VMDK_FILE"}}},
+                              **({"2001": {"backing": {"type": "RDM"}}} if i % 17 == 0 else {})),
+                "cdroms": {"3000": {"state": "CONNECTED" if i % 13 == 0 else "NOT_CONNECTED",
+                                    "backing": {"type": "ISO_FILE" if i % 13 == 0 else "CLIENT_DEVICE"}}},
             },
             "_tools": "RUNNING" if i % 11 else "NOT_RUNNING",
+            # every third VM answers on loopback; the rest sit on TEST-NET (never reachable)
+            "_ip": "127.0.0.1" if i % 3 == 0 else "203.0.113.{}".format(i % 250 + 1),
+            "_tags": ["tag-app-{}".format(APPS[(i // 4) % len(APPS)].lower())]
+                     + (["tag-tier-{}".format(TIERS[["app", "web", "db", "svc"][i % 4]].lower())]),
         }
         folder_members[folder].append(moref)
         cluster_members[cluster].append(moref)
@@ -112,6 +130,20 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("vmware-api-session-id") == TOKEN
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path.startswith("/api/cis/tagging/tag-association"):
+            if not self._authed():
+                self._send(401, {"error": "unauthenticated"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            vms = Handler.inventory["vms"]
+            out = []
+            for obj in body.get("object_ids", []):
+                vm = vms.get(obj.get("id"))
+                if vm:
+                    out.append({"object_id": obj, "tag_ids": vm["_tags"]})
+            self._send(200, out)
+            return
         if self.path != "/api/session":
             self._send(404, {"error": "not found"})
             return
@@ -155,6 +187,28 @@ class Handler(BaseHTTPRequestHandler):
                 items = [v for v in items if v["power_state"] in query["power_states"]]
             self._send(200, [{k: v for k, v in vm.items() if not k.startswith("_")}
                              for vm in items])
+            return
+
+        if path.startswith("/api/cis/tagging/tag/"):
+            tid = path.rsplit("/", 1)[-1]
+            if tid not in TAGS:
+                self._send(404, {"error": "no such tag"})
+                return
+            cat, name = TAGS[tid]
+            self._send(200, {"id": tid, "name": name, "category_id": cat})
+            return
+
+        if path.startswith("/api/cis/tagging/category/"):
+            cid = path.rsplit("/", 1)[-1]
+            self._send(200, {"id": cid, "name": CATEGORIES.get(cid, cid)})
+            return
+
+        if path.startswith("/api/vcenter/vm/") and path.endswith("/guest/identity"):
+            vm = inv["vms"].get(path.split("/")[4])
+            if not vm or vm["_tools"] != "RUNNING" or vm["power_state"] != "POWERED_ON":
+                self._send(503, {"error": "tools not running"})
+                return
+            self._send(200, {"ip_address": vm["_ip"], "host_name": vm["name"]})
             return
 
         if path.startswith("/api/vcenter/vm/") and path.endswith("/tools"):

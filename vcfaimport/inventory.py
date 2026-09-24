@@ -85,6 +85,7 @@ class VmRecord:
     group: str = ""
     notes: str = ""
     row: int = 0
+    app: str = ""        # application the VM belongs to (moves with its app when app_together)
 
     @property
     def grouping_key(self) -> Tuple[int, str, str, str]:
@@ -133,6 +134,7 @@ class VmRecord:
             "group": self.group,
             "notes": self.notes,
             "row": self.row,
+            "app": self.app,
         }
 
     @classmethod
@@ -147,6 +149,7 @@ class VmRecord:
             group=d.get("group", ""),
             notes=d.get("notes", ""),
             row=int(d.get("row", 0)),
+            app=d.get("app", ""),
         )
 
 
