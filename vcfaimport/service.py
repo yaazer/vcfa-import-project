@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .config import Config
 from .discovery import match_folder_map, _match_mapping  # noqa: F401  (re-exported for web)
 from .engine import STAGE_IMPORT, AbortRun, Engine
-from .kube import Kubectl
+from .kube import Kubectl, KubectlError
 from .folders import folder_matches, norm_folder
 from . import state as st
 
@@ -633,3 +633,43 @@ def wave_estimates(store: st.Store, cfg: Config) -> Dict[int, Dict[str, Any]]:
                   "import": estimate(store, cfg, "import", imp.get(w, {}))}
     return out
 
+
+
+# ------------------------------------------------------------ cluster namespaces
+# Namespaces the Supervisor runs for itself: never an import target.
+SYSTEM_NAMESPACE_RE = re.compile(r"^(kube-|vmware-system-|svc-)|^(default|tkg-system)$")
+
+
+def cluster_namespaces(kube: Kubectl) -> Dict[str, Any]:
+    """Namespaces a mapping could target, to suggest while mapping.
+
+    Asks the Supervisor for its namespaces (system ones left out). Where that
+    is not allowed or not answered, falls back to the kubeconfig's contexts for
+    the same Supervisor -- one per namespace this login may use. `complete`
+    says whether the list came from the cluster itself.
+    """
+    out: Dict[str, Any] = {"namespaces": [], "complete": False, "notes": []}
+    try:
+        listed, why = kube.list_namespaces()
+    except KubectlError as exc:
+        listed, why = None, str(exc).splitlines()[-1][:200] if str(exc) else "kubectl failed"
+    try:
+        known, kwhy = kube.kubeconfig_namespaces()
+    except KubectlError:
+        known, kwhy = [], "kubeconfig not readable"
+    names: Dict[str, str] = {n: "kubeconfig" for n in known}
+    if listed is not None:
+        out["complete"] = True
+        for n in listed:
+            if not SYSTEM_NAMESPACE_RE.search(n):
+                names[n] = "both" if n in names else "cluster"
+    else:
+        source = ("the {} namespace(s) your kubeconfig has contexts for".format(len(known)) if known
+                  else "none ({}): log in with `kubectl vsphere login` to add a context per namespace, "
+                       "or type the name".format(kwhy or "no contexts for this Supervisor"))
+        out["notes"].append({
+            "forbidden": "This login may not list every namespace on the Supervisor; showing " + source + ".",
+            "unanswered": "The Supervisor did not answer; showing " + source + ".",
+        }.get(why, "Could not list namespaces ({}); showing {}.".format(why, source)))
+    out["namespaces"] = [{"name": n, "source": src} for n, src in sorted(names.items())]
+    return out

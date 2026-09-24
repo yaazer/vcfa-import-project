@@ -4542,7 +4542,120 @@ def t_help_doc_anchors():
     eq(broken, [], "renaming a heading in the guides breaks these links")
 
 
+@test("linux jump box: serve --open never launches a text browser without a desktop session")
+def t_serve_open_headless():
+    from vcfaimport.web import server
+    saved_platform, saved_env = sys.platform, dict(os.environ)
+    try:
+        for key in ("DISPLAY", "WAYLAND_DISPLAY"):
+            os.environ.pop(key, None)
+        sys.platform = "linux"
+        eq(server.can_open_browser(), False, "headless Ubuntu")
+        os.environ["DISPLAY"] = ":0"
+        eq(server.can_open_browser(), True, "Ubuntu desktop")
+        os.environ.pop("DISPLAY")
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        eq(server.can_open_browser(), True, "Wayland desktop")
+        os.environ.pop("WAYLAND_DISPLAY")
+        for plat in ("win32", "darwin"):
+            sys.platform = plat
+            eq(server.can_open_browser(), True, plat)
+    finally:
+        sys.platform = saved_platform
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+@test("an old Python (Ubuntu 22.04's 3.10) gets a clear message, not a traceback")
+def t_python_version_message():
+    code = ("import sys, runpy; sys.version_info = (3, 10, 12); sys.argv = ['vcfa-import.py', '--version']; "
+            "runpy.run_path({!r}, run_name='__main__')").format(str(ROOT / "vcfa-import.py"))
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    eq(proc.returncode, 1)
+    assert "needs Python 3.11 or newer" in proc.stderr and "sudo apt install python3.11" in proc.stderr, proc.stderr
+    sys.path.insert(0, str(ROOT / "tools"))
+    import build
+    assert "sys.version_info < (3, 11)" in build.PYZ_VERSION_CHECK, "the .pyz entry point checks too"
+    compile("import sys\n" + build.PYZ_VERSION_CHECK, "<pyz __main__>", "exec")
+
+
+@test("stage: when two sources name different namespaces, the first wins and the rest are reported")
+def t_stage_ns_conflicts():
+    from vcfaimport.discovery import folder_map_from_rows, network_map_from_rows, stage, tag_map_from_rows
+    folders = folder_map_from_rows([{"folder": "Production", "namespace": "ns-folder", "wave": "1"}])
+    nets = network_map_from_rows([{"portgroup": "VLAN197-Prod", "namespace": "ns-network", "subnet": "sub-a"},
+                                  {"portgroup": "VLAN200-DB", "namespace": "ns-folder", "subnet": "sub-b"}])
+    two_nics = '[{"device_key":4000,"network_name":"VLAN197-Prod"},{"device_key":4001,"network_name":"VLAN200-DB"}]'
+    rows = [_disc_row(moref="vm-1"),                                            # folder vs network: conflict
+            _disc_row(moref="vm-2", nics_json='[{"device_key":4000,"network_name":"VLAN200-DB"}]'),  # agree
+            _disc_row(moref="vm-3", namespace="ns-picked"),                     # Select overrides both maps
+            _disc_row(moref="vm-4", folder="Elsewhere", nics_json=two_nics)]     # two adapters disagree
+    res = stage(rows, Config(), mapping=nets, folder_mapping=folders)
+    got = {r.moref: r.namespace for r in res.records}
+    eq(got, {"vm-1": "ns-folder", "vm-2": "ns-folder", "vm-3": "ns-picked", "vm-4": "ns-network"})
+    by = {c["moref"]: c for c in res.ns_conflicts}
+    eq(sorted(by), ["vm-1", "vm-3", "vm-4"], "no conflict when the sources agree")
+    eq((by["vm-1"]["source"], by["vm-1"]["ignored"]), ("folder map", [{"source": "portgroup map (VLAN197-Prod)", "namespace": "ns-network"}]))
+    eq(by["vm-3"]["source"], "set in Select")
+    eq(sorted(i["namespace"] for i in by["vm-3"]["ignored"]), ["ns-folder", "ns-network"])
+    eq(by["vm-4"]["ignored"], [{"source": "portgroup map (VLAN200-DB)", "namespace": "ns-folder"}])
+    note = next(r.notes for r in res.records if r.moref == "vm-1")
+    assert "ns-network (portgroup map (VLAN197-Prod))" in note, note
+    tags = tag_map_from_rows([{"tag": "Application:Payroll", "namespace": "ns-tag"}])
+    res = stage([_disc_row(moref="vm-5", tags_json='["Application:Payroll"]')], Config(), mapping=nets,
+                folder_mapping=folders, tag_mapping=tags)
+    eq(res.records[0].namespace, "ns-tag")
+    eq(res.ns_conflicts[0]["source"], "tag map (Application:Payroll)")
+
+
+@test("e2e: namespace suggestions from the Supervisor, or from kubeconfig when listing is not allowed")
+def t_e2e_cluster_namespaces():
+    from vcfaimport import service
+    from vcfaimport.kube import Kubectl
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "happy")
+        _seed_cluster(tmp, ["migration-testing-ns-kcvm5", "ns-b"], ["migration-testing-ns-kcvm5/migration-testing"])
+        cfg_path = _write_config(tmp)
+        saved = dict(os.environ)
+        try:
+            os.environ.update(env)
+            cfg = Config.load(cfg_path)
+            names = lambda d: [n["name"] for n in d["namespaces"]]  # noqa: E731
+            d = service.cluster_namespaces(Kubectl(cfg))
+            eq(names(d), ["migration-testing-ns-kcvm5", "ns-b"], "system namespaces left out")
+            eq((d["complete"], d["notes"]), (True, []))
+            eq({n["source"] for n in d["namespaces"]}, {"both"}, "on the cluster and in kubeconfig")
+            for mode, word in (("forbidden", "may not list"), ("timeout", "did not answer")):
+                os.environ["FAKE_KUBECTL_NS_LIST"] = mode
+                d = service.cluster_namespaces(Kubectl(cfg))
+                eq(names(d), ["migration-testing-ns-kcvm5", "ns-b"], mode + ": kubeconfig contexts, same cluster only")
+                eq(d["complete"], False)
+                assert word in d["notes"][0] and "kubeconfig" in d["notes"][0], d["notes"]
+            os.environ["FAKE_KUBECTL_NS_LIST"] = "forbidden"
+            out = _run_cli(["-c", cfg_path, "namespaces"], dict(env, FAKE_KUBECTL_NS_LIST="forbidden"), tmp).stdout
+            assert "migration-testing-ns-kcvm5" in out and "kubeconfig context" in out and "may not list" in out, out
+            os.environ.pop("FAKE_KUBECTL_NS_LIST")
+            cfg.kubectl = "vcfa-test-no-such-kubectl"
+            d = service.cluster_namespaces(Kubectl(cfg))
+            eq((d["namespaces"], d["complete"]), ([], False), "no kubectl: nothing, and no crash")
+            assert d["notes"], d
+            c = _Console(tmp, Config.load(cfg_path))
+            try:
+                first = c.ok("GET", "/api/cluster/namespaces")
+                eq(names(first), ["migration-testing-ns-kcvm5", "ns-b"])
+                Path(tmp, "cluster.json").write_text(Path(tmp, "cluster.json").read_text().replace('"ns-b"', '"ns-c"'))
+                eq(names(c.ok("GET", "/api/cluster/namespaces")), names(first), "cached between looks")
+                eq(names(c.ok("GET", "/api/cluster/namespaces?refresh=1")), ["migration-testing-ns-kcvm5", "ns-c"])
+            finally:
+                c.close()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+
 UNIT = [
+    t_stage_ns_conflicts,
+    t_serve_open_headless, t_python_version_message,
     t_web_docs, t_help_doc_anchors,
     t_readiness_rules, t_estimate, t_verify_checks, t_notify_channels, t_access_rules,
     t_schedule_rules, t_settings_overlay, t_tag_map_stage, t_apps_together, t_readiness_exclusion,
@@ -4576,6 +4689,7 @@ UNIT = [
 ]
 
 E2E = [
+    t_e2e_cluster_namespaces,
     t_e2e_web_governance, t_e2e_cli_governance,
     t_fake_operator_name_collision,
     t_e2e_happy, t_e2e_precheck_gate, t_e2e_preflight_missing, t_e2e_flaky,

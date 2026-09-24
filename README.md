@@ -67,7 +67,7 @@ one workspace, and a batch started from either shows up in both.
 | **Overview** | Campaign totals, progress by wave, namespace and application (with time left per wave), live batches, recent failures, requests waiting for approval, the next change window, and a *next step* prompt that tells you what to do now |
 | **1 Discover** | Connect to vCenter (server/user pre-filled from `VCFA_VC_*`; the password is used once and never stored) and read the inventory, with a live progress bar |
 | **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), search and facet filters (including **readiness**, vCenter **tag** and **application**), shift-click ranges, bulk namespace/wave/app, saved views |
-| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
+| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. The namespaces on the Supervisor are listed and suggested in every namespace field, and a name that is not there is flagged; if two maps name different namespaces for a VM, the preview says which one won. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
 | **4 Waves** | A board with one column per wave and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
 | **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. Includes a commit gate, a *Watch* for batches left over from an earlier session, an ETA per wave, what is held back and why, post-import verification, and *Schedule…* to run it in a change window instead |
 | **Import queue** | Every VM with state, application and verification filters and saved views; bulk retry / skip / move wave / verify / roll back / abandon |
@@ -133,8 +133,9 @@ loopback and tunnel:
 ssh -L 8765:127.0.0.1:8765 jumpbox        # then open the printed link locally
 ```
 
-No SSH on the jump box (a Windows jump box over RDP, say)? Use the browser on
-the jump box itself. [LAB-GUIDE.md](LAB-GUIDE.md#prefer-a-browser-run-the-same-lab-from-the-web-console)
+On a Linux jump box, run `serve` inside `tmux` so it survives your SSH session,
+and reach it through the tunnel above. No SSH on the jump box (a Windows jump
+box over RDP, say)? Use the browser on the jump box itself. [LAB-GUIDE.md](LAB-GUIDE.md#prefer-a-browser-run-the-same-lab-from-the-web-console)
 walks through the whole setup: kubectl login, the map files, the access link,
 the ways to reach the console, and each lab step in the console.
 
@@ -153,7 +154,7 @@ the `.pyz` and `.exe`.
 
 | | |
 |---|---|
-| Python | 3.11+ (standard library only — no pip install) |
+| Python | 3.11+ (standard library only — no pip install). Ubuntu 24.04 ships 3.12; on 22.04 (3.10) `sudo apt install python3.11` and run the tool with `python3.11`. The Windows `.exe` needs no Python |
 | `kubectl` | on `PATH`, logged in to the Supervisor |
 | VCF | 9.1 or later (Mobility Operator CRDs) |
 | Permissions | ability to create `importoperationbatches` in the target namespaces |
@@ -387,7 +388,9 @@ Legacy/*,redbull-ns3-legacy,3,
 ```
 
 **`portgroup-map.csv`** — which subnet each network adapter lands on. It can
-also carry a namespace and wave, used only for VMs no folder rule covers, plus
+also carry a namespace and wave, used only for VMs no folder rule covers (when
+both name a namespace for the same VM, the folder map wins and `stage` reports
+the conflict, so leave the column blank unless you mean it), plus
 per-portgroup overrides for the NIC device key and the subnet kind/API group.
 All columns after `namespace` are optional:
 
@@ -555,6 +558,7 @@ it never touches batches it did not create.
 | `skip` | exclude or re-include VMs |
 | `events` | the run's event log |
 | `report` | standalone HTML and/or CSV report |
+| `namespaces` | the namespaces you can map to: from the Supervisor, or from your kubeconfig's contexts when this login may not list them |
 | `readiness` | grade discovered VMs from their vCenter facts before precheck (advisory); exit 4 when some are likely to fail |
 | `verify` | check committed VMs: powered on, Tools running, IP kept, ping, TCP ports |
 | `schedule` | change windows: `add --start --end`, `list`, `cancel ID`, `tick` (run from Task Scheduler or cron) |

@@ -31,6 +31,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC_FILES = ("README.md", "LAB-GUIDE.md")
+# The .pyz runs with whatever `python3` the machine has; say plainly when it is too old.
+PYZ_VERSION_CHECK = """# Checked before importing the package, so an old interpreter gets a clear
+# message instead of a traceback. (On Ubuntu 22.04, python3 is 3.10.)
+if sys.version_info < (3, 11):
+    sys.exit("vcfa-import needs Python 3.11 or newer; this is Python {} ({}).\\n"
+             "On Ubuntu 22.04: sudo apt install python3.11, then run it with python3.11, "
+             "e.g. python3.11 vcfa-import.pyz --version".format(sys.version.split()[0], sys.executable))
+"""
 DIST = ROOT / "dist"
 sys.path.insert(0, str(ROOT))
 from vcfaimport import __version__  # noqa: E402
@@ -48,7 +56,8 @@ def build_pyz() -> Path:
     for name in DOC_FILES:
         shutil.copy2(ROOT / name, staging / "vcfaimport" / "web" / "docs" / name)
     (staging / "__main__.py").write_text(
-        "import sys\nfrom vcfaimport.cli import main\nsys.exit(main())\n", encoding="utf-8")
+        "import sys\n\n" + PYZ_VERSION_CHECK + "\nfrom vcfaimport.cli import main\nsys.exit(main())\n",
+        encoding="utf-8")
     out = DIST / "vcfa-import.pyz"
     zipapp.create_archive(staging, out, interpreter="/usr/bin/env python3", compressed=True)
     shutil.rmtree(staging)

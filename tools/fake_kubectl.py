@@ -348,6 +348,17 @@ def main(argv: list) -> int:
     ns = arg_value(argv, "-n") or arg_value(argv, "--namespace")
 
     if verb == "config":
+        if len(argv) > 1 and argv[1] == "view":
+            # What `kubectl vsphere login` leaves behind: a Supervisor context, one
+            # context per namespace on the same cluster, and an unrelated cluster.
+            contexts = [{"name": "fake-supervisor", "context": {"cluster": "10.0.0.10", "user": "wcp:10.0.0.10:admin"}}]
+            contexts += [{"name": n, "context": {"cluster": "10.0.0.10", "namespace": n, "user": "wcp:10.0.0.10:admin"}}
+                         for n in data["namespaces"]]
+            contexts.append({"name": "elsewhere", "context": {"cluster": "10.9.9.9", "namespace": "other-cluster-ns",
+                                                             "user": "someone"}})
+            print(json.dumps({"apiVersion": "v1", "kind": "Config", "current-context": "fake-supervisor",
+                              "contexts": contexts}))
+            return 0
         print("fake-supervisor")
         return 0
 
@@ -421,6 +432,19 @@ def main(argv: list) -> int:
             }]}))
             return 0
 
+        if base in ("namespace", "namespaces", "ns") and name is None:
+            mode = os.environ.get("FAKE_KUBECTL_NS_LIST", "")
+            if mode == "forbidden":
+                sys.stderr.write('Error from server (Forbidden): namespaces is forbidden: User "sso:admin@vsphere.local" '
+                                 'cannot list resource "namespaces" in API group "" at the cluster scope\n')
+                return 1
+            if mode == "timeout":
+                sys.stderr.write("Unable to connect to the server: dial tcp 10.0.0.10:443: i/o timeout\n")
+                return 1
+            system = ["default", "kube-system", "kube-public", "vmware-system-mobility", "svc-tmc-c8", "tkg-system"]
+            print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [
+                {"metadata": {"name": n}} for n in system + list(data["namespaces"])]}))
+            return 0
         if base in ("namespace", "namespaces", "ns"):
             if name in data["namespaces"]:
                 print("namespace/{}".format(name))
