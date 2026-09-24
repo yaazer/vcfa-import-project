@@ -444,6 +444,7 @@ class WebApp:
             "by_namespace": sorted(by_ns.items()),
             "coverage": coverage,
             "app_moves": result.app_moves,
+            "ns_conflicts": result.ns_conflicts,
         }
 
     def stage_commit(self, q, body) -> Dict[str, Any]:
@@ -462,6 +463,7 @@ class WebApp:
         summary["staged"] = len(result.records)
         summary["problems"] = result.problems
         summary["app_moves"] = result.app_moves
+        summary["ns_conflicts"] = result.ns_conflicts
         return summary
 
     # =============================================================== queue
@@ -1018,6 +1020,17 @@ class WebApp:
                     access.touch(self.store, user["name"])
         return user
 
+    def cluster_namespaces(self, q, body) -> Dict[str, Any]:
+        """Suggestions for the namespace fields; cached, since each look is a kubectl call."""
+        cached = getattr(self, "_ns_cache", None)
+        if cached and not q.get("refresh") and time.time() - cached[0] < 120:
+            return cached[1]
+        data = service.cluster_namespaces(Kubectl(self.cfg))
+        data["checked_at"] = _local_now()
+        data["context"] = self.cfg.context or ""
+        self._ns_cache = (time.time(), data)
+        return data
+
     def docs(self, q, body, name: str) -> Dict[str, Any]:
         if name not in DOCS:
             raise ApiError(404, "no such guide")
@@ -1357,6 +1370,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
                  r"abandon|cleanup|verify)", "run_job"),
         ("GET", r"/api/me", "me"),
         ("GET", r"/api/docs/(?P<name>[a-z]+)", "docs"),
+        ("GET", r"/api/cluster/namespaces", "cluster_namespaces"),
         ("GET", r"/api/readiness", "readiness_summary"),
         ("GET", r"/api/apps", "apps"),
         ("GET", r"/api/approvals", "approvals"),

@@ -409,6 +409,8 @@ class StageResult:
     unmapped_networks: Dict[str, int] = field(default_factory=dict)
     unmapped_folders: Dict[str, int] = field(default_factory=dict)
     app_moves: List[str] = field(default_factory=list)    # VMs pulled into their app's wave
+    # VMs whose sources named different namespaces: the first won, the rest are listed.
+    ns_conflicts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def stage(
@@ -425,7 +427,9 @@ def stage(
     A VM's namespace comes from, in order: the namespace set on the discovered
     row (from the picker or `select --namespace`), the tag map, the folder map,
     the network map, then --default-namespace. Wave follows the same order. A
-    VM with no namespace is reported, never guessed.
+    VM with no namespace is reported, never guessed. When two of those name
+    different namespaces for one VM, the first still wins -- and the others are
+    reported in ns_conflicts and the VM's notes, so a wrong map entry is seen.
 
     Each record carries its application (see app_of). With cfg.app_together,
     an application's VMs are staged into one wave -- the earliest any of them
@@ -446,6 +450,10 @@ def stage(
         group = ""
         nics: List[Nic] = []
         notes: List[str] = []
+        # (source, namespace) in precedence order; the first is the one used.
+        claims: List[Tuple[str, str]] = []
+        if namespace:
+            claims.append(("set in Select", namespace))
 
         # Batches are built per folder, so `run --folder`, `rollback --folder`
         # and the batch names all line up with the tree. An explicit group from
@@ -455,6 +463,8 @@ def stage(
         by_tag = match_tag_map(row_tags(row), tag_mapping) if tag_mapping else None
         if by_tag:
             entry = by_tag[1]
+            if entry.namespace:
+                claims.append(("tag map ({})".format(by_tag[0]), entry.namespace))
             if not namespace and entry.namespace:
                 namespace = entry.namespace
             if entry.wave:
@@ -464,6 +474,8 @@ def stage(
 
         by_folder = match_folder_map(row["folder"] or "", folder_mapping) if folder_mapping else None
         if by_folder:
+            if by_folder.namespace:
+                claims.append(("folder map", by_folder.namespace))
             if not namespace and by_folder.namespace:
                 namespace = by_folder.namespace
             if by_folder.wave and mapped_wave is None:      # a tag map wave already won
@@ -482,6 +494,8 @@ def stage(
                     result.unmapped_networks[network] = result.unmapped_networks.get(network, 0) + 1
                     notes.append("unmapped network: {}".format(network))
                 continue
+            if entry.namespace:
+                claims.append(("portgroup map ({})".format(network), entry.namespace))
             if not namespace and entry.namespace:
                 namespace = entry.namespace
             if entry.wave and mapped_wave is None:      # folder map wave already won if set
@@ -495,6 +509,15 @@ def stage(
                 )
             )
 
+        if claims:
+            used_from = claims[0][0]
+            ignored = [{"source": src, "namespace": ns} for src, ns in claims[1:] if ns != namespace]
+            if ignored:
+                result.ns_conflicts.append({
+                    "vm_name": row["name"] or row["moref"], "moref": row["moref"], "folder": row["folder"] or "",
+                    "namespace": namespace, "source": used_from, "ignored": ignored})
+                notes.append("namespace {} from the {}; ignored: {}".format(
+                    namespace, used_from, ", ".join("{} ({})".format(i["namespace"], i["source"]) for i in ignored)))
         if not namespace:
             namespace = (default_namespace or "").strip()
         if not namespace:

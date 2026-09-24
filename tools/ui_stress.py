@@ -278,6 +278,37 @@ const SCENARIOS = {
     click('[data-act="saveMaps"]');
     await sleep(600);
     check('saving unchanged maps keeps them intact', (await GET('/api/maps')).folder.rows.length === mapsBefore);
+
+    // namespaces from the Supervisor, suggested while mapping
+    const chip = await waitFor(() => document.querySelector('.nsbar .nschip'), 10000);
+    check('the Supervisor\'s namespaces are listed while mapping', chip && /prod-web-ns1/.test(document.querySelector('.nsbar').textContent),
+      document.querySelector('.nsbar') && document.querySelector('.nsbar').textContent.slice(0, 160));
+    check('system namespaces are left out', !/kube-system|vmware-system|svc-/.test(document.querySelector('.nsbar').textContent));
+    check('every namespace field suggests them', [...document.querySelectorAll('#ns-options option')].some((o) => o.value === 'prod-db-ns2' && o.label));
+    click('[data-act="addRow"][data-m="f"]:not([data-key])');
+    const k = await waitFor(() => { const i = S.view.fr.length - 1; return document.getElementById('f-' + i + '-namespace') ? i + 1 : 0; }) - 1;
+    document.getElementById('f-' + k + '-namespace').focus();
+    const pick = [...document.querySelectorAll('.nsbar .nschip')].find((x) => x.dataset.ns === 'dmz-ns3');
+    pick.click();
+    check('clicking a namespace fills the field you were in', await waitFor(() => S.view.fr[k].namespace === 'dmz-ns3', 3000), S.view.fr[k].namespace);
+    type('#f-' + k + '-namespace', 'prod-web-nsl');
+    check('a namespace not on the Supervisor is flagged as you type', document.getElementById('f-' + k + '-namespace').classList.contains('unknown'));
+    check('with a reason', /Supervisor|kubeconfig/.test(document.getElementById('f-' + k + '-namespace').title));
+    check('and listed above the maps', await waitFor(() => { S.view.render(); return /prod-web-nsl/.test((document.querySelector('.nsbar .note.warn') || {}).textContent || ''); }, 4000));
+    click('[data-act="delRow"][data-m="f"][data-i="' + k + '"]');
+    await waitFor(() => S.view.fr.length === k, 3000);
+
+    // two maps disagree about a VM's namespace
+    const ni = S.view.nr.findIndex((r) => r.portgroup === 'DMZ-Uplink');   // the Databases VMs' network in the fake vCenter
+    if (ni >= 0) {
+      type('#n-' + ni + '-namespace', 'prod-web-ns1');
+      const conflict = await waitFor(() => [...document.querySelectorAll('#stage-preview details.note.warn')].find((d) => /conflicting namespace/.test(d.textContent)), 8000);
+      check('a portgroup entry that disagrees with the folder map is reported', conflict, S.view.preview.ns_conflicts && S.view.preview.ns_conflicts.length);
+      check('the folder map still wins', S.view.preview.records.filter((r) => r.folder === 'Databases').every((r) => r.namespace === 'prod-db-ns2'));
+      check('each conflict names both sources', conflict && /folder map/.test(conflict.textContent) && /portgroup map \(DMZ-Uplink\)/.test(conflict.textContent));
+      type('#n-' + ni + '-namespace', '');
+      check('clearing it clears the warning', await waitFor(() => !(S.view.preview.ns_conflicts || []).length, 8000));
+    }
     check('stage view never broke', !brokeView());
   },
 

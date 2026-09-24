@@ -27,13 +27,30 @@ Discovery talks to vCenter over HTTPS on 443. Everything else goes through
 
 ## 1. Install
 
-**Windows, no Python required:** unzip the bundle and use `vcfa-import.exe`.
-
-**Anywhere with Python 3.11+ (Linux jump host, macOS):** use `vcfa-import.pyz`:
+**Linux jump box (Ubuntu) or macOS:** use `vcfa-import.pyz`, a single file
+that runs with the machine's own Python -- 3.11 or newer, nothing else to
+install. Copy it over (or unzip the whole bundle there):
 
 ```bash
-python3 vcfa-import.pyz --version
+scp vcfa-import.pyz <user>@<jumpbox>:~/        # from where you downloaded it
 ```
+
+Then, on the jump box:
+
+```bash
+python3 --version              # Ubuntu 24.04: 3.12 -- good as it is
+sudo apt install python3.11    # Ubuntu 22.04 ships 3.10: add 3.11 next to it, and
+                               # use python3.11 wherever this guide says python3
+python3 ~/vcfa-import.pyz --version
+alias vcfa-import='python3 ~/vcfa-import.pyz'   # optional; add it to ~/.bashrc to keep it
+```
+
+With too old a Python the tool says so and names the fix. `kubectl` and its
+vSphere plugin for Linux come from the Supervisor's own download page: open
+`https://<supervisor-ip>` in a browser, download *CLI Plugin Linux*, and put
+`kubectl` and `kubectl-vsphere` on the `PATH` (for example `~/bin`).
+
+**Windows jump box, no Python required:** unzip the bundle and use `vcfa-import.exe`.
 
 Either way, confirm it runs and can see your cluster:
 
@@ -43,7 +60,8 @@ kubectl config current-context
 kubectl api-resources --api-group mobility-operator.vmware.com
 ```
 
-Below, `vcfa-import` means whichever of the two you are using.
+Below, `vcfa-import` means whichever of the two you are using (with the alias
+above, it is literally that on Linux).
 
 ---
 
@@ -130,16 +148,29 @@ Do step 3 above first, then this.
    `redbull-*` namespaces -- `VLAN2*`, for one, can match a lab portgroup. You
    can also delete them on that page, with the **x** next to each row.
 
-**b. Start the console** in the workspace folder, and leave the window open:
+**b. Start the console** in the workspace folder.
+
+On a **Linux jump box** you are usually connected over SSH, and closing that
+session would stop the console. Run it inside `tmux` so it keeps running
+(`sudo apt install tmux` if it is missing):
+
+```bash
+tmux new -s vcfa                                      # a session that outlives your SSH connection
+cd ~/vcfa-lab
+python3 ~/vcfa-import.pyz -c vcfa-import.toml serve   # no --open: a server has no browser
+# Ctrl-b then d leaves it running; `tmux attach -t vcfa` brings it back
+```
+
+On a **Windows jump box**:
 
 ```powershell
 cd vcfa-lab
-vcfa-import.exe -c vcfa-import.toml serve --open         # Windows bundle
-python vcfa-import.pyz -c vcfa-import.toml serve --open  # anywhere with Python 3.11+
+vcfa-import.exe -c vcfa-import.toml serve --open
 ```
 
-It prints a link like `http://127.0.0.1:8765/#t=<token>`; `--open` opens it in
-the jump box's browser. The token is new each time the console starts, so use
+It prints a link like `http://127.0.0.1:8765/#t=<token>`; on a jump box with a
+desktop, `--open` opens it in the local browser (without one, `--open` says so
+and does nothing). The token is new each time the console starts, so use
 the link from the latest start -- or pass `--token <a-long-random-string>` to
 keep one link for the whole lab. If port 8765 is taken, add `--port 8780`.
 Closing the window or Ctrl-C stops the console; batches already on the cluster
@@ -149,9 +180,13 @@ keep running, and the next run (or **Execute → Watch**) records their outcome.
 
 | you are | do this |
 |---|---|
-| on the jump box (RDP or its console) | use the jump box's browser -- nothing else to set up |
-| at your desk, and the jump box runs SSH (Linux, or Windows with OpenSSH Server) | `ssh -L 8765:127.0.0.1:8765 <user>@<jumpbox>`, then open the printed link on your desk |
-| at your desk, no SSH | start it with `serve --host 0.0.0.0 --token <long-random-string>`, allow the port through the jump box firewall, and open the printed link with `127.0.0.1` replaced by the jump box's address. **Anyone who can reach the port and has the link can drive imports** -- lab networks only; the console warns about this when it starts |
+| at your desk, the jump box is Linux (or Windows with OpenSSH Server) | **recommended.** Open an SSH tunnel and leave it open while you work: `ssh -L 8765:127.0.0.1:8765 <user>@<jumpbox>` (PowerShell and Windows Terminal have `ssh` built in; in PuTTY: *Connection → SSH → Tunnels*, source port `8765`, destination `127.0.0.1:8765`, *Add*). Then open the printed link in your desk's browser. The tunnel can be a second SSH session; the console keeps running in `tmux` either way |
+| on the jump box itself, with a desktop (RDP or its console) | use the jump box's browser -- nothing else to set up |
+| at your desk, and SSH tunnels are not allowed | start it with `serve --host 0.0.0.0 --token <long-random-string>`, open the port (`sudo ufw allow 8765/tcp` if `ufw` is on), and open the printed link with `127.0.0.1` replaced by the jump box's address. **Anyone who can reach the port and has the link can drive imports** -- lab networks only; the console warns about this when it starts |
+
+Through a tunnel, the pages are drawn by your desk's browser, which usually
+has a GPU: expect the full look. The Lite rendering below matters when the
+browser itself runs on the jump box.
 
 **d. Check before you touch anything.** The top bar must show **ctx** = your
 Supervisor context and **commit Wait**. If either is wrong, stop the console,
@@ -165,13 +200,13 @@ open the Theme Studio (palette icon) and choose **Rendering: Lite**.
 | lab step | in the console |
 |---|---|
 | 4 discover / select | **Discover** (type the password in the page), then **Select VMs**: tick `Migration/Wave1` in the folder tree. The **Ready** column warns about VMs likely to fail precheck |
-| 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` and the VM's portgroup → `migration-testing`, check the preview, **Stage** |
+| 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` in the folder map, and the VM's portgroup → subnet `migration-testing` with its namespace left blank. The namespaces on the Supervisor are listed above the maps (click one to fill the field you are in) and suggested as you type; a name that is not there is flagged. Check the preview -- it also warns if two maps name different namespaces for a VM -- then **Stage** |
 | 5 preflight / plan | **Execute → Run preflight**; the batch plan is shown before every run |
 | 6 precheck | **Execute → Precheck → wave 1**; follow the log panel. A DNS stall on the Supervisor shows up in **Triage** as *DNS lookup from the Supervisor timed out* |
 | 7 import, held | **Execute → Import** (dry run first if you like); VMs stop at *awaiting commit* |
 | 8 roll back | **Execute → Commit gate → Roll back instead**, or the VM's drawer → **Roll back** |
 | 9 commit | **Execute → Commit** (type `COMMIT`) |
-| 9 verify | **Execute → Post-import verification → Verify**. The vCenter checks need a session: tick *Keep these credentials in memory* on Discover, or set `VCFA_VC_PASSWORD` before starting the console; without it only ping runs |
+| 9 verify | **Execute → Post-import verification → Verify**. The vCenter checks need a session: tick *Keep these credentials in memory* on Discover, or set `VCFA_VC_PASSWORD` before starting the console; without it only ping runs. Ping goes out from the jump box (`sudo apt install iputils-ping` if `ping` is missing; without it that check is skipped) |
 | 10 tracker | **Activity & logs → Exports** |
 | 10b start over | **Batches** → the batch → **Abandon** |
 
@@ -230,7 +265,9 @@ adapter's `device_key` as vCenter reports it. This is the value that goes into
 the manifest; the article's example uses 4000, but a VM whose first NIC was
 ever removed and re-added may have 4001.
 
-Select them and assign the target:
+Select them and assign the target. `vcfa-import namespaces` lists the
+namespaces you can use -- from the Supervisor, or from your kubeconfig's
+contexts if this login may not list them:
 
 ```bash
 vcfa-import select --folder Lab/Import --namespace <target-namespace> --wave 1
