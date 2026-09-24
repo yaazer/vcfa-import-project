@@ -133,6 +133,11 @@ loopback and tunnel:
 ssh -L 8765:127.0.0.1:8765 jumpbox        # then open the printed link locally
 ```
 
+No SSH on the jump box (a Windows jump box over RDP, say)? Use the browser on
+the jump box itself. [LAB-GUIDE.md](LAB-GUIDE.md#prefer-a-browser-run-the-same-lab-from-the-web-console)
+walks through the whole setup: kubectl login, the map files, the access link,
+the ways to reach the console, and each lab step in the console.
+
 ```
 serve [--host 127.0.0.1] [--port 8765] [--token T] [--open]
       [--folder-map folder-map.csv] [--map portgroup-map.csv] [--tag-map tag-map.csv]   # default: next to the config

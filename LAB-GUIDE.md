@@ -94,33 +94,97 @@ deliberate choice.
 
 ### Prefer a browser? Run the same lab from the web console
 
-Every step below can be done in the web console instead of the CLI. It uses
-the same config, state database and ledger, so you can switch between the two
-at any point.
+Every step below can be done in the web console instead of the CLI. It is the
+same tool, reading the same `vcfa-import.toml` and the same workspace (state
+database, ledger, map files), so you can switch between the two at any point.
+Do step 3 above first, then this.
 
-```bash
-vcfa-import -c vcfa-import.toml serve            # on the jump box
-ssh -L 8765:127.0.0.1:8765 <jumpbox>             # from your desk, then open the printed link
+**a. Prepare the jump box.** In the user session that will run the console:
+
+1. Log in to the Supervisor and select its context. The console runs `kubectl`
+   as this user, with this user's kubeconfig:
+
+   ```bash
+   kubectl vsphere login --server <supervisor-ip> --vsphere-username <user> --insecure-skip-tls-verify
+   kubectl config use-context <your-supervisor-context>
+   ```
+
+   The login expires (10 hours by default). If a console job later fails with
+   `Unauthorized`, log in again; the console picks the new login up without a
+   restart.
+2. Optional: pre-fill the vCenter server and user on the Discover page. The
+   password is typed into the page and never stored.
+
+   ```powershell
+   $env:VCFA_VC_SERVER = "vcenter.lab.local"                # PowerShell
+   $env:VCFA_VC_USER   = "administrator@vsphere.local"
+   ```
+
+   ```bash
+   export VCFA_VC_SERVER=vcenter.lab.local                  # bash
+   export VCFA_VC_USER=administrator@vsphere.local
+   ```
+3. **Remove the sample rows `init` wrote** into `folder-map.csv` and
+   `portgroup-map.csv` (keep each file's first line, the header). The console
+   loads both files on Map & Stage and would otherwise apply the sample
+   `redbull-*` namespaces -- `VLAN2*`, for one, can match a lab portgroup. You
+   can also delete them on that page, with the **x** next to each row.
+
+**b. Start the console** in the workspace folder, and leave the window open:
+
+```powershell
+cd vcfa-lab
+vcfa-import.exe -c vcfa-import.toml serve --open         # Windows bundle
+python vcfa-import.pyz -c vcfa-import.toml serve --open  # anywhere with Python 3.11+
 ```
+
+It prints a link like `http://127.0.0.1:8765/#t=<token>`; `--open` opens it in
+the jump box's browser. The token is new each time the console starts, so use
+the link from the latest start -- or pass `--token <a-long-random-string>` to
+keep one link for the whole lab. If port 8765 is taken, add `--port 8780`.
+Closing the window or Ctrl-C stops the console; batches already on the cluster
+keep running, and the next run (or **Execute → Watch**) records their outcome.
+
+**c. Open it from where you sit.**
+
+| you are | do this |
+|---|---|
+| on the jump box (RDP or its console) | use the jump box's browser -- nothing else to set up |
+| at your desk, and the jump box runs SSH (Linux, or Windows with OpenSSH Server) | `ssh -L 8765:127.0.0.1:8765 <user>@<jumpbox>`, then open the printed link on your desk |
+| at your desk, no SSH | start it with `serve --host 0.0.0.0 --token <long-random-string>`, allow the port through the jump box firewall, and open the printed link with `127.0.0.1` replaced by the jump box's address. **Anyone who can reach the port and has the link can drive imports** -- lab networks only; the console warns about this when it starts |
+
+**d. Check before you touch anything.** The top bar must show **ctx** = your
+Supervisor context and **commit Wait**. If either is wrong, stop the console,
+fix `vcfa-import.toml`, and start it again. The first visit offers a
+two-minute tour that changes nothing. On a jump box without GPU acceleration
+the console switches to Lite rendering on its own; if it still feels slow,
+open the Theme Studio (palette icon) and choose **Rendering: Lite**.
+
+**e. Then follow the lab steps in the console:**
 
 | lab step | in the console |
 |---|---|
-| 4 discover / select | **Discover** (the password is asked for in the page), then **Select VMs**. Tick `Migration/Wave1` in the folder tree |
+| 4 discover / select | **Discover** (type the password in the page), then **Select VMs**: tick `Migration/Wave1` in the folder tree. The **Ready** column warns about VMs likely to fail precheck |
 | 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` and the VM's portgroup → `migration-testing`, check the preview, **Stage** |
 | 5 preflight / plan | **Execute → Run preflight**; the batch plan is shown before every run |
 | 6 precheck | **Execute → Precheck → wave 1**; follow the log panel. A DNS stall on the Supervisor shows up in **Triage** as *DNS lookup from the Supervisor timed out* |
 | 7 import, held | **Execute → Import** (dry run first if you like); VMs stop at *awaiting commit* |
 | 8 roll back | **Execute → Commit gate → Roll back instead**, or the VM's drawer → **Roll back** |
 | 9 commit | **Execute → Commit** (type `COMMIT`) |
+| 9 verify | **Execute → Post-import verification → Verify**. The vCenter checks need a session: tick *Keep these credentials in memory* on Discover, or set `VCFA_VC_PASSWORD` before starting the console; without it only ping runs |
 | 10 tracker | **Activity & logs → Exports** |
 | 10b start over | **Batches** → the batch → **Abandon** |
+
+The CLI still works alongside it on the same workspace, for example
+`vcfa-import status` in a second window. Only one run happens at a time: a
+second one is refused (the console says the workspace is busy; the CLI exits
+with code 7) rather than applying batches twice.
 
 Job logs from the console are kept under `run/jobs/`. Include them when you
 report back (step 11).
 
 The console carries this guide: **Help & guides → Lab guide**, and every **?**
-next to a setting links to the step it matters in. The first visit also offers
-a two-minute tour of the console that changes nothing.
+next to a setting links to the step it matters in.
 
 ### Campaign controls: off unless you turn them on
 
