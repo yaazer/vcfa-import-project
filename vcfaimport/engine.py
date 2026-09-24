@@ -56,6 +56,20 @@ class Engine:
         self._orig_sigint = None
 
     # ------------------------------------------------------------- signals
+    def request_stop(self) -> None:
+        """Graceful stop, as the first Ctrl-C: apply nothing new, finish what is in flight.
+
+        Safe to call from another thread (the web console's Stop button).
+        """
+        if not self._stopping:
+            self._stopping = True
+            self.log("! stop requested -- no new batches will be applied; "
+                     "in-flight batches will be polled to completion")
+
+    @property
+    def stopping(self) -> bool:
+        return self._stopping
+
     def _install_sigint(self) -> None:
         def handler(signum, frame):  # noqa: ARG001
             if self._stopping:
@@ -117,8 +131,12 @@ class Engine:
         namespaces = self.store.namespaces()
         if check_targets and namespaces:
             missing_ns: List[str] = []
+            unverified: List[str] = []    # the API server did not answer: unknown, not missing
             for ns in namespaces:
-                if not self.kube.exists("namespace", ns):
+                found = self.kube.exists("namespace", ns)
+                if found is None:
+                    unverified.append("namespace " + ns)
+                elif not found:
                     missing_ns.append(ns)
             checks.append(("target namespaces exist", not missing_ns,
                            "{}/{} present".format(len(namespaces) - len(missing_ns), len(namespaces))))
@@ -126,8 +144,13 @@ class Engine:
                 problems.append("namespace(s) not found: " + ", ".join(sorted(missing_ns)[:20]))
 
             # RBAC: creating batches is the one verb we cannot do without.
-            denied = [ns for ns in namespaces[:25]
-                      if not self.kube.can_i("create", self.cfg.batch_resource, ns)]
+            denied = []
+            for ns in namespaces[:25]:
+                allowed = self.kube.can_i("create", self.cfg.batch_resource, ns)
+                if allowed is None:
+                    unverified.append("create permission in " + ns)
+                elif not allowed:
+                    denied.append(ns)
             checks.append(("can create batches", not denied,
                            "denied in " + ", ".join(denied[:5]) if denied else "ok"))
             if denied:
@@ -142,7 +165,11 @@ class Engine:
                 resource = entry["kind"].lower()
                 if entry["api_group"]:
                     resource = "{}.{}".format(resource, entry["api_group"])
-                if self.kube.exists(resource, entry["subnet"], entry["namespace"]):
+                found = self.kube.exists(resource, entry["subnet"], entry["namespace"])
+                if found:
+                    continue
+                if found is None:
+                    unverified.append("subnet {}/{}".format(entry["namespace"], entry["subnet"]))
                     continue
                 # VPC-mode namespaces reference subnets that live in the VPC's own
                 # namespace; the batch names them without a namespace and the
@@ -182,6 +209,12 @@ class Engine:
                             "subnet has not been created/shared into it yet, or your account "
                             "cannot list subnets there (kubectl auth can-i list subnets.crd.nsx.vmware.com -n {})"
                             .format(ns, ns))
+            if unverified:
+                warnings.append(
+                    "could not verify {} item(s) because the API server kept timing out: {}. "
+                    "They are not known to be missing -- check connectivity to the Supervisor "
+                    "(a wedged DNS resolver on a control-plane node has caused this before) and "
+                    "run preflight again".format(len(unverified), ", ".join(unverified[:8])))
 
         return PreflightResult(
             ok=not problems,

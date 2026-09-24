@@ -2,6 +2,7 @@
 run/
 run.*/
 rehearsal/
+webdemo/
 *.log
 tracker.csv
 transitions.csv

@@ -43,6 +43,65 @@ generated manifest.
 --batch-size 25    batch sizing to rehearse
 ```
 
+The same simulation, driven from the browser instead:
+
+```bash
+python tools/web_demo.py --keep ./webdemo     # opens the console on http://127.0.0.1:8765
+```
+
+---
+
+## The web console
+
+```bash
+python vcfa-import.pyz -c vcfa-import.toml serve --open
+```
+
+Everything the CLI does, from a browser: discover, select, map, arrange waves,
+execute, then follow progress and triage failures. It is the same engine,
+state database and ledger as the CLI. The two can be used interchangeably on
+one workspace, and a batch started from either shows up in both.
+
+| page | what you do there |
+|---|---|
+| **Overview** | Campaign totals, progress by wave and namespace, live batches, recent failures, and a *next step* prompt that tells you what to do now |
+| **1 Discover** | Connect to vCenter (server/user pre-filled from `VCFA_VC_*`; the password is used once and never stored) and read the inventory, with a live progress bar |
+| **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), search and facet filters, shift-click ranges, bulk namespace/wave |
+| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
+| **4 Waves** | A board with one column per wave. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. VMs already in a batch are locked and cannot move |
+| **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. Includes a commit gate and a *Watch* for batches left over from an earlier session |
+| **Import queue** | Every VM with state filters; bulk retry / skip / move wave / roll back / abandon |
+| **Batches** | Every `ImportOperationBatch` with its members, the manifest that was applied, and its events |
+| **Triage** | Failures grouped by cause (VM-specific details are normalised away), each with the likely fix and the right buttons: retry, skip, abandon, roll back. Also stalled VMs, rolled-back VMs, and batches safe to clean up |
+| **Activity & logs** | Every job's full log (searchable, *problems only*), the event log, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
+
+Long operations run as background **jobs**. Their log streams into a panel at
+the bottom of every page, and is kept under `<workdir>/jobs/` so it survives a
+restart. **Stop** acts like the first Ctrl-C: nothing new is applied, and
+batches already on the cluster are polled to completion. Only one job runs at a
+time.
+
+**Safety.** The console listens on `127.0.0.1` by default and needs the access
+token printed at start-up (the link carries it after `#t=`, so it never reaches
+a server log). Every API call sends it in a header, so another web page in the
+same browser cannot drive the console. Requests naming a foreign `Host` are
+refused. Cluster-changing actions need an explicit confirmation, which the
+server enforces as well as the UI. To reach it from your desk, keep it on
+loopback and tunnel:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 jumpbox        # then open the printed link locally
+```
+
+```
+serve [--host 127.0.0.1] [--port 8765] [--token T] [--open]
+      [--folder-map folder-map.csv] [--map portgroup-map.csv]   # default: next to the config
+```
+
+Like the rest of the tool it is standard library only, and the UI is plain
+HTML/CSS/JS with no CDN, so it works on an air-gapped jump box and ships inside
+the `.pyz` and `.exe`.
+
 ---
 
 ## Requirements
@@ -451,6 +510,7 @@ it never touches batches it did not create.
 | `skip` | exclude or re-include VMs |
 | `events` | the run's event log |
 | `report` | standalone HTML and/or CSV report |
+| `serve` | the web console: every step above from a browser (see [The web console](#the-web-console)) |
 
 ### Preflight vs precheck
 
@@ -740,10 +800,18 @@ back to vCenter management. The tool is built around that fact:
   and leaves resumable state.
 - **In-flight VMs are locked.** Re-running `load` after editing the CSV will not
   change the target of a VM that is mid-import; it reports the conflict instead.
+- **One writer per workspace.** `precheck`, `run`, `commit`, `rollback`, `abandon`
+  and `cleanup` -- from the CLI or the web console -- take an OS lock on
+  `<workdir>/run.lock`. A second one is refused with the holder's name (exit 7)
+  instead of applying duplicate batches for the same VMs. The OS releases the lock
+  if its holder crashes, so it can never be left stuck. Dry runs and read-only
+  commands do not take it.
+- **A flapping API server is not a verdict.** Timeouts are retried; preflight
+  reports what it could not verify as a warning, never as "missing".
 
 Exit codes: `0` ok · `1` aborted by the operator · `2` config/inventory/preflight
 problem · `3` circuit breaker · `4` finished with failures · `5` kubectl error ·
-`6` vCenter error.
+`6` vCenter error · `7` workspace busy (another run holds it).
 
 ---
 
@@ -901,10 +969,33 @@ python tests/run_tests.py --slow        # + the 1800-VM scale case
 `tools/fake_kubectl.py` stands in for kubectl and the Mobility Operator and
 `tools/fake_vcenter.py` stands in for the vCenter REST API, so discovery,
 selection, staging and the apply/poll/commit/retry loop are all exercised offline — including failure
-injection, the commit gate, and the circuit breaker. Point the tool at it to
-rehearse a campaign without a cluster:
+injection, the commit gate, and the circuit breaker. Point the tool at the fake
+to rehearse a campaign without a cluster:
 
 ```toml
 kubectl = "python /path/to/tools/fake_kubectl.py"
 ```
+
+The web console is tested the same way: its API is driven end to end (discover
+through rollback and retry, plus Stop), and its token/Host/confirm guards are
+unit-tested.
+
+The `stress/` tests go after failure conditions on purpose: hostile HTTP
+(pipelined and smuggled bodies, oversized and malformed requests, a fuzz matrix
+over every route, DNS-rebinding Host headers, path traversal), 24 concurrent
+clients, a crash of the console mid-run, the CLI and console racing on one
+workspace, an API server that times out a quarter of the time, a missing
+kubectl, a sick operator, bad vCenter credentials, the circuit breaker, and
+1800 VMs end to end (`--slow`).
+
+```bash
+python tests/run_tests.py --only=stress/chaos   # any test whose name contains the text
+python tools/ui_stress.py [--scale]             # the UI itself, in headless Chrome/Edge
+```
+
+`tools/ui_stress.py` drives the real UI -- clicks, typing, drag and drop,
+confirmations -- against the fakes. It covers hostile VM names (no markup is
+ever injected), a server that disappears and comes back, phone-width layout, an
+empty workspace, both themes, and 1800-VM rendering timed on the server's
+clock.
 

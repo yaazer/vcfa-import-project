@@ -180,39 +180,86 @@ class NetworkMapping:
     subnet_api_group: Optional[str] = None
 
 
+NETWORK_MAP_COLUMNS = ["portgroup", "namespace", "subnet", "wave", "device_key",
+                       "subnet_kind", "subnet_api_group"]
+FOLDER_MAP_COLUMNS = ["folder", "namespace", "wave", "group"]
+_NETWORK_KEY_ALIASES = ("portgroup", "network", "network_name")
+_FOLDER_KEY_ALIASES = ("folder", "vm_folder", "path", "folder_path")
+
+
+def _int_cell(value: str, column: str, where: str) -> Optional[int]:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        raise SelectionError("{}: {} must be a number, not '{}'".format(where, column, value))
+
+
+def _map_rows(rows: Any, where: str) -> List[Dict[str, Any]]:
+    """Map rows arrive from files and from the web console: insist on a list of objects."""
+    if not isinstance(rows, (list, tuple)) or not all(isinstance(r, dict) for r in rows):
+        raise SelectionError("{}: expected a list of rows, each an object of column values".format(where))
+    return list(rows)
+
+
+def _read_map_csv(path: str, what: str, key_aliases: Sequence[str],
+                  key: str) -> List[Dict[str, str]]:
+    """Rows of a map CSV with canonical lowercase column names (aliases folded)."""
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise SelectionError("{} not found: {}".format(what, p))
+    try:
+        with p.open("r", encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            fields = {(k or "").strip().lower(): k for k in (reader.fieldnames or [])}
+            key_col = next((fields[k] for k in key_aliases if k in fields), None)
+            if not key_col or "namespace" not in fields:
+                raise SelectionError("{}: needs at least '{}' and 'namespace' columns".format(p, key))
+            rows = []
+            for raw in reader:
+                row = {name: str(raw.get(orig) or "").strip() for name, orig in fields.items()}
+                row[key] = str(raw.get(key_col) or "").strip()
+                rows.append(row)
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise SelectionError(
+            "{} ({}) is not a readable CSV: {}. Save it as UTF-8 CSV (Excel: 'CSV UTF-8'), "
+            "or delete it and recreate it in the console".format(what, p, exc))
+    return rows
+
+
+def network_map_from_rows(rows: Sequence[Dict[str, Any]],
+                          where: str = "network map") -> Dict[str, NetworkMapping]:
+    """portgroup -> mapping, from rows keyed by NETWORK_MAP_COLUMNS. Blank keys are skipped."""
+    out: Dict[str, NetworkMapping] = {}
+    for row in _map_rows(rows, where):
+        cell = lambda c: str(row.get(c) or "").strip()  # noqa: E731
+        pg = cell("portgroup")
+        if not pg:
+            continue
+        out[pg] = NetworkMapping(
+            namespace=cell("namespace"),
+            subnet=cell("subnet"),
+            wave=_int_cell(cell("wave"), "wave", "{} ({})".format(where, pg)),
+            device_key=_int_cell(cell("device_key"), "device_key", "{} ({})".format(where, pg)),
+            subnet_kind=cell("subnet_kind") or None,
+            subnet_api_group=cell("subnet_api_group") or None,
+        )
+    return out
+
+
 def load_network_map(path: str) -> Dict[str, NetworkMapping]:
     """Read portgroup -> namespace/subnet mappings.
 
     Columns: portgroup,namespace,subnet[,wave][,device_key][,subnet_kind][,subnet_api_group]
     The portgroup column may contain a glob.
     """
-    p = Path(path).expanduser()
-    if not p.is_file():
-        raise SelectionError("network map not found: {}".format(p))
-    out: Dict[str, NetworkMapping] = {}
-    with p.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        fields = {(k or "").strip().lower(): k for k in (reader.fieldnames or [])}
-        pg_col = next((fields[k] for k in ("portgroup", "network", "network_name")
-                       if k in fields), None)
-        if not pg_col or "namespace" not in fields:
-            raise SelectionError(
-                "{}: needs at least 'portgroup' and 'namespace' columns".format(p))
-        for row in reader:
-            pg = (row.get(pg_col) or "").strip()
-            if not pg:
-                continue
-            wave_raw = (row.get(fields.get("wave", ""), "") or "").strip()
-            dk_raw = (row.get(fields.get("device_key", ""), "") or "").strip()
-            out[pg] = NetworkMapping(
-                namespace=(row.get(fields["namespace"]) or "").strip(),
-                subnet=(row.get(fields.get("subnet", ""), "") or "").strip(),
-                wave=int(float(wave_raw)) if wave_raw else None,
-                device_key=int(dk_raw) if dk_raw else None,
-                subnet_kind=(row.get(fields.get("subnet_kind", ""), "") or "").strip() or None,
-                subnet_api_group=(row.get(fields.get("subnet_api_group", ""), "") or "").strip() or None,
-            )
-    return out
+    return network_map_from_rows(read_network_map_rows(path), where=str(path))
+
+
+def read_network_map_rows(path: str) -> List[Dict[str, str]]:
+    return _read_map_csv(path, "network map", _NETWORK_KEY_ALIASES, "portgroup")
 
 
 @dataclass
@@ -228,28 +275,44 @@ def load_folder_map(path: str) -> Dict[str, FolderMapping]:
     Columns: folder,namespace[,wave][,group]. A folder covers its whole subtree;
     the most specific (longest) matching folder wins. Globs are allowed.
     """
-    p = Path(path).expanduser()
-    if not p.is_file():
-        raise SelectionError("folder map not found: {}".format(p))
+    return folder_map_from_rows(read_folder_map_rows(path), where=str(path))
+
+
+def read_folder_map_rows(path: str) -> List[Dict[str, str]]:
+    return _read_map_csv(path, "folder map", _FOLDER_KEY_ALIASES, "folder")
+
+
+def folder_map_from_rows(rows: Sequence[Dict[str, Any]],
+                         where: str = "folder map") -> Dict[str, FolderMapping]:
+    """folder -> mapping, from rows keyed by FOLDER_MAP_COLUMNS. Blank keys are skipped."""
     out: Dict[str, FolderMapping] = {}
-    with p.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        fields = {(k or "").strip().lower(): k for k in (reader.fieldnames or [])}
-        folder_col = next((fields[k] for k in ("folder", "vm_folder", "path", "folder_path")
-                           if k in fields), None)
-        if not folder_col or "namespace" not in fields:
-            raise SelectionError("{}: needs 'folder' and 'namespace' columns".format(p))
-        for row in reader:
-            folder = (row.get(folder_col) or "").strip()
-            if not folder:
-                continue
-            wave_raw = (row.get(fields.get("wave", ""), "") or "").strip()
-            out[folder] = FolderMapping(
-                namespace=(row.get(fields["namespace"]) or "").strip(),
-                wave=int(float(wave_raw)) if wave_raw else None,
-                group=(row.get(fields.get("group", ""), "") or "").strip() or None,
-            )
+    for row in _map_rows(rows, where):
+        cell = lambda c: str(row.get(c) or "").strip()  # noqa: E731
+        folder = cell("folder")
+        if not folder:
+            continue
+        out[folder] = FolderMapping(
+            namespace=cell("namespace"),
+            wave=_int_cell(cell("wave"), "wave", "{} ({})".format(where, folder)),
+            group=cell("group") or None,
+        )
     return out
+
+
+def write_map_rows(path: str, columns: Sequence[str], rows: Sequence[Dict[str, Any]]) -> int:
+    """Write a map CSV atomically (temp file + rename). Blank-key rows are dropped."""
+    key = columns[0]
+    keep = [r for r in rows if str(r.get(key) or "").strip()]
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(columns)
+        for r in keep:
+            writer.writerow([str(r.get(c) if r.get(c) is not None else "").strip() for c in columns])
+    tmp.replace(p)
+    return len(keep)
 
 
 def match_folder_map(path: str, mapping: Dict[str, FolderMapping]) -> Optional[FolderMapping]:

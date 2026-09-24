@@ -140,20 +140,43 @@ class Kubectl:
         info["resources"] = self.api_resources()
         return info
 
+    def _probe(self, args: Sequence[str], timeout: int = 60, attempts: int = 3):
+        """A read-only query whose failure is an answer ("no such thing"), retried
+        while the failure is only the API server not answering."""
+        proc = None
+        for attempt in range(1, attempts + 1):
+            proc = self.run(args, check=False, timeout=timeout)
+            if proc.returncode == 0 or not TRANSIENT_RE.search(proc.stderr or ""):
+                return proc
+            if attempt < attempts:
+                self._log("  transient kubectl error, retry {}/{}: {}".format(
+                    attempt, attempts - 1, (proc.stderr or "").strip()[:160]))
+                time.sleep(min(2 ** attempt, 8))
+        return proc
+
+    @staticmethod
+    def _unanswered(proc) -> bool:
+        return proc.returncode != 0 and bool(TRANSIENT_RE.search(proc.stderr or ""))
+
     def api_resources(self) -> Dict[str, str]:
-        """Map resource name -> kind for the mobility-operator API group."""
+        """Map resource name -> kind for the mobility-operator API group.
+
+        A failed listing is never cached as "no resources": one API-server
+        timeout would otherwise make a whole run believe the ImportOperation
+        CRD is missing. kubectl often exits non-zero because some *other* API
+        group is down while still listing ours, so output wins over exit code.
+        """
         if self._resource_cache is not None:
             return self._resource_cache
-        proc = self.run(
-            ["api-resources", "--api-group", self.cfg.api_group, "--no-headers"],
-            check=False,
-            timeout=60,
-        )
+        args = ["api-resources", "--api-group", self.cfg.api_group, "--no-headers"]
+        proc = self._probe(args)
         found: Dict[str, str] = {}
         for line in proc.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2:
                 found[parts[0]] = parts[-1]
+        if not found and proc.returncode != 0:
+            raise KubectlError(self._base() + args, proc.returncode, proc.stdout, proc.stderr)
         self._resource_cache = found
         return found
 
@@ -187,19 +210,29 @@ class Kubectl:
         except json.JSONDecodeError:
             return None
 
-    def exists(self, resource: str, name: str, namespace: Optional[str] = None) -> bool:
+    def exists(self, resource: str, name: str, namespace: Optional[str] = None) -> Optional[bool]:
+        """True or False -- or None when the API server never answered, which is
+        not the same as "not found" and must not be reported as missing."""
         args = ["get", resource, name, "-o", "name"]
         if namespace:
             args += ["-n", namespace]
-        proc = self.run(args, check=False, timeout=60)
-        return proc.returncode == 0
+        proc = self._probe(args)
+        if proc.returncode == 0:
+            return True
+        return None if self._unanswered(proc) else False
 
-    def can_i(self, verb: str, resource: str, namespace: Optional[str] = None) -> bool:
+    def can_i(self, verb: str, resource: str, namespace: Optional[str] = None) -> Optional[bool]:
+        """True / False, or None when the API server never answered."""
         args = ["auth", "can-i", verb, resource]
         if namespace:
             args += ["-n", namespace]
-        proc = self.run(args, check=False, timeout=60)
-        return proc.stdout.strip().lower().startswith("yes")
+        proc = self._probe(args)
+        answer = proc.stdout.strip().lower()
+        if answer.startswith("yes"):
+            return True
+        if not answer and self._unanswered(proc):
+            return None
+        return False
 
     # ------------------------------------------------------------ mutations
     def apply(self, manifest_yaml: str, namespace: str) -> str:

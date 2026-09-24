@@ -23,12 +23,13 @@ from .discovery import (
     write_picker,
     write_selection_csv,
 )
-from .engine import STAGE_IMPORT, STAGE_PRECHECK, AbortRun, Engine
+from .engine import STAGE_IMPORT, STAGE_PRECHECK
 from .folders import describe as describe_scope
 from .inventory import InventoryError, load_inventory, write_template
-from .kube import Kubectl, KubectlError
+from .kube import KubectlError
 from .planner import summarize
 from . import report
+from . import service
 from . import state as st
 from .vcenter import VCenterClient, VCenterError, discover, resolve_credentials
 
@@ -50,11 +51,7 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
     return answer in ("y", "yes")
 
 
-def _store_path(cfg: Config) -> str:
-    return str(Path(cfg.workdir).expanduser() / "state.db")
-
-
-def _open(args) -> tuple:
+def _load_config(args) -> Config:
     cfg = Config.load(args.config)
     if args.workdir:
         cfg.workdir = args.workdir
@@ -62,19 +59,20 @@ def _open(args) -> tuple:
         cfg.context = args.context
     if args.kubeconfig:
         cfg.kubeconfig = args.kubeconfig
+    return cfg
+
+
+def _open(args) -> tuple:
+    cfg = _load_config(args)
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
     if getattr(args, "parallel", None):
         cfg.max_parallel_batches = args.parallel
     if getattr(args, "no_precheck", False):
         cfg.require_precheck = False
-    cfg.validate()
-    Path(cfg.workdir).expanduser().mkdir(parents=True, exist_ok=True)
-    store = st.Store(_store_path(cfg), ledger_path=cfg.ledger_path)
-    kube = Kubectl(cfg, dry_run=getattr(args, "dry_run", False),
-                   verbose=getattr(args, "verbose", False), log=log)
-    engine = Engine(cfg, store, kube, log)
-    return cfg, store, kube, engine
+    ws = service.Workspace(cfg, dry_run=getattr(args, "dry_run", False),
+                           verbose=getattr(args, "verbose", False), log=log)
+    return ws.cfg, ws.store, ws.kube, ws.engine
 
 
 def _waves(args) -> Optional[List[int]]:
@@ -563,12 +561,9 @@ def _execute(args, stage: str) -> int:
     only = args.vm or None
     scope = args.folder or None
     exact = bool(getattr(args, "no_subfolders", False))
-    rows = []
-    for wave in (waves or store.waves()):
-        eligible = engine.eligible(stage, wave, morefs=only, include_failed=args.include_failed,
-                                   folders=scope, folder_exact=exact)
-        if eligible:
-            rows.append([wave, len(eligible)])
+    rows = [list(r) for r in service.eligible_by_wave(
+        engine, stage, waves, morefs=only, include_failed=args.include_failed,
+        folders=scope, folder_exact=exact)]
     if not rows:
         log("nothing to do for stage '{}'".format(stage))
         if stage == STAGE_IMPORT and cfg.require_precheck:
@@ -599,28 +594,22 @@ def _execute(args, stage: str) -> int:
         return 1
 
     started = time.time()
-    halted = None
+    lock = None if args.dry_run else service.WorkspaceLock(cfg, "`{}` from the CLI".format(stage))
     try:
-        totals = engine.execute(
-            stage,
-            waves=waves,
-            limit=args.limit,
-            morefs=only,
-            include_failed=args.include_failed,
-            watch_only=False,
-            folders=scope,
-            folder_exact=exact,
-        )
-    except AbortRun as exc:
-        halted = exc
-        totals = {"applied": 0, "succeeded": 0, "failed": 1, "awaiting_commit": 0}
+        if lock:
+            lock.acquire()
+        totals = service.run_stage(
+            engine, stage, waves=waves, limit=args.limit, morefs=only,
+            include_failed=args.include_failed, folders=scope, folder_exact=exact,
+            rollback_failed=getattr(args, "rollback_failed", False), log=log)
     except KeyboardInterrupt:
         log("\ninterrupted; state is saved -- re-run the same command to resume")
         return 130
+    finally:
+        if lock:
+            lock.release()
 
-    if stage == STAGE_IMPORT and getattr(args, "rollback_failed", False) and totals["failed"]:
-        _rollback_after_run(engine, store, waves, scope, exact)
-
+    halted = totals["halted"]
     if halted is not None:
         log("\nRUN HALTED: {}".format(halted))
         log("Investigate with `vcfa-import status` and `vcfa-import events --level error`,")
@@ -634,33 +623,6 @@ def _execute(args, stage: str) -> int:
     log("")
     log(report.render_status(store, cfg))
     return 0 if totals["failed"] == 0 else 4
-
-
-def _rollback_after_run(engine, store, waves, folders=None, folder_exact=False) -> None:
-    """--rollback-failed: hand every failed import back to vCenter, then stop.
-
-    Same mechanism as `rollback --failed` -- rollbackAction is patched onto
-    batches that have already run and failed -- just without a second command.
-    Batches are left on the cluster for `cleanup`; nothing is deleted here.
-    """
-    targets = []
-    for wave in (waves or [None]):
-        rows, notes = engine.rollback_targets(failed_only=not folders, wave=wave,
-                                              folders=folders, folder_exact=folder_exact)
-        for note in notes:
-            log("  ! " + note)
-        targets += [r for r in rows if r not in targets]
-    if not targets:
-        return
-    log("")
-    log("--rollback-failed: reverting {} batch(es) with failed imports".format(len(targets)))
-    result = engine.rollback(targets, action="Immediate", wait=True, delete=False)
-    log("  {} VM(s) confirmed back under vCenter; {} batch(es) still reverting".format(
-        result["reverted"], len(result["pending"])))
-    for err in result["errors"]:
-        log("  ! " + err)
-    if result["reverted"]:
-        log("  rolled-back VMs are retryable with `retry`; delete their batches with `cleanup`")
 
 
 def cmd_precheck(args) -> int:
@@ -727,7 +689,8 @@ def cmd_commit(args) -> int:
     if not _confirm("Commit these {} VM(s)?".format(len(waiting)), args.yes):
         log("aborted")
         return 1
-    result = engine.commit(morefs=args.vm or None, wave=args.wave_single)
+    with service.WorkspaceLock(cfg, "`commit` from the CLI"):
+        result = engine.commit(morefs=args.vm or None, wave=args.wave_single)
     log("patched {} batch(es) covering {} VM(s)".format(result["batches"], result["vms"]))
     for err in result["errors"]:
         log("  ! " + err)
@@ -774,8 +737,9 @@ def cmd_rollback(args) -> int:
         log("aborted")
         return 1
 
-    result = engine.rollback(batches, action=args.action, wait=not args.no_wait,
-                             delete=args.delete, timeout_minutes=args.timeout)
+    with service.WorkspaceLock(cfg, "`rollback` from the CLI"):
+        result = engine.rollback(batches, action=args.action, wait=not args.no_wait,
+                                 delete=args.delete, timeout_minutes=args.timeout)
     log("")
     log("patched {} batch(es); {} VM(s) confirmed reverted to vCenter; {} deleted".format(
         len(result["patched"]), result["reverted"], len(result["deleted"])))
@@ -816,7 +780,8 @@ def cmd_abandon(args) -> int:
     if not _confirm("Abandon {} batch(es)?".format(len(batches)), args.yes):
         log("aborted")
         return 1
-    result = engine.abandon(batches)
+    with service.WorkspaceLock(_cfg, "`abandon` from the CLI"):
+        result = engine.abandon(batches)
     log("deleted {} batch(es); {} VM(s) back to pending".format(
         len(result["deleted"]), result["requeued"]))
     for err in result["errors"]:
@@ -829,7 +794,7 @@ def cmd_abandon(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    _cfg, _store, _kube, engine = _open(args)
+    cfg, _store, _kube, engine = _open(args)
     candidates = engine.cleanup_candidates()
     if args.batch:
         wanted = set(args.batch)
@@ -848,7 +813,8 @@ def cmd_cleanup(args) -> int:
                     args.yes):
         log("aborted")
         return 1
-    result = engine.delete_batches(candidates)
+    with service.WorkspaceLock(cfg, "`cleanup` from the CLI"):
+        result = engine.delete_batches(candidates)
     log("deleted {} batch(es)".format(len(result["deleted"])))
     for err in result["errors"]:
         log("  ! " + err)
@@ -887,19 +853,9 @@ def cmd_vms(args) -> int:
 
 def cmd_skip(args) -> int:
     _cfg, store, _kube, _engine = _open(args)
-    changed = 0
-    for moref in args.vm:
-        row = store.get_vm(moref)
-        if row is None:
-            log("  ! {} is not in the inventory".format(moref))
-            continue
-        if row["state"] in (st.S_IMPORTING, st.S_PRECHECK_RUNNING, st.S_COMMITTED):
-            log("  ! {} is {}; refusing to skip".format(moref, row["state"]))
-            continue
-        target = st.S_PENDING if args.unskip else st.S_SKIPPED
-        store.set_vm_state(moref, target, message="manually {}".format(
-            "unskipped" if args.unskip else "skipped"))
-        changed += 1
+    changed, notes = service.skip_vms(store, args.vm, unskip=args.unskip)
+    for note in notes:
+        log("  ! " + note)
     log("{} {} VM(s)".format("unskipped" if args.unskip else "skipped", changed))
     return 0
 
@@ -1018,6 +974,22 @@ def cmd_report(args) -> int:
     for out in outputs:
         log("wrote {}".format(out))
     return 0
+
+
+def cmd_serve(args) -> int:
+    from .web.api import WebApp
+    from .web.server import serve
+
+    cfg = _load_config(args)
+    app = WebApp(cfg, config_path=args.config, folder_map=args.folder_map,
+                 network_map=args.map, verbose=args.verbose)
+    try:
+        return serve(app, args.host, args.port, token=args.token,
+                     open_browser=args.open, log=log)
+    except OSError as exc:
+        app.close()
+        log("error: cannot listen on {}:{}: {}".format(args.host, args.port, exc))
+        return 2
 
 
 # -------------------------------------------------------------------- parser
@@ -1258,10 +1230,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--csv", help="output path for the per-VM CSV")
     sp.add_argument("--refresh", action="store_true")
 
+    sp = add("serve", cmd_serve,
+             "run the web console: discover, plan waves, execute and triage from a browser")
+    sp.add_argument("--host", default="127.0.0.1",
+                    help="address to listen on (default 127.0.0.1; prefer an SSH tunnel "
+                         "over exposing it)")
+    sp.add_argument("--port", type=int, default=8765)
+    sp.add_argument("--token", help="access token (default: a fresh random one per start)")
+    sp.add_argument("--open", action="store_true", help="open the console in a browser")
+    sp.add_argument("--folder-map",
+                    help="folder map CSV the console edits (default: folder-map.csv next to "
+                         "the config)")
+    sp.add_argument("--map", help="portgroup map CSV the console edits (default: "
+                                  "portgroup-map.csv next to the config)")
+
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # vCenter allows any Unicode VM name. On Windows, output piped to a file or
+    # `tee` uses the ANSI code page, and one such name used to crash `vms`,
+    # `history` -- or the summary at the end of a `run`. Never die on output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -1275,6 +1269,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except KubectlError as exc:
         log("kubectl error: {}".format(exc))
         return 5
+    except service.WorkspaceBusy as exc:
+        log("refused: {}".format(exc))
+        return 7
     except KeyboardInterrupt:
         log("\ninterrupted")
         return 130

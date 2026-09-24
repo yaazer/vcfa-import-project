@@ -21,6 +21,19 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   Do not bypass `Store.set_vm_state`.
 - Batches are built **per vCenter folder**; folders are the unit of collection
   (`select --folder`) and execution (`run --folder`).
+- **CLI and web console must not diverge.** Put behaviour in the engine, store or
+  `service.py`; `cli.py` and `web/api.py` only parse input and format output.
+- Web console: no external assets (no CDN, no web fonts; the jump box may be air-gapped),
+  every `/api` call needs the `X-VCFA-Token` header, and cluster-changing endpoints
+  require `"confirm": true` on the server side too. Only one job runs at a time.
+- A wave is not a state: `Store.set_vm_wave` / `swap_waves` log an event, not a
+  transition, and refuse VMs already in a batch (`WAVE_LOCKED_STATES`).
+- **Anything that changes the cluster takes `service.WorkspaceLock`** (CLI: exit 7 when
+  busy; console: 409). Two runs on one state.db were seen applying duplicate batches.
+- kubectl probes (`exists`, `can_i`, `api_resources`) return `None` / raise when the API
+  server never answered. Never turn a timeout into "missing" or "denied".
+- Map rows reach the parsers from files *and* from the browser: validate shape, never
+  assume a list of dicts. Report bad input as `SelectionError` (400), never a 500.
 
 ## Layout
 
@@ -33,6 +46,13 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/discovery.py` | filters, folder/portgroup maps, `stage()`, HTML picker |
 | `vcfaimport/vcenter.py` | REST client: VM list, folder tree, NICs |
 | `vcfaimport/render.py` | manifest builder + dependency-free YAML emitter |
+| `vcfaimport/service.py` | logic shared by CLI and web: `Workspace`, `run_stage`, skip, previews, overview, triage (`KNOWN_ISSUES`), map coverage |
+| `vcfaimport/web/server.py` | `serve`: stdlib HTTP server, token + Host checks, static assets via `pkgutil` (works in .pyz/.exe) |
+| `vcfaimport/web/api.py` | JSON API; `ROUTES` table; cluster-touching actions start jobs, DB-only ones run inline |
+| `vcfaimport/web/jobs.py` | background jobs: one at a time, own `Store`, log streamed + kept in `<workdir>/jobs/` |
+| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `views.js` (pages), `app.css` |
+| `tools/web_demo.py` | the console against the fakes: `--keep ./webdemo` |
+| `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge |
 | `tools/fake_kubectl.py` | simulated kubectl + operator (emits the real condition vocabulary) |
 | `tools/fake_vcenter.py` | simulated vCenter REST API |
 | `tools/demo.py` | full offline campaign; `--keep ./rehearsal` |
@@ -47,7 +67,10 @@ python tests/run_tests.py --slow        # + 1800-VM scale case
 ```
 
 No pytest; tests are `@test`-decorated functions registered in the `UNIT` / `E2E`
-lists at the bottom of `tests/run_tests.py`. Add a test for any operator behaviour
+lists at the bottom of `tests/run_tests.py`. `_Console` runs the web console
+in-process on a free port for API tests; `--only=<text>` runs matching tests.
+UI changes: run `python tools/ui_stress.py` (headless Chrome/Edge; drives the real
+UI against the fakes) and add a scenario for new interactions. Add a test for any operator behaviour
 learned from a real cluster — the fakes should model what was observed.
 
 ## Operator facts observed on a real Supervisor (2026-09-18, VCF 9.1)

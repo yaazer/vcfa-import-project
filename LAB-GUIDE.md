@@ -55,6 +55,7 @@ every step's output looks like before you touch anything real:
 
 ```bash
 python tools/demo.py --keep ./rehearsal
+python tools/web_demo.py --keep ./webdemo     # the same, in the browser console
 ```
 
 ---
@@ -90,6 +91,32 @@ failure_rate_abort = 0.5
 `commit_action = "Wait"` is the key lab setting. Imported VMs stop at
 `awaiting_commit`; you can roll them back or commit them, and either is a
 deliberate choice.
+
+### Prefer a browser? Run the same lab from the web console
+
+Every step below can be done in the web console instead of the CLI. It uses
+the same config, state database and ledger, so you can switch between the two
+at any point.
+
+```bash
+vcfa-import -c vcfa-import.toml serve            # on the jump box
+ssh -L 8765:127.0.0.1:8765 <jumpbox>             # from your desk, then open the printed link
+```
+
+| lab step | in the console |
+|---|---|
+| 4 discover / select | **Discover** (the password is asked for in the page), then **Select VMs**. Tick `Migration/Wave1` in the folder tree |
+| 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` and the VM's portgroup → `migration-testing`, check the preview, **Stage** |
+| 5 preflight / plan | **Execute → Run preflight**; the batch plan is shown before every run |
+| 6 precheck | **Execute → Precheck → wave 1**; follow the log panel. A DNS stall on the Supervisor shows up in **Triage** as *DNS lookup from the Supervisor timed out* |
+| 7 import, held | **Execute → Import** (dry run first if you like); VMs stop at *awaiting commit* |
+| 8 roll back | **Execute → Commit gate → Roll back instead**, or the VM's drawer → **Roll back** |
+| 9 commit | **Execute → Commit** (type `COMMIT`) |
+| 10 tracker | **Activity & logs → Exports** |
+| 10b start over | **Batches** → the batch → **Abandon** |
+
+Job logs from the console are kept under `run/jobs/`. Include them when you
+report back (step 11).
 
 ---
 

@@ -355,10 +355,18 @@ def _pbar(done: int, failed: int, total: int) -> str:
             '<span class="f" style="width:{:.1f}%"></span></div>').format(d, f)
 
 
+class _Cell(str):
+    """A complete, already-escaped <td>. Anything else in a row is data and is escaped.
+
+    (Cells used to pass through whenever they *started with* "<" -- so a VM
+    renamed to '<img src=x onerror=...>' in vCenter was injected into the report.)
+    """
+
+
 def _rows_html(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     head = "".join("<th>{}</th>".format(html.escape(str(h))) for h in headers)
     body = "".join(
-        "<tr>" + "".join(c if str(c).startswith("<") else "<td>{}</td>".format(html.escape(str(c)))
+        "<tr>" + "".join(c if isinstance(c, _Cell) else "<td>{}</td>".format(html.escape(str(c)))
                          for c in row) + "</tr>"
         for row in rows
     )
@@ -394,7 +402,7 @@ def write_html(store: st.Store, cfg: Config, path: str) -> str:
         wave, wtotal, wdone, wfailed = row[0], row[1], row[2], row[3]
         wave_rows.append([
             "wave {}".format(wave), wtotal, wdone, wfailed, row[4], row[5], row[7],
-            '<td>{}</td>'.format(_pbar(wdone, wfailed, wtotal)),
+            _Cell('<td>{}</td>'.format(_pbar(wdone, wfailed, wtotal))),
         ])
 
     ns_rows = []
@@ -404,18 +412,18 @@ def write_html(store: st.Store, cfg: Config, path: str) -> str:
         ndone = sum(1 for v in vms if v["state"] == st.S_COMMITTED)
         nfail = sum(1 for v in vms if v["state"] in (st.S_FAILED, st.S_PRECHECK_FAILED))
         ns_rows.append([ns, ntotal, ndone, nfail,
-                        '<td>{}</td>'.format(_pbar(ndone, nfail, ntotal))])
+                        _Cell('<td>{}</td>'.format(_pbar(ndone, nfail, ntotal)))])
 
     bad_rows = [
         [v["vm_name"], v["moref"], v["namespace"], STATE_LABEL.get(v["state"], v["state"]),
          v["batch_name"] or v["precheck_batch"] or "",
-         '<td class="msg">{}</td>'.format(html.escape((v["message"] or "")[:400]))]
+         _Cell('<td class="msg">{}</td>'.format(html.escape((v["message"] or "")[:400])))]
         for v in store.query_vms(states=[st.S_FAILED, st.S_PRECHECK_FAILED], limit=200)
     ]
 
     batch_rows = [
         [b["name"], b["namespace"], b["stage"], b["state"], b["vm_count"],
-         b["applied_at"] or "", '<td class="msg">{}</td>'.format(html.escape((b["message"] or "")[:200]))]
+         b["applied_at"] or "", _Cell('<td class="msg">{}</td>'.format(html.escape((b["message"] or "")[:200])))]
         for b in store.query_batches(states=[st.B_APPLIED, st.B_RUNNING, st.B_TIMEDOUT, st.B_PARTIAL])
     ]
 

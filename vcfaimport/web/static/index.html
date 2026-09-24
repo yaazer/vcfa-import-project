@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VCFA Import Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6bff'/%3E%3Cpath d='M9 11l7 11 7-11' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/core.js" defer></script>
+<script src="/static/views.js" defer></script>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8"/><path d="M9 11l7 11 7-11"/></svg></span>
+      <span class="brand-text"><b>VCFA Import</b><small>Mobility console</small></span>
+    </div>
+    <nav id="nav" aria-label="Main"></nav>
+    <div class="side-foot" id="side-foot"></div>
+  </aside>
+  <div class="main">
+    <div class="offline" id="offline" role="status" hidden><span class="spinner"></span>
+      <span>Lost contact with the console. Retrying&hellip; figures on screen may be out of date. Batches already on the cluster keep running.</span></div>
+    <header class="topbar" id="topbar"></header>
+    <main class="view" id="view" tabindex="-1"><div class="boot">Connecting to the console…</div></main>
+  </div>
+</div>
+<section class="dock" id="dock" hidden></section>
+<div id="drawer-root"></div>
+<div id="modal-root"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

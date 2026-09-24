@@ -2140,6 +2140,1604 @@ def t_e2e_scale():
         eq(cluster["applies"], 144, "1800 VMs / 25 per batch, twice (precheck + import)")
 
 
+# ------------------------------------------------------------- web console
+@test("moving VMs between waves: queued VMs move, in-batch VMs are refused, no transition")
+def t_store_wave_moves():
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        for i, state in enumerate([None, vst.S_IMPORTING, vst.S_COMMITTED, vst.S_FAILED]):
+            _record(store, moref="vm-{}".format(i), name="vm{}".format(i))
+            if state:
+                store.set_vm_state("vm-{}".format(i), state, stage="import")
+        store.upsert_discovered([{"moref": "vm-0", "name": "vm0"}])
+        before = store.get_vm("vm-0")["updated_at"]
+        n_trans = len(store.transitions())
+
+        moved, refused = store.set_vm_wave(["vm-0", "vm-1", "vm-2", "vm-3", "vm-404"], 3)
+        eq(moved, 2, "pending and failed move")
+        eq(len(refused), 3, "importing, committed and unknown are refused")
+        eq(store.get_vm("vm-0")["wave"], 3)
+        eq(store.get_vm("vm-1")["wave"], 1, "an importing VM keeps the wave its batch has")
+        eq(store.query_discovered(morefs=["vm-0"])[0]["wave"], 3, "re-staging keeps the choice")
+        eq(store.get_vm("vm-0")["updated_at"], before, "held-time accounting is untouched")
+        eq(len(store.transitions()), n_trans, "a wave is not a state")
+        assert any("to wave 3" in e["message"] for e in store.recent_events(moref="vm-0"))
+        try:
+            store.set_vm_wave(["vm-0"], 0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("wave 0 must be rejected")
+        store.close()
+
+
+@test("swapping waves is all or nothing")
+def t_store_swap_waves():
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _record(store, moref="vm-1", name="a", wave=1)
+        _record(store, moref="vm-2", name="b", wave=2)
+        ok, _ = store.swap_waves(1, 2)
+        assert ok
+        eq((store.get_vm("vm-1")["wave"], store.get_vm("vm-2")["wave"]), (2, 1))
+        store.set_vm_state("vm-2", vst.S_PRECHECK_RUNNING, stage="precheck")
+        ok, refused = store.swap_waves(1, 2)
+        assert not ok and refused, "a VM in a batch pins its wave"
+        eq((store.get_vm("vm-1")["wave"], store.get_vm("vm-2")["wave"]), (2, 1), "nothing moved")
+        store.close()
+
+
+@test("triage groups failures by cause and recognises the lab's DNS wedge")
+def t_triage_groups():
+    from vcfaimport import service
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        msgs = {
+            "vm-1": "lookup vc01.lab on 127.0.0.53:53: read udp 10.0.0.4:4411->127.0.0.53:53: i/o timeout",
+            "vm-2": "lookup vc01.lab on 127.0.0.53:53: read udp 10.0.0.4:5822->127.0.0.53:53: i/o timeout",
+            "vm-3": "VM Tools not running",
+            "vm-4": "something nobody has seen before",
+        }
+        for moref, msg in msgs.items():
+            _record(store, moref=moref, name=moref)
+            store.set_vm_state(moref, vst.S_PRECHECK_FAILED if moref != "vm-3" else vst.S_FAILED,
+                               message=msg, stage="precheck")
+        out = service.failure_groups(store)
+        by_issue = {(g["issue"] or {}).get("id"): g for g in out["groups"]}
+        eq(by_issue["dns"]["count"], 2, "two DNS failures, different ports, one group")
+        eq(by_issue["tools"]["stages"], {"import": 1})
+        assert None in by_issue, "an unknown message still gets its own group"
+        eq(out["groups"][0]["count"], 2, "biggest group first")
+        store.close()
+
+
+@test("map files round-trip through the editor rows, and bad numbers are rejected")
+def t_map_rows_roundtrip():
+    from vcfaimport.discovery import (
+        FOLDER_MAP_COLUMNS, SelectionError, folder_map_from_rows, load_folder_map,
+        read_folder_map_rows, write_map_rows)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "folder-map.csv")
+        rows = [{"folder": "Production", "namespace": "ns-a", "wave": "2", "group": ""},
+                {"folder": "Production/Web", "namespace": "ns-b", "wave": "", "group": "web"},
+                {"folder": "  ", "namespace": "dropped"}]
+        eq(write_map_rows(path, FOLDER_MAP_COLUMNS, rows), 2, "blank keys are dropped")
+        loaded = load_folder_map(path)
+        eq(loaded["Production"].wave, 2)
+        eq(loaded["Production/Web"].group, "web")
+        eq(folder_map_from_rows(read_folder_map_rows(path)), loaded)
+        try:
+            folder_map_from_rows([{"folder": "X", "namespace": "n", "wave": "soon"}])
+        except SelectionError as exc:
+            assert "wave" in str(exc)
+        else:
+            raise AssertionError("a non-numeric wave must be rejected")
+
+
+@test("skip refuses VMs in a batch; unskip never requeues a failed VM")
+def t_skip_semantics():
+    from vcfaimport import service
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _record(store, moref="vm-1")
+        _record(store, moref="vm-2", name="b")
+        store.set_vm_state("vm-1", vst.S_AWAITING_COMMIT, stage="import")
+        store.set_vm_state("vm-2", vst.S_FAILED, stage="import")
+        changed, notes = service.skip_vms(store, ["vm-1"])
+        eq(changed, 0)
+        assert notes and "awaiting_commit" in notes[0], notes
+        changed, _ = service.skip_vms(store, ["vm-2"], unskip=True)
+        eq(changed, 0)
+        eq(store.get_vm("vm-2")["state"], vst.S_FAILED, "retry, not unskip, requeues a failure")
+        store.close()
+
+
+class _Console:
+    """An in-process web console on a free port, for tests."""
+
+    def __init__(self, tmp, cfg=None, token="t0ken"):
+        from vcfaimport.web.api import WebApp
+        from vcfaimport.web.server import make_server
+        import threading
+        if cfg is None:
+            cfg = Config()
+            # Never let a unit test reach a real cluster through kubectl on PATH.
+            cfg.kubectl = "vcfa-test-no-such-kubectl"
+        if cfg.workdir == "./run":
+            cfg.workdir = os.path.join(tmp, "run")
+        self.app = WebApp(cfg, config_path=None, folder_map=os.path.join(tmp, "folder-map.csv"),
+                          network_map=os.path.join(tmp, "portgroup-map.csv"))
+        self.server = make_server(self.app, "127.0.0.1", 0, token=token)
+        self.base = "http://127.0.0.1:{}".format(self.server.server_address[1])
+        self.token = token
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def call(self, method, path, body=None, token=None, headers=None, raw=False):
+        import urllib.error
+        import urllib.request
+        h = {"Content-Type": "application/json"}
+        if token is not False:
+            h["X-VCFA-Token"] = token or self.token
+        h.update(headers or {})
+        req = urllib.request.Request(self.base + path, method=method, headers=h,
+                                     data=json.dumps(body).encode() if body is not None else None)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+                return resp.status, (data if raw else json.loads(data)), dict(resp.headers)
+        except urllib.error.HTTPError as exc:
+            data = exc.read()
+            try:
+                return exc.code, json.loads(data), dict(exc.headers)
+            except ValueError:
+                return exc.code, data, dict(exc.headers)
+
+    def ok(self, method, path, body=None):
+        status, data, _ = self.call(method, path, body)
+        assert status == 200, "{} {} -> {}: {}".format(method, path, status, data)
+        return data
+
+    def wait(self, job, timeout=240):
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            snap = self.ok("GET", "/api/jobs/" + job["id"])
+            if snap["status"] != "running":
+                return snap
+            time.sleep(0.3)
+        raise AssertionError("job {} did not finish".format(job["id"]))
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.app.close()
+
+
+@test("web console: token, Host check, static assets and the confirm guard")
+def t_web_security():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            status, body, headers = c.call("GET", "/", token=False, raw=True)
+            eq(status, 200)
+            assert b"core.js" in body and "script-src 'self'" in headers["Content-Security-Policy"]
+            eq(c.call("GET", "/static/app.css", token=False, raw=True)[0], 200)
+            eq(c.call("GET", "/static/..%2Fapi.py", token=False, raw=True)[0], 404)
+            eq(c.call("GET", "/api/info", token=False)[0], 401, "no token")
+            eq(c.call("GET", "/api/info", token="wrong")[0], 401, "wrong token")
+            eq(c.call("GET", "/api/info", headers={"Host": "evil.example:80"})[0], 403,
+               "DNS rebinding: a foreign Host is refused on loopback")
+            info = c.ok("GET", "/api/info")
+            eq(info["settings"]["commit_action"], "Auto")
+            # Downloads cannot send a header, so exports alone accept ?t=
+            eq(c.call("GET", "/api/export/tracker.csv?t=" + c.token, token=False, raw=True)[0], 200)
+            eq(c.call("GET", "/api/overview?t=" + c.token, token=False)[0], 401)
+            status, body, _ = c.call("POST", "/api/run/execute", {"stage": "import"})
+            eq(status, 400)
+            assert "confirm" in body["error"], body
+            eq(c.call("POST", "/api/run/rollback", {"failed": True})[0], 400)
+            eq(c.call("POST", "/api/vms/wave", {"morefs": ["vm-1"], "wave": 0})[0], 400)
+            eq(c.call("GET", "/api/nope")[0], 404)
+        finally:
+            c.close()
+
+
+@test("web jobs: one at a time, logged to disk, reloaded after a restart")
+def t_web_jobs():
+    import threading
+    from vcfaimport.web.jobs import FAILED, JobBusy, JobManager, STOPPED, SUCCEEDED
+    with tempfile.TemporaryDirectory() as tmp:
+        jm = JobManager(Path(tmp))
+        gate = threading.Event()
+
+        def slow(job):
+            job.log("first\nsecond")
+            stop = threading.Event()
+            job.on_stop(stop.set)
+            gate.wait(10)
+            stop.wait(10)
+            return {"n": 1}
+
+        job = jm.start("x", "Slow job", {}, slow)
+        try:
+            jm.start("y", "Another", {}, lambda j: {})
+        except JobBusy:
+            pass
+        else:
+            raise AssertionError("a second job must wait for the first")
+        gate.set()
+        import time
+        for _ in range(100):
+            if job.stoppable:
+                break
+            time.sleep(0.05)
+        assert job.request_stop()
+        for _ in range(100):
+            if job.status != "running":
+                break
+            time.sleep(0.05)
+        eq(job.status, STOPPED)
+        eq([line[2] for line in job.snapshot()["log"]], ["first", "second"])
+        eq(job.snapshot(since=1)["log"][0][2], "second", "incremental reads")
+
+        boom = jm.start("z", "Broken", {}, lambda j: 1 / 0)
+        for _ in range(100):
+            if boom.status != "running":
+                break
+            time.sleep(0.05)
+        eq(boom.status, FAILED)
+        assert "division" in boom.error
+
+        again = JobManager(Path(tmp))
+        eq({j["id"] for j in again.list()}, {job.id, boom.id})
+        eq(again.get(job.id).snapshot()["log"][1][2], "second")
+        eq(again.get(job.id).status, STOPPED)
+        eq(SUCCEEDED, "succeeded")
+
+
+@test("e2e web: discover, select, stage, arrange, precheck, import, triage, roll back, retry")
+def t_e2e_web_campaign():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    server, port = fake_vcenter.serve(count=40)
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ.update(_e2e_env(tmp, "import-flaky", settle="1"))
+            os.environ.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                              VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            _seed_cluster(tmp, ["ns-web", "ns-db"], ["ns-web/sub-prod", "ns-db/sub-prod"])
+            cfg = Config.load(_write_config(tmp, failure_rate_abort=0.9))
+            c = _Console(tmp, cfg)
+            try:
+                job = c.ok("POST", "/api/run/discover", {})["job"]
+                snap = c.wait(job)
+                eq(snap["status"], "succeeded", snap.get("error"))
+                eq(snap["result"]["discovered"], 40)
+                assert all(line[2] != fake_vcenter.PASSWORD for line in snap["log"])
+
+                vms = c.ok("GET", "/api/discovered")["vms"]
+                picked = [v["moref"] for v in vms if v["folder"].startswith(("Production", "Databases"))]
+                c.ok("POST", "/api/select", {"morefs": picked, "selected": True})
+
+                # Maps edited in the browser: preview with unsaved rows, then stage (saves them).
+                folder_rows = [{"folder": "Production", "namespace": "ns-web", "wave": "1"},
+                               {"folder": "Databases", "namespace": "ns-db", "wave": "2"}]
+                network_rows = [{"portgroup": "VLAN*", "subnet": "sub-prod"},
+                                {"portgroup": "DMZ-Uplink", "subnet": "sub-prod"}]
+                body = {"folder_rows": folder_rows, "network_rows": network_rows}
+                preview = c.ok("POST", "/api/stage/preview", body)
+                eq(len(preview["records"]), len(picked))
+                eq(preview["problems"], [])
+                staged = c.ok("POST", "/api/stage", dict(body, save_maps=True))
+                eq(staged["added"], len(picked))
+                assert Path(tmp, "folder-map.csv").is_file(), "staging saved the maps"
+                eq(len(c.ok("GET", "/api/maps")["folder"]["rows"]), 2)
+
+                queue = c.ok("GET", "/api/vms")["vms"]
+                db = [v["moref"] for v in queue if v["wave"] == 2]
+                eq(c.ok("POST", "/api/waves/swap", {"a": 1, "b": 2}), {"swapped": True})
+                eq({v["wave"] for v in c.ok("GET", "/api/vms")["vms"] if v["moref"] in db}, {1},
+                   "Databases now runs first")
+
+                eq(c.wait(c.ok("POST", "/api/run/preflight", {})["job"])["result"]["ok"], True)
+                plan = c.ok("POST", "/api/execute/preview", {"stage": "precheck", "waves": [1]})
+                eq(plan["total"], len(db))
+                pre = c.wait(c.ok("POST", "/api/run/execute",
+                                  {"stage": "precheck", "confirm": True})["job"])
+                eq(pre["status"], "succeeded")
+                eq(pre["result"]["succeeded"], len(picked))
+
+                imp = c.wait(c.ok("POST", "/api/run/execute",
+                                  {"stage": "import", "confirm": True})["job"])
+                eq(imp["status"], "warning", "import-flaky fails some VMs")
+                failed = imp["result"]["failed"]
+                assert failed > 0
+
+                tri = c.ok("GET", "/api/triage")
+                eq(sum(g["count"] for g in tri["groups"]), failed)
+                eq(tri["groups"][0]["issue"]["id"], "tools")
+
+                rb = c.ok("POST", "/api/rollback/preview", {"failed": True})
+                eq(rb["revert"], failed)
+                done = c.wait(c.ok("POST", "/api/run/rollback",
+                                   {"failed": True, "delete": True, "confirm": True})["job"])
+                eq(done["result"]["reverted"], failed)
+                eq(done["result"]["errors"], [])
+
+                again = c.ok("POST", "/api/vms/retry", {})
+                eq(again["requeued"], failed)
+                counts = c.ok("GET", "/api/overview")["counts"]
+                eq(counts.get("pending"), failed)
+                eq(counts.get("committed"), len(picked) - failed)
+
+                detail = c.ok("GET", "/api/vms/" + queue[0]["moref"])
+                assert len(detail["transitions"]) >= 4
+                batches = c.ok("GET", "/api/batches")["batches"]
+                assert any(b["state"] == "deleted" for b in batches)
+                kinds = [j["kind"] for j in c.ok("GET", "/api/jobs")["jobs"]]
+                eq(kinds, ["rollback", "execute", "execute", "preflight", "discover"])
+                assert list(Path(cfg.workdir, "jobs").glob("*-execute.log")), "job logs on disk"
+            finally:
+                c.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+
+
+@test("e2e web: Stop applies nothing new and leaves nothing half-tracked")
+def t_e2e_web_stop():
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ.update(_e2e_env(tmp, "happy", settle="2"))
+            _seed_cluster(tmp, ["ns-a", "ns-b"], ["ns-a/sub-ns-a", "ns-b/sub-ns-b"])
+            cfg = Config.load(_write_config(tmp, batch_size=2, max_parallel_batches=1))
+            _run_cli(["-c", str(Path(tmp, "cfg.toml")), "load", "-i", _inventory(tmp, 12, waves=(1,))],
+                     dict(os.environ), tmp)
+            c = _Console(tmp, cfg)
+            try:
+                job = c.ok("POST", "/api/run/execute", {"stage": "precheck", "confirm": True})["job"]
+                import time
+                for _ in range(100):
+                    snap = c.ok("GET", "/api/jobs/" + job["id"])
+                    if snap["stoppable"] and any("applying" in l[2] for l in snap["log"]):
+                        break
+                    time.sleep(0.1)
+                eq(c.call("POST", "/api/run/refresh", {})[0], 409, "one job at a time")
+                c.ok("POST", "/api/jobs/{}/stop".format(job["id"]))
+                snap = c.wait(job)
+                eq(snap["status"], "stopped")
+                counts = c.ok("GET", "/api/overview")["counts"]
+                eq(counts.get("precheck_running", 0), 0, "in-flight batches were finished")
+                assert counts.get("pending", 0) > 0, "and nothing new was applied: {}".format(counts)
+            finally:
+                c.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+# ============================================================= stress: HTTP
+def _raw_http(port, payload, timeout=3.0):
+    """Send raw bytes, return every HTTP status code that comes back."""
+    import re as _re
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    s.sendall(payload)
+    data = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, ConnectionResetError, ConnectionAbortedError):
+        pass
+    finally:
+        s.close()
+    return [int(c) for c in _re.findall(r"HTTP/1\.[01] (\d{3})", data.decode("latin-1"))]
+
+
+@test("stress/http: a rejected request's body is never parsed as the next request")
+def t_http_keepalive_desync():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            port = c.server.server_address[1]
+            smuggled = b"GET /api/info HTTP/1.1\r\nHost: 127.0.0.1\r\nX-VCFA-Token: t0ken\r\n\r\n"
+            for prefix in (b"POST /api/select", b"POST /api/nowhere", b"PUT /api/maps",
+                           b"GET /api/vms"):
+                req = (prefix + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                       b"Content-Length: %d\r\n\r\n" % len(smuggled)) + smuggled
+                req += b"GET /api/pulse HTTP/1.1\r\nHost: 127.0.0.1\r\nX-VCFA-Token: t0ken\r\n\r\n"
+                codes = _raw_http(port, req)
+                eq(len(codes), 2, "{}: one response per real request, got {}".format(prefix, codes))
+                eq(codes[1], 200, prefix.decode())
+        finally:
+            c.close()
+
+
+@test("stress/http: oversized, malformed and chunked bodies are refused cleanly")
+def t_http_body_limits():
+    from vcfaimport.web.server import MAX_BODY
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            port = c.server.server_address[1]
+            head = b"POST /api/select HTTP/1.1\r\nHost: 127.0.0.1\r\nX-VCFA-Token: t0ken\r\n"
+            eq(_raw_http(port, head + b"Content-Length: %d\r\n\r\n{}" % (MAX_BODY + 1)), [413])
+            eq(_raw_http(port, head + b"Content-Length: banana\r\n\r\n"), [400])
+            eq(_raw_http(port, head + b"Content-Length: -5\r\n\r\n"), [400])
+            eq(_raw_http(port, head + b"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"), [400])
+            for body in (b"[1,2]", b'"text"', b"{not json", b"\xff\xfe\x00", b"null", b"42"):
+                codes = _raw_http(port, head + b"Content-Length: %d\r\n\r\n" % len(body) + body)
+                eq(codes, [400], repr(body))
+            eq(c.call("GET", "/api/pulse")[0], 200, "still healthy afterwards")
+        finally:
+            c.close()
+
+
+@test("stress/http: every route survives a matrix of hostile inputs without a 500")
+def t_http_fuzz():
+    import time as _t
+    from vcfaimport.web.api import ROUTES
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            _seed_store_with_vms(c.app.store, 30)
+            bodies = [
+                {}, {"morefs": 5}, {"morefs": "vm-1,vm-2"}, {"morefs": [None, 3, {"x": 1}]},
+                {"morefs": ["vm-%d" % i for i in range(5000)]}, {"wave": "x"}, {"wave": -3},
+                {"wave": 10 ** 12}, {"wave": 1.5}, {"waves": "1,x"}, {"waves": [None]},
+                {"stage": "bogus"}, {"stage": None}, {"a": "1", "b": 1}, {"a": 0, "b": 0},
+                {"selected": "yes", "morefs": ["vm-1"]}, {"namespace": ["list"]},
+                {"folder_rows": "nope"}, {"folder_rows": [{"folder": "X", "wave": "soon"}]},
+                {"network_rows": [None]}, {"folder_rows": [[1, 2]]},
+                {"default_wave": "zero"}, {"batches": 7}, {"folders": [["nested"]]},
+                {"limit": "-1", "stage": "precheck", "confirm": True},
+                {"batch_size": 0, "stage": "import", "confirm": True},
+                {"interval": "fast"}, {"server": "x" * 5000, "user": "u", "password": "p",
+                                      "timeout": 5},
+                {"‮": "\U0001F4A5", "morefs": ["\u0000", "'; DROP TABLE vms; --"]},
+                {"nested": {"deep": [[[[[[[[[[{}]]]]]]]]]]}},
+            ]
+            paths = {
+                "POST": [r.pattern.strip("^$") for m, r, _ in ROUTES if m == "POST"],
+                "PUT": ["/api/maps"],
+            }
+            fives = []
+            for method, plist in paths.items():
+                for raw_path in plist:
+                    path = (raw_path.replace("(?P<job_id>[\\w.-]+)", "nope")
+                            .replace("(?P<kind>discover|preflight|execute|refresh|watch|commit|"
+                                     "rollback|abandon|cleanup)", "{kind}"))
+                    kinds = ["discover", "preflight", "execute", "refresh", "watch", "commit",
+                             "rollback", "abandon", "cleanup"] if "{kind}" in path else [None]
+                    for kind in kinds:
+                        p = path.replace("{kind}", kind or "")
+                        for body in bodies:
+                            status, data, _ = c.call(method, p, body)
+                            if status >= 500:
+                                fives.append((method, p, body, data))
+                            # a job that did start must not block the rest of the matrix
+                            active = c.app.jobs.active
+                            if active is not None:
+                                active.request_stop()
+                                for _ in range(200):
+                                    if c.app.jobs.active is None:
+                                        break
+                                    _t.sleep(0.05)
+            for bad in [["GET", "/api/vms/%00"], ["GET", "/api/vms/" + "x" * 3000],
+                        ["GET", "/api/batches/a/b"], ["GET", "/api/jobs/..%2F..%2Fstate.db"],
+                        ["GET", "/api/events?limit=abc"], ["GET", "/api/events?limit=-4"],
+                        ["GET", "/api/transitions?limit=99999999999"], ["DELETE", "/api/vms"],
+                        ["GET", "/api/export/state.db?t=t0ken"]]:
+                status, data, _ = c.call(bad[0], bad[1])
+                if status >= 500 and status != 501:
+                    fives.append((bad, data))
+            assert not fives, "server errors:\n" + "\n".join(repr(f)[:300] for f in fives[:10])
+            eq(c.call("GET", "/api/pulse")[0], 200)
+            # Valid-but-odd requests (a 5000-moref skip) may legitimately change states;
+            # what must hold is that nothing was lost, duplicated or corrupted.
+            eq(sum(c.app.store.counts().values()), 30, "no VM lost or duplicated")
+            eq(c.app.store.conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            for line in Path(c.app.store.ledger_path).read_text(encoding="utf-8").splitlines():
+                json.loads(line)
+        finally:
+            c.close()
+
+
+def _seed_store_with_vms(store, count, waves=(1, 2), folders=("Prod/Web", "Prod/DB", "DMZ")):
+    """Discovered + queued VMs straight into a store, for API tests that need data."""
+    from vcfaimport.inventory import Nic, VmRecord
+    disc, recs = [], []
+    for i in range(count):
+        moref = "vm-{}".format(1000 + i)
+        folder = folders[i % len(folders)]
+        disc.append({"moref": moref, "name": "vm{:04d}".format(i), "power_state": "POWERED_ON",
+                     "folder": folder, "datacenter": "DC1", "cluster": "CL1",
+                     "tools_status": "RUNNING",
+                     "nics": [{"device_key": 4000, "network_name": "VLAN1"}]})
+        recs.append(VmRecord(moref=moref, vm_name="vm{:04d}".format(i), namespace="ns-a",
+                             nics=[Nic(4000, "sub-a", "Subnet", "crd.nsx.vmware.com")],
+                             wave=waves[i % len(waves)], group=folder.replace("/", "-").lower()))
+    store.upsert_discovered(disc)
+    store.set_selected([d["moref"] for d in disc], True)
+    store.sync_inventory(recs)
+    for d in disc:
+        store._provenance_from_discovery(d["moref"])
+    store.conn.commit()
+
+
+@test("stress/http: Host header variants (DNS rebinding) and static path traversal")
+def t_http_host_and_paths():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            port = c.server.server_address[1]
+            good = ["127.0.0.1", "127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port,
+                    "LOCALHOST"]
+            bad = ["evil.example", "127.0.0.1.evil.example", "localhost.evil:80", "10.0.0.5",
+                   "[fe80::1]:80", "127.0.0.1@evil.example"]
+            for host in good:
+                eq(c.call("GET", "/api/pulse", headers={"Host": host})[0], 200, host)
+            for host in bad:
+                eq(c.call("GET", "/api/pulse", headers={"Host": host})[0], 403, host)
+            for path in ["/static/../api.py", "/static/%2e%2e/api.py", "/static/..%5Capi.py",
+                         "/static/.hidden", "/static/sub/app.css", "/static/", "/static/app.css/",
+                         "/static/core.js%00.css", "/static//etc/passwd", "/../vcfaimport/cli.py",
+                         "/static/__init__.py", "/static/api.py"]:
+                status, body, _ = c.call("GET", path, token=False, raw=True)
+                eq(status, 404, path)
+                assert b"def " not in body, path
+        finally:
+            c.close()
+
+
+@test("stress/http: bound to 0.0.0.0 the Host check relaxes but the token does not")
+def t_http_non_loopback():
+    from vcfaimport.web.api import WebApp
+    from vcfaimport.web.server import make_server
+    import threading
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config()
+        cfg.workdir = os.path.join(tmp, "run")
+        app = WebApp(cfg)
+        srv = make_server(app, "0.0.0.0", 0, token="abc")
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            ok = _raw_http(port, b"GET /api/pulse HTTP/1.1\r\nHost: jumpbox.corp:%d\r\n"
+                                 b"X-VCFA-Token: abc\r\nConnection: close\r\n\r\n" % port)
+            eq(ok, [200])
+            eq(_raw_http(port, b"GET /api/pulse HTTP/1.1\r\nHost: jumpbox.corp\r\n"
+                               b"Connection: close\r\n\r\n"), [401])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            app.close()
+
+
+@test("stress/concurrency: 24 threads editing and reading at once -- no errors, no lost writes")
+def t_http_concurrent_edits():
+    import threading
+    import time as _t
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            _seed_store_with_vms(c.app.store, 480)
+            c.ok("POST", "/api/select/clear")
+            morefs = ["vm-{}".format(1000 + i) for i in range(480)]
+            errors, latencies = [], []
+            lock = threading.Lock()
+
+            def writer(k):
+                mine = morefs[k * 40:(k + 1) * 40]
+                for i in range(0, 40, 4):
+                    chunk = mine[i:i + 4]
+                    for path, body in (("/api/select", {"morefs": chunk, "selected": True}),
+                                       ("/api/vms/wave", {"morefs": chunk, "wave": 3 + k % 3})):
+                        t0 = _t.time()
+                        status, data, _ = c.call("POST", path, body)
+                        with lock:
+                            latencies.append(_t.time() - t0)
+                            if status != 200:
+                                errors.append((path, status, data))
+
+            def reader(k):
+                for i in range(15):
+                    for path in ("/api/pulse", "/api/overview", "/api/vms", "/api/discovered",
+                                 "/api/triage", "/api/batches"):
+                        t0 = _t.time()
+                        status, data, _ = c.call("GET", path)
+                        with lock:
+                            latencies.append(_t.time() - t0)
+                            if status != 200:
+                                errors.append((path, status, data))
+
+            threads = [threading.Thread(target=writer, args=(k,)) for k in range(12)]
+            threads += [threading.Thread(target=reader, args=(k,)) for k in range(12)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(120)
+            assert not errors, errors[:5]
+            eq(c.app.store.discovered_counts()["selected"], 480, "every select landed")
+            waves = c.app.store.state_matrix("wave")
+            eq(sum(sum(v.values()) for w, v in waves.items() if w >= 3), 480, "every move landed")
+            latencies.sort()
+            p95 = latencies[int(len(latencies) * 0.95)]
+            assert p95 < 5.0, "p95 latency {:.2f}s under contention".format(p95)
+        finally:
+            c.close()
+
+
+# ============================================================ stress: locks & jobs
+@test("stress/lock: one cluster-changing operation per workspace, across processes")
+def t_workspace_lock():
+    from vcfaimport import service
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config()
+        cfg.workdir = tmp
+        first = service.WorkspaceLock(cfg, "import wave 1").acquire()
+        try:
+            service.WorkspaceLock(cfg, "rollback").acquire()
+        except service.WorkspaceBusy as exc:
+            assert "import wave 1" in str(exc) and "pid" in str(exc), exc
+        else:
+            raise AssertionError("a second holder must be refused")
+        first.release()
+        service.WorkspaceLock(cfg, "again").acquire().release()
+
+        # A holder that dies without releasing must not wedge the workspace.
+        code = ("import sys, os; sys.path.insert(0, {root!r}); "
+                "from vcfaimport import service; from vcfaimport.config import Config; "
+                "c = Config(); c.workdir = {tmp!r}; service.WorkspaceLock(c, 'doomed').acquire(); "
+                "print('held', flush=True); os._exit(9)").format(root=str(ROOT), tmp=tmp)
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        eq(proc.stdout.strip(), "held")
+        eq(proc.returncode, 9)
+        service.WorkspaceLock(cfg, "after a crash").acquire().release()
+
+
+@test("stress/lock: a held workspace turns console jobs away with 409, not a failed job")
+def t_web_lock_conflict():
+    from vcfaimport import service
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            held = service.WorkspaceLock(c.app.cfg, "`import` from the CLI").acquire()
+            try:
+                for kind, body in (("rollback", {"failed": True, "confirm": True}),
+                                   ("commit", {"confirm": True}), ("refresh", {}), ("watch", {}),
+                                   ("cleanup", {"confirm": True}),
+                                   ("execute", {"stage": "precheck", "confirm": True})):
+                    status, data, _ = c.call("POST", "/api/run/" + kind, body)
+                    eq(status, 409, kind)
+                    assert "from the CLI" in data["error"], data
+                eq(c.ok("GET", "/api/jobs")["jobs"], [], "nothing was started")
+                # A dry run applies nothing, so it does not need (or wait for) the lock.
+                job = c.ok("POST", "/api/run/execute",
+                           {"stage": "precheck", "dry_run": True, "confirm": True})["job"]
+                eq(c.wait(job)["status"], "succeeded")
+            finally:
+                held.release()
+            job = c.ok("POST", "/api/run/refresh", {})["job"]
+            eq(c.wait(job)["status"], "succeeded")
+            job = c.ok("POST", "/api/run/refresh", {})["job"]
+            eq(c.wait(job)["status"], "succeeded", "the job released the lock when it ended")
+        finally:
+            c.close()
+
+
+@test("stress/jobs: Stop works from the first instant, and crashes release everything")
+def t_jobs_edge_cases():
+    import threading
+    import time as _t
+    from vcfaimport import service
+    from vcfaimport.web.jobs import FAILED, MAX_LINES_IN_MEMORY, JobManager, STOPPED
+    with tempfile.TemporaryDirectory() as tmp:
+        jm = JobManager(Path(tmp, "jobs"))
+        registered = threading.Event()
+        stopped = threading.Event()
+
+        def late(job):
+            _t.sleep(0.4)                       # Stop arrives before the handler exists
+            job.on_stop(stopped.set)
+            registered.set()
+            stopped.wait(10)
+            return {}
+
+        job = jm.start("x", "late", {}, late, stoppable=True)
+        assert job.request_stop(), "stoppable jobs accept Stop immediately"
+        assert stopped.wait(5), "the late handler fired on registration"
+        for _ in range(100):
+            if job.status != "running":
+                break
+            _t.sleep(0.05)
+        eq(job.status, STOPPED)
+
+        # Not stoppable: refused, not silently accepted.
+        gate = threading.Event()
+        j2 = jm.start("y", "busy", {}, lambda j: gate.wait(10) and {})
+        assert not j2.request_stop()
+        gate.set()
+        for _ in range(100):
+            if j2.status != "running":
+                break
+            _t.sleep(0.05)
+
+        # A crash inside a locked job releases the workspace lock.
+        cfg = Config()
+        cfg.workdir = tmp
+        j3 = jm.start("z", "crash", {}, lambda j: [][1], lock=service.WorkspaceLock(cfg, "crash"))
+        for _ in range(100):
+            if j3.status != "running":
+                break
+            _t.sleep(0.05)
+        eq(j3.status, FAILED)
+        assert "IndexError" in "\n".join(l[2] for l in j3.snapshot()["log"])
+        service.WorkspaceLock(cfg, "after").acquire().release()
+
+        # Very chatty jobs: memory is capped, reads past the window still work.
+        def chatty(job):
+            for i in range(MAX_LINES_IN_MEMORY + 5000):
+                job.log("line {}".format(i))
+            return {}
+        j4 = jm.start("w", "chatty", {}, chatty)
+        for _ in range(400):
+            if j4.status != "running":
+                break
+            _t.sleep(0.05)
+        snap = j4.snapshot(since=0, limit=10)
+        eq(snap["log"][0][2], "line 5000", "oldest lines dropped from memory")
+        eq(j4.line_count, MAX_LINES_IN_MEMORY + 5000)
+        eq(j4.snapshot(since=10 ** 9)["log"], [])
+        eq(len(Path(tmp, "jobs", j4.id + ".log").read_text().splitlines()),
+           MAX_LINES_IN_MEMORY + 5000, "but the file keeps everything")
+
+        # Corrupt history files are skipped, not fatal.
+        Path(tmp, "jobs", "garbage.json").write_text("{not json", encoding="utf-8")
+        Path(tmp, "jobs", "noid.json").write_text("{}", encoding="utf-8")
+        again = JobManager(Path(tmp, "jobs"))
+        assert j4.id in {j["id"] for j in again.list()}
+
+
+# ============================================================ stress: data edges
+@test("stress/data: map editing -- JSON types, globs, unicode, duplicates, failed saves")
+def t_web_map_edges():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            rows = [{"folder": "Prod", "namespace": "ns-a", "wave": 2, "group": None, "extra": "x"},
+                    {"folder": "Légacy/Ünïcode ✓", "namespace": "ns-ü", "wave": "3.0"},
+                    {"folder": "Legacy/*", "namespace": "ns-g", "wave": ""},
+                    {"folder": "Prod", "namespace": "ns-dup", "wave": 1}]
+            got = c.ok("PUT", "/api/maps", {"folder_rows": rows, "network_rows": [
+                {"portgroup": "VLAN*", "subnet": "s", "device_key": 4001}]})
+            eq([r["folder"] for r in got["folder"]["rows"]],
+               ["Prod", "Légacy/Ünïcode ✓", "Legacy/*", "Prod"])
+            before = Path(tmp, "folder-map.csv").read_bytes()
+            status, data, _ = c.call("PUT", "/api/maps", {"folder_rows": [
+                {"folder": "X", "namespace": "n", "wave": "tomorrow"}]})
+            eq(status, 400)
+            assert "wave" in data["error"]
+            eq(Path(tmp, "folder-map.csv").read_bytes(), before, "a rejected save changes nothing")
+            from vcfaimport.discovery import load_folder_map
+            eq(load_folder_map(os.path.join(tmp, "folder-map.csv"))["Prod"].namespace, "ns-dup",
+               "a duplicate key: the last row wins, as in the CLI")
+            assert not list(Path(tmp).glob("*.tmp")), "no temp files left behind"
+        finally:
+            c.close()
+
+
+@test("stress/data: staging edge cases -- no selection, no namespace, locked VMs, defaults")
+def t_web_stage_edges():
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            eq(c.ok("POST", "/api/stage/preview", {})["selected"], 0)
+            eq(c.call("POST", "/api/stage", {})[0], 400, "nothing selected")
+
+            _seed_store_with_vms(c.app.store, 9)
+            c.app.store.set_vm_state("vm-1000", vst.S_IMPORTING, stage="import")
+            p = c.ok("POST", "/api/stage/preview", {})
+            eq(len(p["problems"]), 9, "no maps, no default: nothing is guessed")
+            eq(c.call("POST", "/api/stage", {})[0], 400)
+
+            body = {"folder_rows": [{"folder": "Prod", "namespace": "ns-new", "wave": "5"}],
+                    "default_namespace": "ns-default", "default_wave": 2}
+            p = c.ok("POST", "/api/stage/preview", body)
+            eq(p["problems"], [])
+            nss = {r["moref"]: (r["namespace"], r["wave"]) for r in p["records"]}
+            eq(nss["vm-1002"], ("ns-default", 2), "DMZ falls back to the default")
+            eq(nss["vm-1001"], ("ns-new", 5))
+            assert [r for r in p["records"] if r["moref"] == "vm-1000"][0]["locked"]
+
+            r = c.ok("POST", "/api/stage", body)
+            assert any("vm-1000" in x for x in r["conflicts"]), r
+            vm = c.app.store.get_vm("vm-1000")
+            eq((vm["namespace"], vm["state"]), ("ns-a", "importing"), "in flight: untouched")
+            eq(c.app.store.get_vm("vm-1003")["namespace"], "ns-new", "pending: updated")
+            eq(c.call("POST", "/api/stage/preview", {"default_wave": 0})[0], 400)
+        finally:
+            c.close()
+
+
+@test("stress/data: hostile VM names and messages round-trip intact and are escaped in reports")
+def t_web_hostile_names():
+    from vcfaimport import state as vst
+    evil = ['<img src=x onerror="alert(1)">', "Robert'); DROP TABLE vms;--", "名前 ✓ ‮evil",
+            "a\"b'c`d", "x" * 400, "tab\there", "</script><script>alert(2)</script>"]
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            store = c.app.store
+            store.upsert_discovered([{"moref": "vm-{}".format(i), "name": n,
+                                      "folder": "F/" + n[:20], "networks": n[:10]}
+                                     for i, n in enumerate(evil)])
+            got = {v["moref"]: v for v in c.ok("GET", "/api/discovered")["vms"]}
+            for i, n in enumerate(evil):
+                eq(got["vm-{}".format(i)]["name"], n)
+            store.set_selected(list(got), True)
+            p = c.ok("POST", "/api/stage/preview", {"default_namespace": "ns"})
+            eq(len(p["records"]), len(evil))
+            c.ok("POST", "/api/stage", {"default_namespace": "ns"})
+            store.set_vm_state("vm-0", vst.S_FAILED, message=evil[0] + evil[6], stage="import")
+            tri = c.ok("GET", "/api/triage")
+            eq(tri["groups"][0]["message"], evil[0] + evil[6])
+            status, report_html, _ = c.call("GET", "/api/export/report.html?t=t0ken", raw=True)
+            eq(status, 200)
+            assert b"<script>alert(2)" not in report_html and b'<img src=x' not in report_html
+            status, csv_bytes, _ = c.call("GET", "/api/export/tracker.csv?t=t0ken", raw=True)
+            assert evil[1].encode() in csv_bytes
+            eq(len(c.ok("GET", "/api/vms")["vms"]), len(evil))
+            eq(c.ok("GET", "/api/vms/vm-0")["vm"]["vm_name"], evil[0])
+        finally:
+            c.close()
+
+
+@test("stress/data: triage normalisation groups by cause, not by VM detail")
+def t_triage_normalisation():
+    from vcfaimport.service import classify_failure, normalise_message
+    same = [
+        'failed to create op "web-001-1483400": vm-1483400 is locked by task-99812',
+        'failed to create op "db-777-1483999": vm-1483999 is locked by task-1',
+    ]
+    eq(normalise_message(same[0]), normalise_message(same[1]))
+    assert normalise_message("VM Tools not running") != normalise_message("disk full")
+    eq(normalise_message(None), "(no message)")
+    eq(normalise_message("   "), "(no message)")
+    assert len(normalise_message("x" * 10000)) <= 240
+    eq(normalise_message("id 6f1c2a9e-1b2c-4d5e-8f90-123456789abc gone"),
+       normalise_message("id 0a0b0c0d-1111-2222-3333-444455556666 gone"))
+    # Found by the stress run: one kubectl outage split into a group per namespace/batch.
+    eq(normalise_message("batch apply failed: kubectl apply -n ns-a failed (exit 127)"),
+       normalise_message("batch apply failed: kubectl apply -n prod-db-ns2 failed (exit 127)"))
+    eq(normalise_message("batch pre-w1-sub-ns-a-001-3cbaa disappeared from the cluster"),
+       normalise_message("batch imp-w12-databases-web-004-9d2c4 disappeared from the cluster"))
+    for msg, issue in [
+        ("lookup vc.lab on 127.0.0.53:53: read udp: i/o timeout", "dns"),
+        ("VM Tools not running", "tools"), ("guest toolsNotRunning", "tools"),
+        ("number of operations from status: 0 does not match number of operations from spec: 2",
+         "collision"),
+        ("ROLLBACK FAILED: vm locked", "rollback"),
+        ("batch apply failed: forbidden", "apply"),
+        ("batch x disappeared from the cluster during refresh", "vanished"),
+        ("batch exceeded batch_timeout_minutes=90", "timeout"),
+        ("subnet sub-a not found", "subnet"),
+    ]:
+        eq((classify_failure(msg) or {}).get("id"), issue, msg)
+    eq(classify_failure(""), None)
+    eq(classify_failure(None), None)
+
+
+@test("stress/data: lookups of things that do not exist")
+def t_web_missing_things():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            eq(c.call("GET", "/api/vms/vm-404")[0], 404)
+            eq(c.call("GET", "/api/vms/vm%2F..%2F1")[0], 404)
+            eq(c.call("GET", "/api/batches/ns/none")[0], 404)
+            eq(c.call("GET", "/api/jobs/20260101-000000-001-x")[0], 404)
+            eq(c.call("POST", "/api/jobs/nope/stop")[0], 404)
+            for name in ("tracker.csv", "transitions.csv", "ledger.jsonl", "report.html"):
+                eq(c.call("GET", "/api/export/%s?t=t0ken" % name, raw=True)[0], 200, name)
+            _seed_store_with_vms(c.app.store, 2)
+            c.app.store.create_batch("b1", "ns-a", "r", 1, "precheck", 2,
+                                     manifest_path=os.path.join(tmp, "gone.yaml"))
+            eq(c.ok("GET", "/api/batches/ns-a/b1")["manifest"], None, "missing manifest file")
+            eq(c.ok("POST", "/api/vms/wave", {"morefs": ["vm-404"], "wave": 2})["moved"], 0)
+            eq(c.ok("POST", "/api/vms/retry", {"morefs": ["vm-404"]})["requeued"], 0)
+            eq(c.ok("POST", "/api/waves/swap", {"a": 7, "b": 8}), {"swapped": True})
+            eq(c.call("POST", "/api/waves/swap", {"a": 1, "b": 1})[0], 400)
+        finally:
+            c.close()
+
+
+# ======================================================= stress: failure e2e
+class _EnvPatch:
+    """Temporarily set os.environ (the fake kubectl reads its scenario from there)."""
+
+    def __init__(self, **values):
+        self.values = values
+        self.saved = None
+
+    def __enter__(self):
+        self.saved = dict(os.environ)
+        os.environ.update({k: str(v) for k, v in self.values.items()})
+        return self
+
+    def __exit__(self, *exc):
+        os.environ.clear()
+        os.environ.update(self.saved)
+
+
+def _cluster(tmp):
+    return json.loads(Path(tmp, "cluster.json").read_text(encoding="utf-8"))
+
+
+def _queue_console(tmp, scenario, count=8, settle="1", namespaces=("ns-a", "ns-b"),
+                   waves=(1,), seed=True, **cfg_overrides):
+    """A console over a workspace whose queue was loaded from an inventory CSV."""
+    env = _e2e_env(tmp, scenario, settle=settle)
+    patch = _EnvPatch(**{k: env[k] for k in ("FAKE_KUBECTL_STATE", "FAKE_KUBECTL_SCENARIO",
+                                              "FAKE_KUBECTL_SETTLE")})
+    patch.__enter__()
+    if seed:
+        _seed_cluster(tmp, list(namespaces), ["{0}/sub-{0}".format(n) for n in namespaces])
+    cfg_path = _write_config(tmp, **cfg_overrides)
+    _run_cli(["-c", cfg_path, "load", "-i", _inventory(tmp, count, namespaces=namespaces,
+                                                       waves=waves)], dict(os.environ), tmp)
+    return _Console(tmp, Config.load(cfg_path)), patch, cfg_path
+
+
+def _run_job(c, kind, body=None, expect_status=None):
+    snap = c.wait(c.ok("POST", "/api/run/" + kind, dict(body or {}))["job"])
+    if expect_status:
+        eq(snap["status"], expect_status, "{}: {}".format(kind, snap.get("error")))
+    return snap
+
+
+@test("stress/e2e: the circuit breaker halts a disastrous wave and says so")
+def t_e2e_web_circuit_breaker():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "disaster", count=12, batch_size=2, max_parallel_batches=1,
+                                   failure_rate_abort=0.5, failure_rate_min_sample=2)
+        try:
+            snap = _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "warning")
+            assert snap["result"]["halted"] and "failure_rate_abort" in snap["result"]["halted"]
+            assert any("RUN HALTED" in l[2] for l in snap["log"])
+            assert _cluster(tmp)["applies"] < 6, "the breaker stopped further batches"
+            counts = c.ok("GET", "/api/overview")["counts"]
+            assert counts.get("pending", 0) > 0, "unapplied VMs stay pending: {}".format(counts)
+            eq(counts.get("precheck_running", 0), 0, "nothing left half-tracked")
+            # After the operator is healthy again, the rest go through.
+            os.environ["FAKE_KUBECTL_SCENARIO"] = "happy"
+            _run_job(c, "execute", {"stage": "precheck", "include_failed": True, "confirm": True},
+                     "succeeded")
+            eq(c.ok("GET", "/api/overview")["counts"], {"precheck_passed": 12})
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: commitAction Wait -- held, refused without confirm, committed on request")
+def t_e2e_web_commit_gate():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "wait", count=4, commit_action="Wait")
+        try:
+            _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "succeeded")
+            _run_job(c, "execute", {"stage": "import", "confirm": True}, "succeeded")
+            eq(c.ok("GET", "/api/overview")["awaiting_commit"], 4)
+            eq(len(c.ok("GET", "/api/triage")["awaiting_commit"]), 4)
+            eq(c.call("POST", "/api/run/commit", {})[0], 400, "commit needs confirm")
+            eq(c.call("POST", "/api/run/commit", {"confirm": "yes"})[0], 400, "exactly true")
+            snap = _run_job(c, "commit", {"confirm": True}, "succeeded")
+            eq(snap["result"]["vms"], 4)
+            for _ in range(6):
+                _run_job(c, "refresh")
+                if c.ok("GET", "/api/overview")["committed"] == 4:
+                    break
+            eq(c.ok("GET", "/api/overview")["counts"], {"committed": 4})
+            # Committed is irreversible: rollback finds nothing to revert.
+            snap = _run_job(c, "rollback", {"failed": True, "confirm": True})
+            eq(snap["result"].get("reverted", 0), 0)
+            eq(c.ok("GET", "/api/overview")["counts"], {"committed": 4})
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: kubectl missing -- preflight fails clearly, a run fails every VM cleanly")
+def t_e2e_web_kubectl_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "happy", count=4, kubectl="vcfa-definitely-not-kubectl")
+        try:
+            snap = _run_job(c, "preflight", {}, "failed")
+            assert "not found" in snap["error"], snap["error"]
+            snap = _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "warning")
+            eq(snap["result"]["failed"], 4)
+            eq(c.ok("GET", "/api/overview")["counts"], {"precheck_failed": 4})
+            tri = c.ok("GET", "/api/triage")["groups"]
+            eq([g["issue"]["id"] for g in tri], ["apply"])
+            eq(c.ok("POST", "/api/vms/retry", {})["requeued"], 4, "and they can be retried")
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: preflight names a missing namespace and a crash-looping operator")
+def t_e2e_web_preflight_problems():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "happy", count=4, seed=False)
+        _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-ns-a"])
+        os.environ["FAKE_KUBECTL_OPERATOR_POD"] = "CrashLoopBackOff"
+        try:
+            snap = _run_job(c, "preflight", {}, "warning")
+            r = snap["result"]
+            eq(r["ok"], False)
+            text = "\n".join(r["problems"])
+            assert "ns-b" in text, text
+            assert "Mobility Operator" in text, text
+            failed_checks = {x["name"] for x in r["checks"] if not x["ok"]}
+            assert "target namespaces exist" in failed_checks, failed_checks
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: vCenter wrong password, unreachable, and missing -- never leaks the password")
+def t_e2e_web_vcenter_failures():
+    import socket
+    import time as _t
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    server, port = fake_vcenter.serve(count=5)
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _EnvPatch():
+            for k in ("VCFA_VC_SERVER", "VCFA_VC_USER", "VCFA_VC_PASSWORD"):
+                os.environ.pop(k, None)
+            c = _Console(tmp)
+            try:
+                url = "http://127.0.0.1:{}".format(port)
+                secret = "Sup3r-S3cret-!"
+                snap = _run_job(c, "discover", {"server": url, "user": fake_vcenter.USER,
+                                                "password": secret}, "failed")
+                assert "401" in snap["error"] or "auth" in snap["error"].lower(), snap["error"]
+                everything = json.dumps(snap) + "".join(
+                    p.read_text(encoding="utf-8") for p in Path(c.app.cfg.workdir, "jobs").glob("*"))
+                assert secret not in everything, "the password leaked into a job record"
+
+                s = socket.socket()
+                s.bind(("127.0.0.1", 0))
+                dead = s.getsockname()[1]
+                s.close()
+                t0 = _t.time()
+                snap = _run_job(c, "discover", {"server": "http://127.0.0.1:{}".format(dead),
+                                                "user": "u", "password": "p", "timeout": 5}, "failed")
+                assert _t.time() - t0 < 30, "an unreachable vCenter fails fast"
+
+                eq(c.call("POST", "/api/run/discover", {"server": url, "user": "u"})[0], 400)
+                eq(c.call("POST", "/api/run/discover", {"password": "p"})[0], 400)
+                eq(c.ok("GET", "/api/discovered")["vms"], [], "failures leave the cache alone")
+            finally:
+                c.close()
+    finally:
+        server.shutdown()
+
+
+@test("stress/e2e: a batch deleted behind the tool's back is caught and triaged")
+def t_e2e_web_vanished_batch():
+    import sqlite3 as sq
+    import time as _t
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, cfg_path = _queue_console(tmp, "happy", count=2, settle="1000",
+                                          namespaces=("ns-a",))
+        try:
+            job = c.ok("POST", "/api/run/execute", {"stage": "precheck", "confirm": True})["job"]
+            for _ in range(200):
+                if _cluster(tmp)["batches"]:
+                    break
+                _t.sleep(0.1)
+            c.ok("POST", "/api/jobs/{}/stop".format(job["id"]))
+            cluster = _cluster(tmp)
+            cluster["batches"] = {}                       # kubectl delete, outside the tool
+            Path(tmp, "cluster.json").write_text(json.dumps(cluster))
+            conn = sq.connect(str(Path(c.app.cfg.workdir, "state.db")))
+            conn.execute("UPDATE batches SET applied_at='2026-01-01T00:00:00Z'")
+            conn.commit()
+            conn.close()
+            c.wait(job)
+            _run_job(c, "refresh", {}, "succeeded")
+            tri = c.ok("GET", "/api/triage")["groups"]
+            eq([g["issue"]["id"] for g in tri], ["vanished"])
+            eq(tri[0]["count"], 2)
+        finally:
+            c.close()
+            env.__exit__()
+
+
+def _spawn_console(tmp, cfg_path, env, token="tok"):
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "vcfa-import.py"), "-c", cfg_path, "serve", "--port", "0",
+         "--token", token], cwd=tmp, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True)
+    for _ in range(200):
+        line = proc.stdout.readline()
+        if "open" in line and "http://" in line:
+            base = line.split("open", 1)[1].split(":", 1)[1].strip().split("/#")[0]
+            return proc, base
+    proc.kill()
+    raise AssertionError("console did not start")
+
+
+def _http(base, method, path, body=None, token="tok"):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(base + path, method=method,
+                                 headers={"X-VCFA-Token": token, "Content-Type": "application/json"},
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+@test("stress/e2e: the console is killed mid-run; a restart resumes with no duplicate batches")
+def t_e2e_web_crash_resume():
+    import time as _t
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "happy", settle="3")
+        _seed_cluster(tmp, ["ns-a", "ns-b"], ["ns-a/sub-ns-a", "ns-b/sub-ns-b"])
+        cfg_path = _write_config(tmp, batch_size=2, max_parallel_batches=2)
+        _run_cli(["-c", cfg_path, "load", "-i", _inventory(tmp, 8, waves=(1,))], env, tmp)
+
+        proc, base = _spawn_console(tmp, cfg_path, env)
+        try:
+            status, r = _http(base, "POST", "/api/run/execute", {"stage": "precheck", "confirm": True})
+            eq(status, 200)
+            job_id = r["job"]["id"]
+            for _ in range(300):
+                if _cluster(tmp)["applies"] >= 1:
+                    break
+                _t.sleep(0.1)
+            _t.sleep(0.5)
+        finally:
+            proc.kill()                        # a crash: no cleanup, no graceful stop
+            proc.wait()
+        applied_before = _cluster(tmp)["applies"]
+        assert applied_before >= 1
+
+        proc, base = _spawn_console(tmp, cfg_path, env)
+        try:
+            jobs = _http(base, "GET", "/api/jobs")[1]["jobs"]
+            eq([j["status"] for j in jobs if j["id"] == job_id], ["stopped"],
+               "the interrupted job is recorded as stopped")
+            ov = _http(base, "GET", "/api/overview")[1]
+            assert ov["in_flight"] > 0 and ov["live_batches"], "batches outlived the console"
+            status, r = _http(base, "POST", "/api/run/watch", {"interval": 1})
+            eq(status, 200, "the crashed holder's lock was released by the OS")
+            for _ in range(300):
+                j = _http(base, "GET", "/api/jobs/" + r["job"]["id"])[1]
+                if j["status"] != "running":
+                    break
+                _t.sleep(0.2)
+            eq(j["status"], "succeeded")
+            eq(_http(base, "GET", "/api/overview")[1]["in_flight"], 0)
+            status, r = _http(base, "POST", "/api/run/execute", {"stage": "precheck", "confirm": True})
+            eq(status, 200)
+            for _ in range(600):
+                j = _http(base, "GET", "/api/jobs/" + r["job"]["id"])[1]
+                if j["status"] != "running":
+                    break
+                _t.sleep(0.2)
+            eq(_http(base, "GET", "/api/overview")[1]["counts"], {"precheck_passed": 8})
+            eq(_cluster(tmp)["applies"], 4, "8 VMs / 2 per batch: nothing applied twice")
+        finally:
+            proc.kill()
+            proc.wait()
+        _run_cli(["-c", cfg_path, "ledger", "--verify"], env, tmp)
+
+
+@test("stress/e2e: CLI and console on one workspace -- a second run is refused, reads work")
+def t_e2e_web_cli_interplay():
+    import time as _t
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, cfg_path = _queue_console(tmp, "happy", count=8, settle="3", batch_size=2,
+                                          max_parallel_batches=1)
+        try:
+            job = c.ok("POST", "/api/run/execute", {"stage": "precheck", "confirm": True})["job"]
+            for _ in range(100):
+                if _cluster(tmp)["applies"]:
+                    break
+                _t.sleep(0.1)
+            out = _run_cli(["-c", cfg_path, "precheck", "-y"], dict(os.environ), tmp, expect=7)
+            assert "web console" in out.stdout, out.stdout
+            _run_cli(["-c", cfg_path, "status"], dict(os.environ), tmp)
+            _run_cli(["-c", cfg_path, "rollback", "--failed", "-y"], dict(os.environ), tmp,
+                     expect=None)
+            eq(c.wait(job)["status"], "succeeded")
+            _run_cli(["-c", cfg_path, "ledger", "--verify"], dict(os.environ), tmp)
+            cli_vms = json.loads(_run_cli(["-c", cfg_path, "vms", "--json"], dict(os.environ),
+                                          tmp).stdout)
+            web_vms = c.ok("GET", "/api/vms")["vms"]
+            eq(sorted((v["moref"], v["state"]) for v in cli_vms),
+               sorted((v["moref"], v["state"]) for v in web_vms), "one truth, two views")
+            eq(_cluster(tmp)["applies"], 4)
+            # And the other way round: a CLI run holds the lock, the console is refused.
+            proc = subprocess.Popen([sys.executable, str(ROOT / "vcfa-import.py"), "-c", cfg_path,
+                                     "run", "-y"], cwd=tmp, env=dict(os.environ),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                for _ in range(200):
+                    if _cluster(tmp)["applies"] > 4:
+                        break
+                    _t.sleep(0.1)
+                status, data, _ = c.call("POST", "/api/run/execute", {"stage": "import", "confirm": True})
+                eq(status, 409)
+                assert "from the CLI" in data["error"], data
+            finally:
+                proc.communicate(timeout=300)
+            eq(proc.returncode, 0)
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: 12 clients hammer the console during a live import -- no errors")
+def t_e2e_web_load_during_run():
+    import threading
+    import time as _t
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "import-flaky", count=40, settle="2", batch_size=4,
+                                   max_parallel_batches=3, failure_rate_abort=0.95)
+        try:
+            _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "succeeded")
+            job = c.ok("POST", "/api/run/execute", {"stage": "import", "confirm": True})["job"]
+            stop = threading.Event()
+            errors, latencies, lock = [], [], threading.Lock()
+            paths = ["/api/pulse", "/api/overview", "/api/vms", "/api/batches", "/api/triage",
+                     "/api/jobs", "/api/jobs/" + job["id"] + "?since=0", "/api/events",
+                     "/api/transitions?limit=200", "/api/discovered"]
+
+            def client(k):
+                i = 0
+                while not stop.is_set():
+                    path = paths[(i + k) % len(paths)]
+                    t0 = _t.time()
+                    try:
+                        status, data, _ = c.call("GET", path)
+                    except Exception as exc:  # noqa: BLE001
+                        status, data = -1, repr(exc)
+                    with lock:
+                        latencies.append(_t.time() - t0)
+                        if status != 200:
+                            errors.append((path, status, str(data)[:200]))
+                    i += 1
+
+            threads = [threading.Thread(target=client, args=(k,)) for k in range(12)]
+            for t in threads:
+                t.start()
+            snap = c.wait(job)
+            stop.set()
+            for t in threads:
+                t.join(30)
+            assert not errors, errors[:5]
+            assert len(latencies) > 200, "the clients were actually busy: {}".format(len(latencies))
+            latencies.sort()
+            p95 = latencies[int(len(latencies) * 0.95)]
+            assert p95 < 3.0, "p95 {:.2f}s".format(p95)
+            eq(snap["status"], "warning")
+            counts = c.ok("GET", "/api/overview")["counts"]
+            eq(counts.get("committed", 0) + counts.get("failed", 0), 40, counts)
+            eq(counts.get("failed"), snap["result"]["failed"])
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: retry ceiling, forced retry, abandon, refused abandon of a live import")
+def t_e2e_web_retry_abandon():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "import-flaky", count=10, max_retries=0,
+                                   failure_rate_abort=0.95)
+        try:
+            _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "succeeded")
+            snap = _run_job(c, "execute", {"stage": "import", "confirm": True}, "warning")
+            failed = snap["result"]["failed"]
+            _run_job(c, "rollback", {"failed": True, "delete": True, "confirm": True}, "succeeded")
+            eq(c.ok("POST", "/api/vms/retry", {})["requeued"], 0, "max_retries=0 holds them back")
+            eq(c.ok("POST", "/api/vms/retry", {"force": True})["requeued"], failed)
+
+            # Abandon: requeued VMs get a fresh precheck, then that batch is discarded.
+            os.environ["FAKE_KUBECTL_SCENARIO"] = "flaky"
+            snap = _run_job(c, "execute", {"stage": "precheck", "confirm": True})
+            pre_failed = [v["moref"] for v in c.ok("GET", "/api/vms")["vms"]
+                          if v["state"] == "precheck_failed"]
+            assert pre_failed, "flaky fails some prechecks"
+            prev = c.ok("POST", "/api/abandon/preview", {"morefs": pre_failed})
+            assert prev["batches"] and all(b["stage"] == "precheck" for b in prev["batches"])
+            _run_job(c, "abandon", {"morefs": pre_failed, "confirm": True}, "succeeded")
+            states = {v["moref"]: v["state"] for v in c.ok("GET", "/api/vms")["vms"]}
+            assert all(states[m] == "pending" for m in pre_failed), states
+
+            # A held import cannot be abandoned: that would strand VM ownership.
+            os.environ["FAKE_KUBECTL_SCENARIO"] = "wait"
+            c.app.cfg.commit_action = "Wait"
+            _run_job(c, "execute", {"stage": "precheck", "confirm": True})
+            _run_job(c, "execute", {"stage": "import", "confirm": True})
+            held = [v["moref"] for v in c.ok("GET", "/api/vms")["vms"] if v["state"] == "awaiting_commit"]
+            assert held
+            prev = c.ok("POST", "/api/abandon/preview", {"morefs": held})
+            eq(prev["batches"], [])
+            assert any("refused" in n for n in prev["notes"]), prev["notes"]
+            snap = _run_job(c, "abandon", {"morefs": held, "confirm": True}, "warning")
+            eq(snap["result"]["deleted"], [])
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/e2e: dry run changes nothing; folder scope and per-wave limits are honoured")
+def t_e2e_web_scope_limits():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    server, port = fake_vcenter.serve(count=48)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy", settle="1")
+            with _EnvPatch(FAKE_KUBECTL_STATE=env["FAKE_KUBECTL_STATE"], FAKE_KUBECTL_SCENARIO="happy",
+                           FAKE_KUBECTL_SETTLE="1", VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                           VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD):
+                _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-a"])
+                c = _Console(tmp, Config.load(_write_config(tmp)))
+                try:
+                    _run_job(c, "discover", {}, "succeeded")
+                    all_vms = c.ok("GET", "/api/discovered")["vms"]
+                    c.ok("POST", "/api/select", {"morefs": [v["moref"] for v in all_vms], "selected": True})
+                    c.ok("POST", "/api/stage", {"default_namespace": "ns-a", "network_rows": [
+                        {"portgroup": "*", "subnet": "sub-a"}]})
+                    before = c.ok("GET", "/api/overview")["counts"]
+
+                    snap = _run_job(c, "execute", {"stage": "precheck", "dry_run": True,
+                                                   "confirm": True}, "succeeded")
+                    eq(_cluster(tmp)["applies"], 0, "dry run applies nothing")
+                    eq(c.ok("GET", "/api/overview")["counts"], before, "and changes no state")
+                    eq(c.ok("GET", "/api/batches")["batches"], [])
+
+                    db = [v["moref"] for v in c.ok("GET", "/api/vms")["vms"]
+                          if (v["folder"] or "").startswith("Databases")]
+                    _run_job(c, "execute", {"stage": "precheck", "folders": ["Databases"],
+                                            "confirm": True}, "succeeded")
+                    passed = {v["moref"] for v in c.ok("GET", "/api/vms")["vms"]
+                              if v["state"] == "precheck_passed"}
+                    eq(passed, set(db), "only the scoped folder was touched")
+
+                    _run_job(c, "execute", {"stage": "precheck", "limit": 3, "confirm": True},
+                             "succeeded")
+                    eq(len([v for v in c.ok("GET", "/api/vms")["vms"]
+                            if v["state"] == "precheck_passed"]), len(db) + 3)
+                finally:
+                    c.close()
+    finally:
+        server.shutdown()
+
+
+@test("stress/misc: double-clicked Start, busy port, corrupt map file, bad config, odd paths")
+def t_e2e_web_misc():
+    import socket
+    import threading
+    with tempfile.TemporaryDirectory() as root:
+        tmp = Path(root, "work dir with spaces ünïcode ✓")
+        tmp.mkdir()
+        c, env, cfg_path = _queue_console(str(tmp), "happy", count=4, settle="3")
+        try:
+            # A double click fires two starts at once: exactly one wins.
+            results = []
+
+            def start():
+                results.append(c.call("POST", "/api/run/execute",
+                                      {"stage": "precheck", "confirm": True})[0])
+            ts = [threading.Thread(target=start) for _ in range(6)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(60)
+            eq(sorted(results), [200, 409, 409, 409, 409, 409])
+            job = [j for j in c.ok("GET", "/api/jobs")["jobs"] if j["kind"] == "execute"][0]
+            eq(c.wait(job)["status"], "succeeded")
+            eq(_cluster(str(tmp))["applies"], 2, "one run, not six")
+
+            # Exports and the lock work under an awkward path.
+            eq(c.call("GET", "/api/export/tracker.csv?t=t0ken", raw=True)[0], 200)
+            eq(c.call("GET", "/api/export/report.html?t=t0ken", raw=True)[0], 200)
+
+            # A map file mangled on disk is a clear 400, not a crash.
+            Path(c.app.folder_map_path).write_bytes(b"\xff\xfe\x00\x01garbage\n\x00,,,")
+            status, data, _ = c.call("GET", "/api/maps")
+            eq(status, 400)
+            assert "folder-map.csv" in data["error"], data
+            eq(c.call("POST", "/api/stage/preview", {})[0], 400)
+            Path(c.app.folder_map_path).write_text("nothing,useful\n1,2\n", encoding="utf-8")
+            status, data, _ = c.call("GET", "/api/maps")
+            eq(status, 400)
+            assert "folder" in data["error"] and "namespace" in data["error"], data
+            Path(c.app.folder_map_path).unlink()
+            eq(c.call("GET", "/api/maps")[0], 200, "and recovers once the file is fixed")
+
+            # `serve` on a port that is taken: a clear refusal, exit 2.
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            s.listen(1)
+            busy = s.getsockname()[1]
+            try:
+                out = _run_cli(["-c", cfg_path, "serve", "--port", str(busy)], dict(os.environ),
+                               str(tmp), expect=2).stdout
+                assert "cannot listen" in out, out
+            finally:
+                s.close()
+            bad_cfg = Path(tmp, "bad.toml")
+            bad_cfg.write_text('rollback_action = "Immediate"\n', encoding="utf-8")
+            out = _run_cli(["-c", str(bad_cfg), "serve"], dict(os.environ), str(tmp), expect=2).stdout
+            assert "revert NOW" in out, out
+            bad_cfg.write_text("this is = not [valid toml", encoding="utf-8")
+            _run_cli(["-c", str(bad_cfg), "serve"], dict(os.environ), str(tmp), expect=2)
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/cli: Unicode VM names never crash CLI output piped on Windows")
+def t_cli_unicode_output():
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        names = ["名前-✓-db", "ünïcode-web", "emoji-🚀-svc"]
+        write_csv(os.path.join(tmp, "inv.csv"),
+                  [[n, "vm-{}".format(1001 + i), "ns-a", "sub", "4000", 1] for i, n in enumerate(names)],
+                  ["vm_name", "moref", "namespace", "subnet", "device_key", "wave"])
+        cfg = _write_config(tmp)
+        env = dict(os.environ)
+        env.pop("PYTHONIOENCODING", None)
+        env.pop("PYTHONUTF8", None)
+        _run_cli(["-c", cfg, "load", "-i", os.path.join(tmp, "inv.csv")], env, tmp)
+        store = vst.Store(os.path.join(tmp, "run", "state.db"))
+        store.set_vm_state("vm-1001", vst.S_FAILED, stage="import", message="✗ failed: 名前")
+        store.close()
+        for args in (["vms"], ["status"], ["history", "--vm", "vm-1001"], ["history"],
+                     ["events"], ["report"], ["ledger"], ["retry", "--vm", "vm-1001"]):
+            proc = subprocess.run([sys.executable, str(ROOT / "vcfa-import.py"), "-c", cfg] + args,
+                                  capture_output=True, cwd=tmp, env=env, timeout=120)
+            eq(proc.returncode, 0, "{}: {}".format(args, proc.stderr[-300:]))
+
+
+CHAOS_KUBECTL = r'''
+import os, random, subprocess, sys
+FAKE = {fake!r}
+rates = {{"get": float(os.environ.get("CHAOS_GET", "0")),
+         "api-resources": float(os.environ.get("CHAOS_GET", "0")),
+         "apply": float(os.environ.get("CHAOS_APPLY", "0")),
+         "patch": float(os.environ.get("CHAOS_APPLY", "0"))}}
+args = sys.argv[1:]
+verb = next((a for a in args if not a.startswith("-") and a not in ("fake-supervisor",)), "")
+i = 0
+while i < len(args) and args[i].startswith("--"):
+    i += 2 if "=" not in args[i] else 1
+verb = args[i] if i < len(args) else ""
+if random.random() < rates.get(verb, 0):
+    with open(os.environ["CHAOS_LOG"], "a") as fh:
+        fh.write(verb + "\n")
+    sys.stderr.write("Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout\n")
+    sys.exit(1)
+sys.exit(subprocess.call([sys.executable, FAKE] + args))
+'''
+
+
+@test("stress/chaos: the API server flaps (25% of reads, 8% of writes time out) -- no false verdicts")
+def t_e2e_web_chaos():
+    with tempfile.TemporaryDirectory() as tmp:
+        chaos = Path(tmp, "chaos_kubectl.py")
+        chaos.write_text(CHAOS_KUBECTL.format(fake=str(ROOT / "tools" / "fake_kubectl.py")),
+                         encoding="utf-8")
+        c, env, _ = _queue_console(
+            tmp, "happy", count=16, settle="4", batch_size=4, max_parallel_batches=2,
+            kubectl="{} {}".format(Path(sys.executable).as_posix(), chaos.as_posix()))
+        os.environ.update(CHAOS_GET="0.25", CHAOS_APPLY="0.08", CHAOS_LOG=str(Path(tmp, "chaos.log")))
+        try:
+            import random as _r
+            _r.seed(7)
+            pre = _run_job(c, "execute", {"stage": "precheck", "confirm": True})
+            imp = _run_job(c, "execute", {"stage": "import", "confirm": True})
+            injected = Path(tmp, "chaos.log").read_text().splitlines()
+            assert len(injected) >= 8, "chaos actually happened: {}".format(len(injected))
+            counts = c.ok("GET", "/api/overview")["counts"]
+            eq(counts, {"committed": 16},
+               "every VM committed despite {} injected faults (precheck {}, import {})".format(
+                   len(injected), pre["status"], imp["status"]))
+            eq(_cluster(tmp)["applies"], 8, "retries never double-applied a batch")
+            log = "\n".join(l[2] for l in pre["log"] + imp["log"])
+            assert "transient kubectl error" in log or "poll error" in log, "faults were retried"
+            # Preflight on a flapping API must not invent missing namespaces.
+            os.environ.update(CHAOS_GET="0.3", CHAOS_APPLY="0")
+            for _ in range(3):
+                pf = c.wait(c.ok("POST", "/api/run/preflight", {})["job"])
+                problems = "\n".join((pf.get("result") or {}).get("problems") or [pf.get("error") or ""])
+                assert "namespace(s) not found" not in problems, problems
+        finally:
+            c.close()
+            env.__exit__()
+
+
+@test("stress/scale: 1800 VMs discovered, staged and imported through the console")
+def t_e2e_web_scale():
+    import time as _t
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    server, port = fake_vcenter.serve(count=1800)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy", settle="1")
+            with _EnvPatch(FAKE_KUBECTL_STATE=env["FAKE_KUBECTL_STATE"], FAKE_KUBECTL_SCENARIO="happy",
+                           FAKE_KUBECTL_SETTLE="1", VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                           VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD):
+                namespaces = ["ns-{:02d}".format(i) for i in range(6)]
+                _seed_cluster(tmp, namespaces, ["{}/sub".format(n) for n in namespaces])
+                c = _Console(tmp, Config.load(_write_config(
+                    tmp, batch_size=25, max_parallel_batches=8, max_parallel_batches_per_namespace=2)))
+                timings = {}
+
+                def timed(name, fn):
+                    t0 = _t.time()
+                    out = fn()
+                    timings[name] = _t.time() - t0
+                    return out
+                try:
+                    _run_job(c, "discover", {"concurrency": 24}, "succeeded")
+                    vms = timed("GET discovered", lambda: c.ok("GET", "/api/discovered")["vms"])
+                    eq(len(vms), 1800)
+                    timed("select 1800", lambda: c.ok("POST", "/api/select", {
+                        "morefs": [v["moref"] for v in vms], "selected": True}))
+                    folders = sorted({(v["folder"] or "").split("/")[0] for v in vms})
+                    body = {"folder_rows": [{"folder": f or "/", "namespace": namespaces[i % 6],
+                                             "wave": str(i % 3 + 1)} for i, f in enumerate(folders)],
+                            "network_rows": [{"portgroup": "*", "subnet": "sub"}]}
+                    p = timed("stage preview", lambda: c.ok("POST", "/api/stage/preview", body))
+                    eq(len(p["records"]), 1800, p["problems"][:3])
+                    timed("stage", lambda: c.ok("POST", "/api/stage", body))
+                    timed("GET vms", lambda: c.ok("GET", "/api/vms"))
+                    timed("GET overview", lambda: c.ok("GET", "/api/overview"))
+                    timed("execute preview", lambda: c.ok("POST", "/api/execute/preview",
+                                                          {"stage": "precheck"}))
+                    moving = [v["moref"] for v in vms[:600]]
+                    timed("move 600 VMs", lambda: c.ok("POST", "/api/vms/wave",
+                                                       {"morefs": moving, "wave": 4}))
+                    t0 = _t.time()
+                    _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "succeeded")
+                    _run_job(c, "execute", {"stage": "import", "confirm": True}, "succeeded")
+                    timings["precheck+import 1800"] = _t.time() - t0
+                    eq(c.ok("GET", "/api/overview")["counts"], {"committed": 1800})
+                    timed("GET triage", lambda: c.ok("GET", "/api/triage"))
+                    timed("GET batches", lambda: c.ok("GET", "/api/batches"))
+                    timed("export tracker", lambda: c.call("GET", "/api/export/tracker.csv?t=t0ken", raw=True))
+                    for name, secs in timings.items():
+                        print("       {:<24} {:6.2f}s".format(name, secs))
+                    slow = {k: v for k, v in timings.items() if "1800" not in k and v > 5}
+                    assert not slow, "interactive calls must stay under 5s at 1800 VMs: {}".format(slow)
+                finally:
+                    c.close()
+    finally:
+        server.shutdown()
+
+
 # -------------------------------------------------------------------- main
 UNIT = [
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,
@@ -2161,6 +3759,12 @@ UNIT = [
     t_track_transitions, t_track_no_duplicates, t_track_milestones, t_track_ledger_file,
     t_track_ledger_durable, t_track_provenance, t_track_migration, t_track_csv,
     t_track_target_extraction,
+    t_store_wave_moves, t_store_swap_waves, t_triage_groups, t_map_rows_roundtrip,
+    t_skip_semantics, t_web_security, t_web_jobs,
+    t_http_keepalive_desync, t_http_body_limits, t_http_fuzz, t_http_host_and_paths,
+    t_http_non_loopback, t_http_concurrent_edits, t_workspace_lock, t_web_lock_conflict,
+    t_jobs_edge_cases, t_web_map_edges, t_web_stage_edges, t_web_hostile_names,
+    t_triage_normalisation, t_web_missing_things,
 ]
 
 E2E = [
@@ -2173,13 +3777,30 @@ E2E = [
     t_e2e_discover, t_e2e_folders, t_e2e_folder_execution, t_e2e_discover_auth, t_e2e_rediscover,
     t_e2e_tracker, t_e2e_tracker_retry,
     t_e2e_rollback, t_e2e_run_rollback_failed, t_e2e_rollback_nowait, t_e2e_rollback_held,
+    t_e2e_web_campaign, t_e2e_web_stop,
+    t_e2e_web_circuit_breaker, t_e2e_web_commit_gate, t_e2e_web_kubectl_missing,
+    t_e2e_web_preflight_problems, t_e2e_web_vcenter_failures, t_e2e_web_vanished_batch,
+    t_e2e_web_crash_resume, t_e2e_web_cli_interplay, t_e2e_web_load_during_run,
+    t_e2e_web_retry_abandon, t_e2e_web_scope_limits, t_e2e_web_chaos,
+    t_e2e_web_misc, t_cli_unicode_output,
 ]
 
-SLOW = [t_e2e_scale]
+SLOW = [t_e2e_scale, t_e2e_web_scale]
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):   # tracebacks may carry non-ASCII test data
+        stream.reconfigure(errors="backslashreplace")
     args = set(sys.argv[1:])
+    only = [a.split("=", 1)[1] for a in args if a.startswith("--only=")]
+    if only:
+        chosen = [fn for fn in UNIT + E2E + SLOW if any(o in fn.__test_name__ for o in only)]
+        for fn in chosen:
+            fn()
+        print("\n{} passed, {} failed".format(RESULTS["pass"], RESULTS["fail"]))
+        for name, tb in FAILURES:
+            print("\n--- {} ---\n{}".format(name, tb))
+        return 1 if RESULTS["fail"] else 0
     print("unit tests")
     for fn in UNIT:
         fn()

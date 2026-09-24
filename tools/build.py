@@ -20,6 +20,7 @@ jump box where installing Python is not an option.
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -75,6 +76,12 @@ def build_exe() -> Path | None:
         "--hidden-import", "getpass",
         "--hidden-import", "ssl",
         "--hidden-import", "concurrent.futures",
+        "--hidden-import", "http.server",
+        # `serve` imports the web console lazily; its UI is data, not code.
+        "--hidden-import", "vcfaimport.web.api",
+        "--hidden-import", "vcfaimport.web.server",
+        "--add-data", "{}{}{}".format(ROOT / "vcfaimport" / "web" / "static", os.pathsep,
+                                      "vcfaimport/web/static"),
         str(ROOT / "vcfa-import.py"),
     ]
     print("  running PyInstaller...")
@@ -105,6 +112,14 @@ def build_bundle(pyz: Path, exe: Path | None) -> Path:
 
 
 def smoke(pyz: Path, exe: Path | None) -> None:
+    # The web console's UI ships as package data; a build without it serves a blank page.
+    with zipfile.ZipFile(pyz) as zf:
+        names = set(zf.namelist())
+    missing = [f for f in ("index.html", "core.js", "views.js", "app.css")
+               if "vcfaimport/web/static/" + f not in names]
+    if missing:
+        raise SystemExit("web console assets missing from the .pyz: " + ", ".join(missing))
+    print("  smoke web  ok   console assets present")
     for label, cmd in (("pyz", [sys.executable, str(pyz), "--version"]),
                        ("exe", [str(exe), "--version"] if exe else None)):
         if not cmd:

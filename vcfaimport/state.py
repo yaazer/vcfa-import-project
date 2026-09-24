@@ -32,6 +32,10 @@ S_SKIPPED = "skipped"                    # excluded by the operator
 
 TERMINAL_STATES = (S_COMMITTED, S_FAILED, S_ROLLED_BACK, S_SKIPPED)
 ACTIVE_STATES = (S_PRECHECK_RUNNING, S_IMPORTING)
+# A VM in one of these is inside a batch that already carries its wave (or is
+# done): moving it to another wave would not move it, only mislabel it.
+WAVE_LOCKED_STATES = (S_PRECHECK_RUNNING, S_IMPORTING, S_AWAITING_COMMIT,
+                      S_ROLLING_BACK, S_COMMITTED)
 
 # --- Batch lifecycle ---------------------------------------------------------
 B_PLANNED = "planned"
@@ -197,7 +201,10 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
 
 
 class Store:
-    def __init__(self, path: str, ledger_path: Optional[str] = None):
+    def __init__(self, path: str, ledger_path: Optional[str] = None,
+                 check_same_thread: bool = True):
+        """check_same_thread=False lets one connection serve several threads;
+        the caller must then serialise access (the web console does, with a lock)."""
         self.path = str(Path(path).expanduser())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         # The ledger is an append-only JSONL mirror of the transitions table. It
@@ -207,7 +214,7 @@ class Store:
             Path(ledger_path).expanduser() if ledger_path
             else Path(self.path).parent / "ledger.jsonl"
         )
-        self.conn = sqlite3.connect(self.path, timeout=30)
+        self.conn = sqlite3.connect(self.path, timeout=30, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -576,6 +583,89 @@ class Store:
         rows = self.conn.execute("SELECT DISTINCT wave FROM vms ORDER BY wave").fetchall()
         return [r["wave"] for r in rows]
 
+    def set_vm_wave(self, morefs: Sequence[str], wave: int) -> Tuple[int, List[str]]:
+        """Move queued VMs to another wave. Returns (moved, refusals).
+
+        A wave is not a state, so this is not a transition; it is recorded as
+        an event instead. VMs already in a batch (or committed) are refused.
+        The discovery row is updated too, so re-staging keeps the choice.
+        updated_at is left alone: it measures time held in the current state.
+        """
+        wave = int(wave)
+        if wave < 1:
+            raise ValueError("wave must be 1 or higher")
+        moved, refused = 0, []
+        for moref in morefs:
+            row = self.get_vm(moref)
+            if row is None:
+                refused.append("{}: not in the import queue".format(moref))
+                continue
+            if row["state"] in WAVE_LOCKED_STATES:
+                refused.append("{} ({}) is {}; its wave can no longer change".format(
+                    moref, row["vm_name"], row["state"]))
+                continue
+            if row["wave"] == wave:
+                continue
+            self.conn.execute("UPDATE vms SET wave=? WHERE moref=?", (wave, moref))
+            self.conn.execute("UPDATE discovered SET wave=? WHERE moref=?", (wave, moref))
+            self.conn.execute(
+                "INSERT INTO events(ts, level, moref, batch, message) VALUES(?,?,?,?,?)",
+                (_now(), "info", moref, None,
+                 "moved from wave {} to wave {}".format(row["wave"], wave)))
+            moved += 1
+        self.conn.commit()
+        return moved, refused
+
+    def swap_waves(self, a: int, b: int) -> Tuple[bool, List[str]]:
+        """Exchange two waves' positions in the running order, all or nothing."""
+        a, b = int(a), int(b)
+        if a < 1 or b < 1 or a == b:
+            raise ValueError("two different waves, each 1 or higher, are needed")
+        locked = self.conn.execute(
+            "SELECT moref, vm_name, wave, state FROM vms WHERE wave IN (?,?) AND state IN ({})"
+            .format(",".join("?" * len(WAVE_LOCKED_STATES))),
+            [a, b] + list(WAVE_LOCKED_STATES)).fetchall()
+        if locked:
+            return False, ["{} ({}) in wave {} is {}".format(
+                r["moref"], r["vm_name"], r["wave"], r["state"]) for r in locked[:10]]
+        morefs = [r["moref"] for r in self.conn.execute(
+            "SELECT moref FROM vms WHERE wave IN (?,?)", (a, b)).fetchall()]
+        self.conn.execute(
+            "UPDATE vms SET wave = CASE WHEN wave=? THEN ? ELSE ? END WHERE wave IN (?,?)",
+            (a, b, a, a, b))
+        for moref in morefs:
+            self.conn.execute(
+                "UPDATE discovered SET wave=(SELECT wave FROM vms WHERE moref=?) WHERE moref=?",
+                (moref, moref))
+        self.conn.execute(
+            "INSERT INTO events(ts, level, moref, batch, message) VALUES(?,?,?,?,?)",
+            (_now(), "info", None, None,
+             "waves {} and {} swapped ({} VM(s))".format(a, b, len(morefs))))
+        self.conn.commit()
+        return True, []
+
+    def state_matrix(self, column: str) -> Dict[Any, Dict[str, int]]:
+        """{wave or namespace: {state: count}} in one query."""
+        if column not in ("wave", "namespace"):
+            raise ValueError(column)
+        out: Dict[Any, Dict[str, int]] = {}
+        for r in self.conn.execute(
+                "SELECT {0} AS k, state, COUNT(*) AS n FROM vms GROUP BY {0}, state".format(column)):
+            out.setdefault(r["k"], {})[r["state"]] = r["n"]
+        return out
+
+    def batch_member_counts(self) -> Dict[Tuple[str, str], Dict[str, int]]:
+        """{(namespace, batch): {state: count}} for every batch a VM currently points at."""
+        out: Dict[Tuple[str, str], Dict[str, int]] = {}
+        for col in ("batch_name", "precheck_batch"):
+            for r in self.conn.execute(
+                    "SELECT namespace, {0} AS b, state, COUNT(*) AS n FROM vms "
+                    "WHERE {0} IS NOT NULL AND {0} != '' GROUP BY namespace, {0}, state"
+                    .format(col)):
+                bucket = out.setdefault((r["namespace"], r["b"]), {})
+                bucket[r["state"]] = bucket.get(r["state"], 0) + r["n"]
+        return out
+
     def namespaces(self) -> List[str]:
         rows = self.conn.execute("SELECT DISTINCT namespace FROM vms ORDER BY namespace").fetchall()
         return [r["namespace"] for r in rows]
@@ -821,12 +911,20 @@ class Store:
         )
         self.conn.commit()
 
-    def recent_events(self, limit: int = 50, level: Optional[str] = None) -> List[sqlite3.Row]:
-        sql = "SELECT * FROM events"
+    def recent_events(self, limit: int = 50, level: Optional[str] = None,
+                      moref: Optional[str] = None,
+                      batch: Optional[str] = None) -> List[sqlite3.Row]:
+        sql = "SELECT * FROM events WHERE 1=1"
         params: List[Any] = []
         if level:
-            sql += " WHERE level=?"
+            sql += " AND level=?"
             params.append(level)
+        if moref:
+            sql += " AND moref=?"
+            params.append(moref)
+        if batch:
+            sql += " AND batch=?"
+            params.append(batch)
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
         return list(self.conn.execute(sql, params).fetchall())
