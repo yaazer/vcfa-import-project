@@ -36,6 +36,10 @@ ACTIVE_STATES = (S_PRECHECK_RUNNING, S_IMPORTING)
 # done): moving it to another wave would not move it, only mislabel it.
 WAVE_LOCKED_STATES = (S_PRECHECK_RUNNING, S_IMPORTING, S_AWAITING_COMMIT,
                       S_ROLLING_BACK, S_COMMITTED)
+# A VM in one of these has not been handed to the importer (or is back with
+# vCenter): a new discovery pass refreshes its recorded source facts.
+PROVENANCE_REFRESH_STATES = (S_PENDING, S_PRECHECK_PASSED, S_PRECHECK_FAILED,
+                             S_FAILED, S_ROLLED_BACK, S_SKIPPED)
 
 # --- Batch lifecycle ---------------------------------------------------------
 B_PLANNED = "planned"
@@ -910,6 +914,13 @@ class Store:
                      networks, _now()) + extra,
                 )
                 summary["added"] += 1
+            # A VM not yet handed to the importer takes the newest facts (a guest
+            # can change IP between discovery passes); once it has moved, its
+            # record keeps the facts from when it moved.
+            vm_row = self.conn.execute(
+                "SELECT state FROM vms WHERE moref=?", (d["moref"],)).fetchone()
+            if vm_row is not None and vm_row["state"] in PROVENANCE_REFRESH_STATES:
+                self._provenance_from_discovery(d["moref"])
         self.conn.commit()
         return summary
 

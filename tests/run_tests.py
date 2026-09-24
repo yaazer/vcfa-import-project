@@ -1019,6 +1019,24 @@ def t_track_provenance():
         store.close()
 
 
+@test("a rediscovery refreshes a queued VM's source IP, not a moved VM's")
+def t_track_provenance_refresh():
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        store.upsert_discovered([{"moref": "vm-1", "name": "web-01", "ip": "10.0.0.7"},
+                                 {"moref": "vm-2", "name": "web-02", "ip": "10.0.0.8"}])
+        _record(store)
+        _record(store, moref="vm-2", name="web-02")
+        eq(store.get_vm("vm-1")["src_ip"], "10.0.0.7")
+        store.set_vm_state("vm-2", vst.S_IMPORTING, stage="import", batch_name="imp-1")
+        store.upsert_discovered([{"moref": "vm-1", "name": "web-01", "ip": "10.0.0.6"},
+                                 {"moref": "vm-2", "name": "web-02", "ip": "10.0.0.9"}])
+        eq(store.get_vm("vm-1")["src_ip"], "10.0.0.6", "pending: the guest's new IP")
+        eq(store.get_vm("vm-2")["src_ip"], "10.0.0.8", "importing: the IP it moved with")
+        store.close()
+
+
 @test("an older database gains the tracking columns on open")
 def t_track_migration():
     import sqlite3 as sq
@@ -4546,7 +4564,8 @@ UNIT = [
     t_stage_namespace_precedence, t_stage_multinic, t_selection_file, t_picker_html,
     t_vcenter_nics,
     t_track_transitions, t_track_no_duplicates, t_track_milestones, t_track_ledger_file,
-    t_track_ledger_durable, t_track_provenance, t_track_migration, t_track_csv,
+    t_track_ledger_durable, t_track_provenance, t_track_provenance_refresh,
+    t_track_migration, t_track_csv,
     t_track_target_extraction,
     t_store_wave_moves, t_store_swap_waves, t_triage_groups, t_map_rows_roundtrip,
     t_skip_semantics, t_web_security, t_web_jobs,
