@@ -458,6 +458,7 @@ exact rather than heuristic.
 | `target_resource` blank | field name unknown | extend `TARGET_KEYS` in `status.py` |
 | `discover`: certificate error | self-signed vCenter | `--insecure` |
 | `discover`: 401 | wrong user format | try `user@vsphere.local` |
+| the web console feels slow or laggy | the browser has no GPU acceleration (typical on a jump box VM or over RDP) and is compositing the glass effects in software | Theme Studio (palette icon) → **Rendering: Lite**. *Auto* normally picks it by itself; the Studio says what it detected |
 
 Every command is safe to re-run. State is in `run/state.db`; the movement log
 in `run/ledger.jsonl` survives even if you delete the database.

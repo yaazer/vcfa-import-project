@@ -85,6 +85,8 @@ H.scenario = HP.get('s');
 store.set('vcfa-token', HP.get('bad') ? 'wrong-token' : HP.get('t'));
 // The first-visit welcome would cover every page; only the help scenario wants it.
 store.set('vcfa-welcome', 'done');
+// Headless Chrome runs without a GPU, so Auto rendering resolves to Lite; &quality=full forces the glass.
+if (HP.get('quality') && window.FX) FX.prefs.quality = HP.get('quality');
 if (HP.get('theme')) store.set('vcfa-theme', HP.get('theme'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function flush() {
@@ -175,6 +177,11 @@ const SCENARIOS = {
       await open('activity', 'tab=' + tab);
       check('activity tab ' + tab + ' renders', !brokeView() && document.querySelector('.tabs button.on').textContent.length > 0);
     }
+    await open('queue');
+    const first = document.querySelector('#view').firstChild;
+    S.view.render();
+    renderNav();
+    check('re-rendering unchanged data leaves the page alone (no repaint)', document.querySelector('#view').firstChild === first);
     for (const q of ['doc=lab', 'doc=readme', 'tab=glossary']) {
       await open('help', q);
       check('help ' + q + ' renders', !brokeView() && noInjection());
@@ -441,6 +448,16 @@ const SCENARIOS = {
     hue.value = '90'; hue.dispatchEvent(new Event('input', { bubbles: true }));
     check('the hue slider re-tints live', accent() !== a0, a0 + ' -> ' + accent());
     check('status colours keep their meaning under a hue shift', /152/.test(getComputedStyle(document.documentElement).getPropertyValue('--s-committed')));
+    const aurora = document.getElementById('fx-aurora');
+    const cardBlur = () => getComputedStyle(document.querySelector('#view .card, #view .kpi')).backdropFilter;
+    check('the aurora carries no full-screen CSS blur', getComputedStyle(aurora).filter === 'none', getComputedStyle(aurora).filter);
+    check('without GPU acceleration, Auto picks Lite rendering', FX.rendering().soft && document.body.dataset.fx === 'lite', JSON.stringify(FX.rendering()));
+    check('Lite drops the glass and the aurora', cardBlur() === 'none' && getComputedStyle(aurora).display === 'none', cardBlur());
+    check('the Studio says why Auto chose Lite', /Lite/.test(document.querySelector('#fx-studio').textContent));
+    click('#fx-studio [data-fx="quality"][data-k="full"]');
+    check('Full brings the glass back', document.body.dataset.fx === 'full' && cardBlur() !== 'none' && getComputedStyle(aurora).display !== 'none', cardBlur());
+    click('#fx-studio [data-fx="quality"][data-k="auto"]');
+    check('and Auto goes back to Lite here', document.body.dataset.fx === 'lite');
     click('#fx-studio [data-fx="motion"][data-k="off"]');
     check('motion Off is applied to the page', document.body.dataset.motion === 'off');
     check('and remembered', JSON.parse(store.get('vcfa-fx')).motion === 'off');
@@ -1046,6 +1063,8 @@ def main():
         plan.append(("pages @ 390px", "main", "pages", "&narrow=1", (390, 844)))
     if not args.only or "empty" in (args.only or []):
         plan.append(("pages on an empty workspace", "empty", "pages", "", (1440, 900)))
+    if not args.only or "full" in (args.only or []):
+        plan.append(("pages with Full rendering (glass)", "main", "pages", "&quality=full", (1440, 900)))
     if not args.only or "light" in (args.only or []):
         plan.append(("pages in light theme", "main", "pages", "&theme=light", (1440, 900)))
     if args.scale or "scale" in (args.only or []):

@@ -24,9 +24,15 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const attr = (cond, name) => (cond ? raw(' ' + name) : '');
 
-/** Replace an element's content, keeping focus, caret and scroll positions. */
+/** Replace an element's content, keeping focus, caret and scroll positions.
+ * Unchanged markup leaves the DOM alone: re-parsing it anyway re-lays-out and
+ * repaints the whole subtree, which the status poll would otherwise do every
+ * few seconds to the nav, the topbar and live pages (costly without a GPU).
+ * The firstChild check notices content that was replaced by other means. */
 function mount(el, content) {
   if (!el) return;
+  const markup = fmt(content);
+  if (el.__markup === markup && el.firstChild && el.__first === el.firstChild) return;
   const active = document.activeElement;
   const keepId = active && el.contains(active) && active.id ? active.id : null;
   let caret = null;
@@ -34,7 +40,9 @@ function mount(el, content) {
     try { caret = [active.selectionStart, active.selectionEnd]; } catch (e) { caret = null; }
   }
   const scrolls = $$('[data-scroll]', el).map((n) => [n.dataset.scroll, n.scrollTop]);
-  el.innerHTML = fmt(content);
+  el.innerHTML = markup;
+  el.__markup = markup;
+  el.__first = el.firstChild;
   for (const [key, top] of scrolls) {
     const n = el.querySelector('[data-scroll="' + key + '"]');
     if (n) n.scrollTop = top;
@@ -423,9 +431,13 @@ function renderDock(full, fresh) {
   }
   // incremental: redraw the bar, append new lines, stick to the bottom if already there
   const barEl = el.querySelector('.dock-bar');
-  const tmp = document.createElement('div');
-  tmp.innerHTML = fmt(bar);
-  barEl.replaceWith(tmp.firstElementChild);
+  const barHtml = fmt(bar);
+  if (barEl.__markup !== barHtml) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = barHtml;
+    tmp.firstElementChild.__markup = barHtml;
+    barEl.replaceWith(tmp.firstElementChild);
+  }
   if (fresh && fresh.length) {
     const atBottom = existingLog.scrollHeight - existingLog.scrollTop - existingLog.clientHeight < 40;
     existingLog.insertAdjacentHTML('beforeend', fmt(logLines(fresh, D.filter)));

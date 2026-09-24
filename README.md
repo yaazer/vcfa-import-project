@@ -95,6 +95,15 @@ turn it amber, a running job quickens it, and a finished campaign blooms.
 - **Stream lanes**: the Migration Stream flows by stage, or regroups its
   particles into one lane per wave, namespace or application, coloured by state.
 - **Density**: *Compact* in the Theme Studio fits more rows on a screen.
+- **Rendering: Auto / Full / Lite.** Frosted glass and the aurora cost almost
+  nothing on a GPU and a great deal on a machine without one -- a jump box VM
+  or a remote desktop session, where every frame is composited in software.
+  *Auto* (the default) checks for hardware acceleration and switches to
+  **Lite** without it: same layout, colours and status meaning, no glass, no
+  aurora, no pointer effects. Measured in software rendering, a frame costs
+  about 2 ms in Lite against 14-40 ms in Full. If Auto guesses wrong, pick Full
+  or Lite in the Theme Studio or with `Ctrl+K` -> *Rendering*.
+  (`python tools/ui_perf.py` measures it on your machine.)
 
 **Help while you work.** The first visit opens a two-minute welcome tour
 (it changes nothing; re-run it from *Help & guides* or `Ctrl+K`). A small **?**

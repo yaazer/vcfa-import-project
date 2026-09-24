@@ -27,7 +27,8 @@ const FX = (() => {
     { id: 'glacier', label: 'Glacier', tag: 'ice blue, light', mode: 'light', h1: 238, h2: 200, h3: 285, hb: 235, c: 1 },
     { id: 'daylight', label: 'Daylight', tag: 'warm paper, light', mode: 'light', h1: 268, h2: 22, h3: 172, hb: 75, c: 0.9 },
   ];
-  const DEFAULTS = { theme: 'aurora', shift: 0, glow: 100, motion: null, reactive: true, density: 'comfortable', streamBy: 'stage' };
+  const RQ_DEFAULT = { soft: false, why: '', checked: false };
+  const DEFAULTS = { theme: 'aurora', shift: 0, glow: 100, motion: null, reactive: true, density: 'comfortable', streamBy: 'stage', quality: 'auto' };
   const P = Object.assign({}, DEFAULTS, readPrefs());
   if (!P.motion) P.motion = matchMedia('(prefers-reduced-motion: reduce)').matches ? 'off' : 'full';
 
@@ -92,6 +93,70 @@ const FX = (() => {
     return v;
   }
 
+  // ------------------------------------------------------- rendering quality
+  /* Full: glass (backdrop blur), aurora, grain, pointer effects. Lite: the same
+   * layout and colours without them. Frosted glass and full-screen filters are
+   * nearly free on a GPU and very expensive in software compositing (a VM or an
+   * RDP session without GPU acceleration): every frame recomputes each blur.
+   * Auto picks Lite when the browser has no hardware acceleration, or when
+   * frames are measured to be slow. */
+  const RQ = Object.assign({}, RQ_DEFAULT, readRQ() || {});
+  function readRQ() {
+    try { const c = JSON.parse(sessionStorage.getItem('vcfa-rq') || 'null'); if (c && typeof c.soft === 'boolean') return c; } catch (e) { /* no cache */ }
+    return null;
+  }
+  function detectRendering() {
+    if (RQ.checked) return;
+    let soft = false, why = '';
+    try {
+      const c = document.createElement('canvas');
+      // failIfMajorPerformanceCaveat: no context when WebGL would be software-rendered
+      const gl = c.getContext('webgl', { failIfMajorPerformanceCaveat: true }) || c.getContext('experimental-webgl', { failIfMajorPerformanceCaveat: true });
+      if (!gl) { soft = true; why = 'no hardware acceleration'; }
+      else {
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        why = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '') : '';
+        if (/swiftshader|llvmpipe|softpipe|software|basic render|\bwarp\b/i.test(why)) soft = true;
+        const lose = gl.getExtension('WEBGL_lose_context');
+        if (lose) lose.loseContext();
+      }
+    } catch (e) { soft = false; why = ''; }
+    Object.assign(RQ, { soft, why: soft ? (why || 'software rendering') : why, checked: true });
+    saveRQ();
+  }
+  function saveRQ() { try { sessionStorage.setItem('vcfa-rq', JSON.stringify(RQ)); } catch (e) { /* private mode */ } }
+  const quality = () => (P.quality === 'full' || P.quality === 'lite' ? P.quality : (RQ.soft ? 'lite' : 'full'));
+  const isLite = () => quality() === 'lite';
+  /* A second opinion for Auto: while a page makes its entrance, frames should
+   * come every ~16ms. Two pages in a row well above that -> this machine
+   * composites slowly; switch to Lite for the rest of the session. */
+  const FW = { strikes: 0, running: false };
+  function frameWatch() {
+    if (P.quality !== 'auto' || isLite() || P.motion === 'off' || FW.running || document.hidden) return;
+    FW.running = true;
+    const gaps = [];
+    let last = 0;
+    const t0 = performance.now();
+    const step = (t) => {
+      if (last) gaps.push(t - last);
+      last = t;
+      if (t - t0 < 900) { requestAnimationFrame(step); return; }
+      FW.running = false;
+      if (gaps.length < 5) return;
+      gaps.sort((a, b) => a - b);
+      const med = gaps[Math.floor(gaps.length / 2)];
+      FW.strikes = med > 45 ? FW.strikes + 1 : 0;
+      if (FW.strikes >= 2) {
+        Object.assign(RQ, { soft: true, why: 'slow frames (' + Math.round(med) + ' ms each)', checked: true });
+        saveRQ();
+        applyTheme();
+        kick();
+        if (typeof toast === 'function') toast('Switched to Lite rendering', 'This machine draws the console slowly (no GPU acceleration). Theme Studio → Rendering changes it.', 'info', 7000);
+      }
+    };
+    requestAnimationFrame(step);
+  }
+
   function applyTheme() {
     const t = theme();
     const root = document.documentElement;
@@ -101,6 +166,7 @@ const FX = (() => {
     root.dataset.theme = t.mode;
     document.body.dataset.motion = P.motion;
     document.body.dataset.density = P.density === 'compact' ? 'compact' : 'comfortable';
+    document.body.dataset.fx = quality();
     readColors();
     applyMood();
   }
@@ -112,7 +178,7 @@ const FX = (() => {
     const committed = (p.counts || {}).committed || 0;
     const busy = !!p.job;
     const done = total > 0 && committed === total;
-    if (busy) document.body.dataset.busy = '1'; else delete document.body.dataset.busy;
+    if (busy !== ('busy' in document.body.dataset)) { if (busy) document.body.dataset.busy = '1'; else delete document.body.dataset.busy; }
     if (done && M.done === false && M.seen) celebrate();
     M.seen = true;
     Object.assign(M, { busy, done, fail: total ? (p.failed || 0) / total : 0, hold: (p.awaiting_commit || 0) > 0 });
@@ -127,9 +193,14 @@ const FX = (() => {
       else if (M.busy) { hue = H.h1; strength = 0.5; }
     }
     M.hue = hue; M.strength = strength;
-    const root = document.documentElement.style;
-    root.setProperty('--mood', ok(H.mode === 'dark' ? 0.72 : 0.6, 0.2, hue));
-    root.setProperty('--aura', strength.toFixed(2));
+    // Only when it changed: a custom property on :root restyles the whole page.
+    const mood = ok(H.mode === 'dark' ? 0.72 : 0.6, 0.2, hue), aura = strength.toFixed(2);
+    if (M.set !== mood + aura) {
+      M.set = mood + aura;
+      const root = document.documentElement.style;
+      root.setProperty('--mood', mood);
+      root.setProperty('--aura', aura);
+    }
   }
   function celebrate() {
     M.burstAt = performance.now();
@@ -455,6 +526,7 @@ const FX = (() => {
     if (attn) { ctx.beginPath(); ctx.moveTo(16, attn.y0 - 7); ctx.lineTo(ST.w - 16, attn.y0 - 7); ctx.stroke(); }
     ctx.setLineDash([]);
     const moving = P.motion !== 'off';
+    const lite = isLite();
     let active = false;
     const r = Math.max(1.1, ST.size * 0.34);
     // Time-based, not frame-based: the same speed at 144fps, 30fps, or in a
@@ -488,15 +560,15 @@ const FX = (() => {
           }
         } else { d.x = d.tx; d.y = d.ty; }
       }
-      const tw = moving ? 0.72 + 0.28 * Math.sin(t / 700 + d.ph) : 1;
-      const pulse = moving && MOVING.has(d.state) ? 1 + 0.35 * Math.sin(t / 220 + d.ph) : 1;
+      const tw = moving && !lite ? 0.72 + 0.28 * Math.sin(t / 700 + d.ph) : 1;
+      const pulse = moving && !lite && MOVING.has(d.state) ? 1 + 0.35 * Math.sin(t / 220 + d.ph) : 1;
       ctx.globalAlpha = Math.max(0, d.a * tw);
       ctx.fillStyle = colors[d.state] || colors.pending;
       ctx.beginPath(); ctx.arc(d.x, d.y, r * pulse, 0, 6.2832); ctx.fill();
     }
     ST.dots = survivors;
     // sparks: flow between lanes while a job runs, and the finale burst
-    if (moving && M.busy && staged && ST.lanes.length > 4 && Math.random() < 0.5) {
+    if (moving && !lite && M.busy && staged && ST.lanes.length > 4 && Math.random() < 0.5) {
       const i = 1 + Math.floor(Math.random() * 3);
       const a = ST.lanes[i], b = ST.lanes[i + 1];
       ST.sparks.push({ x: (a.x0 + a.x1) / 2, y: a.y1 - 8, tx: (b.x0 + b.x1) / 2, ty: b.y1 - 8, p: 0, v: 0.008 + Math.random() * 0.01, col: colors.accent });
@@ -535,18 +607,23 @@ const FX = (() => {
   function loop(t) {
     raf = 0;
     if (document.hidden || P.motion === 'off') return;
-    const auroraFps = P.motion === 'calm' ? 12 : 30;
-    if (t - AU.last > 1000 / auroraFps) { AU.last = t; drawAurora(t); }
+    const lite = isLite();
+    // The aurora drifts slowly: 20 frames a second look the same as 60 and cost a third.
+    const auroraFps = P.motion === 'calm' ? 8 : 20;
+    if (!lite && t - AU.last > 1000 / auroraFps) { AU.last = t; drawAurora(t); }
+    let busy = false;
     if (ST.canvas && ST.canvas.isConnected) {
-      // full rate while particles move; a gentle twinkle rate when idle
-      const busy = drawStreamThrottled(t);
+      // full rate while particles move; a gentle twinkle rate when idle (Full only)
+      busy = drawStreamThrottled(t, lite);
       if (busy) lastStream = t;
     }
+    // Lite: once the particles have settled nothing needs drawing; stop until kick().
+    if (lite && !busy && t - lastStream > 1500) return;
     raf = requestAnimationFrame(loop);
   }
   let lastIdleDraw = 0;
-  function drawStreamThrottled(t) {
-    if (t - lastStream < 1500 || t - lastIdleDraw > 1000 / (P.motion === 'calm' ? 10 : 24)) {
+  function drawStreamThrottled(t, lite) {
+    if (t - lastStream < 1500 || (!lite && t - lastIdleDraw > 1000 / (P.motion === 'calm' ? 10 : 24))) {
       lastIdleDraw = t;
       return drawStream(t);
     }
@@ -554,7 +631,7 @@ const FX = (() => {
   }
   function kick() {
     if (!raf && P.motion !== 'off' && !document.hidden) raf = requestAnimationFrame(loop);
-    if (P.motion === 'off') { drawAurora(0); if (ST.canvas) drawStream(performance.now()); }
+    if (P.motion === 'off') { if (!isLite()) drawAurora(0); if (ST.canvas) drawStream(performance.now()); }
   }
 
   // ------------------------------------------------------------- motion
@@ -602,8 +679,9 @@ const FX = (() => {
     const a = nav && nav.querySelector('.nav-item.active');
     if (!g) return;
     if (!a) { g.classList.remove('on'); return; }
-    g.style.setProperty('--gy', (a.offsetTop - nav.scrollTop) + 'px');
-    g.classList.add('on');
+    const gy = (a.offsetTop - nav.scrollTop) + 'px';
+    if (g.style.getPropertyValue('--gy') !== gy) g.style.setProperty('--gy', gy);
+    if (!g.classList.contains('on')) g.classList.add('on');
   }
   let pointer = null;
   function onPointer(e) {
@@ -616,7 +694,9 @@ const FX = (() => {
   function applyPointer() {
     pointerQueued = false;
     const e = pointer;
-    if (!e) return;
+    // Lite or motion off: the spotlight, tilt and parallax are hidden -- and
+    // every write here would repaint the hovered card for nothing.
+    if (!e || isLite() || P.motion === 'off') return;
     if (P.motion === 'full') {
       document.documentElement.style.setProperty('--px', ((e.clientX / innerWidth - 0.5) * -14).toFixed(1) + 'px');
       document.documentElement.style.setProperty('--py', ((e.clientY / innerHeight - 0.5) * -10).toFixed(1) + 'px');
@@ -711,6 +791,7 @@ const FX = (() => {
     for (const t of THEMES) add('Look & feel', 'Theme: ' + t.label, 'sun', t.tag, () => { set({ theme: t.id }); toast('Theme: ' + t.label, t.tag, 'ok', 2500); });
     add('Look & feel', 'Motion: ' + (P.motion === 'off' ? 'turn on' : 'turn off'), 'activity', 'animations', () => set({ motion: P.motion === 'off' ? 'full' : 'off' }));
     add('Look & feel', 'Density: ' + (P.density === 'compact' ? 'comfortable' : 'compact'), 'queue', 'row height', () => set({ density: P.density === 'compact' ? 'comfortable' : 'compact' }));
+    add('Look & feel', 'Rendering: ' + (isLite() ? 'Full (glass, aurora)' : 'Lite (fastest)'), 'sun', 'Auto picks for this machine', () => set({ quality: isLite() ? 'full' : 'lite' }));
     for (const [k, l] of GROUP_BY) add('Look & feel', 'Stream lanes by ' + l.toLowerCase(), 'waves', 'Migration Stream', () => streamBy(k));
     if (window.GOV) for (const it of GOV.paletteItems()) add(it.sec, it.label, it.ic, it.hint, it.run);
     if (window.HELP) for (const it of HELP.paletteItems()) add(it.sec, it.label, it.ic, it.hint, it.run);
@@ -781,6 +862,10 @@ const FX = (() => {
         <div class="field"><span>Motion</span><div class="seg">${[['full', 'Full'], ['calm', 'Calm'], ['off', 'Off']].map(([k, l]) =>
           html`<button class="${P.motion === k ? 'on' : ''}" data-fx="motion" data-k="${k}">${l}</button>`)}</div>
           <small>Off also stops the background and the particle stream. Your OS "reduce motion" setting picks Off by default.</small></div>
+        <div class="field"><span>Rendering</span><div class="seg">${[['auto', 'Auto'], ['full', 'Full'], ['lite', 'Lite']].map(([k, l]) =>
+          html`<button class="${(P.quality || 'auto') === k ? 'on' : ''}" data-fx="quality" data-k="${k}">${l}</button>`)}</div>
+          <small>${P.quality === 'auto' || !P.quality ? html`Auto is using <b>${quality() === 'lite' ? 'Lite' : 'Full'}</b>${RQ.soft ? ' — ' + RQ.why : ''}. ` : ''}Lite drops the frosted glass,
+            the aurora and the pointer effects: much faster on a VM or remote desktop without GPU acceleration. Colours and layout stay the same.</small></div>
         <div class="field"><span>Density</span><div class="seg">${[['comfortable', 'Comfortable'], ['compact', 'Compact']].map(([k, l]) =>
           html`<button class="${(P.density || 'comfortable') === k ? 'on' : ''}" data-fx="density" data-k="${k}">${l}</button>`)}</div>
           <small>Compact fits more rows on a screen: tables, cards and the queue tighten up.</small></div>
@@ -816,6 +901,7 @@ const FX = (() => {
     motion: (t) => set({ motion: t.dataset.k }),
     reactive: () => set({ reactive: !P.reactive }),
     density: (t) => { set({ density: t.dataset.k }); if (S.view && S.view.render) S.view.render(); },
+    quality: (t) => set({ quality: t.dataset.k }),
     streamBy: (t) => streamBy(t.dataset.k),
     resetFx: () => set(Object.assign({}, DEFAULTS, { motion: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'off' : 'full' })),
   };
@@ -825,6 +911,7 @@ const FX = (() => {
     AU.canvas = document.getElementById('fx-aurora');
     AU.ctx = AU.canvas ? AU.canvas.getContext('2d') : null;
     sizeAurora();
+    detectRendering();
     applyTheme();
     addEventListener('resize', () => { sizeAurora(); navGlider(); kick(); }, { passive: true });
     document.addEventListener('pointermove', onPointer, { passive: true });
@@ -856,6 +943,7 @@ const FX = (() => {
   function afterRoute(el) {
     entering = false;
     if (P.motion === 'off') return;
+    frameWatch();
     el.setAttribute('data-enter', '');
     clearTimeout(afterRoute.t);
     afterRoute.t = setTimeout(() => el.removeAttribute('data-enter'), 1000);
@@ -869,7 +957,7 @@ const FX = (() => {
   }
 
   return {
-    THEMES, prefs: P, stats, init, applyTheme, onPulse, beforeRoute, afterRoute, afterRender, navGlider,
+    THEMES, prefs: P, stats, init, quality, rendering: () => Object.assign({ quality: quality() }, RQ), applyTheme, onPulse, beforeRoute, afterRoute, afterRender, navGlider,
     streamHtml, streamModel, ring, logActivity, spark, openPalette, openStudio, set, kick,
     // one stream frame on demand (tests drive time; browsers use requestAnimationFrame)
     drawNow: () => drawStream(performance.now()),
