@@ -34,6 +34,12 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   server never answered. Never turn a timeout into "missing" or "denied".
 - Map rows reach the parsers from files *and* from the browser: validate shape, never
   assume a list of dicts. Report bad input as `SelectionError` (400), never a 500.
+- UI colours are tokens (`app.css` defaults = Aurora; `fx.js` regenerates them per
+  theme in OKLCH). Never hard-code a colour in a view. Status colours (`--s-*`)
+  keep their hue in every theme -- green is always committed, red always failed.
+- Animation is time-based, never per-frame, and every effect must degrade to a
+  complete static render under Motion: Off (the OS reduce-motion default). `fx.js`
+  hooks fail soft: the console must work if the look breaks.
 
 ## Layout
 
@@ -50,7 +56,7 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/web/server.py` | `serve`: stdlib HTTP server, token + Host checks, static assets via `pkgutil` (works in .pyz/.exe) |
 | `vcfaimport/web/api.py` | JSON API; `ROUTES` table; cluster-touching actions start jobs, DB-only ones run inline |
 | `vcfaimport/web/jobs.py` | background jobs: one at a time, own `Store`, log streamed + kept in `<workdir>/jobs/` |
-| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `views.js` (pages), `app.css` |
+| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `views.js` (pages), `app.css` (token design system) |
 | `tools/web_demo.py` | the console against the fakes: `--keep ./webdemo` |
 | `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge |
 | `tools/fake_kubectl.py` | simulated kubectl + operator (emits the real condition vocabulary) |

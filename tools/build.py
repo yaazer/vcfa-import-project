@@ -115,7 +115,7 @@ def smoke(pyz: Path, exe: Path | None) -> None:
     # The web console's UI ships as package data; a build without it serves a blank page.
     with zipfile.ZipFile(pyz) as zf:
         names = set(zf.namelist())
-    missing = [f for f in ("index.html", "core.js", "views.js", "app.css")
+    missing = [f for f in ("index.html", "core.js", "fx.js", "views.js", "app.css")
                if "vcfaimport/web/static/" + f not in names]
     if missing:
         raise SystemExit("web console assets missing from the .pyz: " + ", ".join(missing))

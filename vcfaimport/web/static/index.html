@@ -7,16 +7,19 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6bff'/%3E%3Cpath d='M9 11l7 11 7-11' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/app.css">
 <script src="/static/core.js" defer></script>
+<script src="/static/fx.js" defer></script>
 <script src="/static/views.js" defer></script>
 </head>
 <body>
+<canvas id="fx-aurora" aria-hidden="true"></canvas>
+<div id="fx-grid" aria-hidden="true"></div>
 <div class="app" id="app">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
       <span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8"/><path d="M9 11l7 11 7-11"/></svg></span>
       <span class="brand-text"><b>VCFA Import</b><small>Mobility console</small></span>
     </div>
-    <nav id="nav" aria-label="Main"></nav>
+    <div class="nav-wrap"><div id="nav-glider" aria-hidden="true"></div><nav id="nav" aria-label="Main"></nav></div>
     <div class="side-foot" id="side-foot"></div>
   </aside>
   <div class="main">
@@ -29,6 +32,7 @@
 <section class="dock" id="dock" hidden></section>
 <div id="drawer-root"></div>
 <div id="modal-root"></div>
+<div id="fx-root"></div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 </body>
 </html>

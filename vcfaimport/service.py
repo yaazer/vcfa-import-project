@@ -68,7 +68,7 @@ class WorkspaceLock:
             holder = self.holder() or "another process"
             raise WorkspaceBusy(
                 "this workspace is busy: {} is already changing it on the cluster. Wait for it "
-                "to finish (or stop it) -- two runs at once would apply duplicate batches for "
+                "to finish (or stop it) — two runs at once would apply duplicate batches for "
                 "the same VMs.".format(holder))
         fh.seek(0)
         fh.truncate()
@@ -200,8 +200,8 @@ def rollback_failed_after_run(engine: Engine, waves: Optional[Sequence[int]],
                               folder_exact: bool = False, log: Optional[Log] = None) -> None:
     """--rollback-failed: hand every failed import back to vCenter, then stop.
 
-    Same mechanism as `rollback --failed` -- rollbackAction is patched onto
-    batches that have already run and failed -- just without a second command.
+    Same mechanism as `rollback --failed` — rollbackAction is patched onto
+    batches that have already run and failed — just without a second command.
     Batches are left on the cluster for `cleanup`; nothing is deleted here.
     """
     say = log or engine.log
@@ -315,7 +315,7 @@ KNOWN_ISSUES: List[Dict[str, Any]] = [
     {"id": "tools", "pattern": r"tools.{0,20}not running|toolsnotrunning",
      "title": "VMware Tools is not running",
      "advice": "The operator needs VMware Tools in the guest. Power the VM on and start "
-               "Tools, then retry -- or skip VMs that should not be imported.",
+               "Tools, then retry — or skip VMs that should not be imported.",
      "actions": ["retry", "skip"]},
     {"id": "collision",
      "pattern": r"does not match number of operations|already exists|name collision",

@@ -75,6 +75,21 @@ one workspace, and a batch started from either shows up in both.
 | **Triage** | Failures grouped by cause (VM-specific details are normalised away), each with the likely fix and the right buttons: retry, skip, abandon, roll back. Also stalled VMs, rolled-back VMs, and batches safe to clean up |
 | **Activity & logs** | Every job's full log (searchable, *problems only*), the event log, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
 
+**Look and feel.** The Overview opens on the **Migration Stream**: every VM is a
+particle, flowing from vCenter through precheck and import into VCF Automation,
+with anything that needs attention pooled underneath. The same stream follows
+you to Execute while a run is in progress. Behind the glass, a slow aurora
+reacts to the campaign: failures tint it with a hazard colour, held commits
+turn it amber, a running job quickens it, and a finished campaign blooms.
+
+- **Theme Studio** (palette icon, top right): seven themes -- Aurora, Nebula,
+  Solar Flare, Phosphor, Graphite, Glacier, Daylight -- plus a hue shift, glow
+  intensity, and motion (Full / Calm / Off). Palettes are generated in OKLCH so
+  every hue stays legible, and status colours keep their meaning in every theme.
+  Your operating system's *reduce motion* setting selects Off automatically.
+- **Command palette** (`Ctrl+K` or `/`): jump to any page, VM or batch, run
+  preflight/refresh/watch, or switch theme, from the keyboard.
+
 Long operations run as background **jobs**. Their log streams into a panel at
 the bottom of every page, and is kept under `<workdir>/jobs/` so it survives a
 restart. **Stop** acts like the first Ctrl-C: nothing new is applied, and

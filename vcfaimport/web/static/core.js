@@ -1,5 +1,5 @@
 'use strict';
-/* VCFA Import Console -- core: templating, API client, shell, dock, drawers,
+/* VCFA Import Console — core: templating, API client, shell, dock, drawers,
  * modals, toasts and the actions shared by several views. views.js holds the
  * pages. Plain scripts, no build step, no network dependencies. */
 
@@ -85,6 +85,7 @@ const ICONS = {
   up: '<path d="M6 15l6-6 6 6"/>',
   down: '<path d="M6 9l6 6 6-6"/>',
   key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M16 7l3 3M18 5l2 2"/>',
+  palette: '<path d="M12 3a9 9 0 100 18c1.1 0 1.7-.9 1.4-1.9-.3-.8.3-1.6 1.1-1.6H17a4 4 0 004-4c0-5-4-8.5-9-8.5z"/><circle cx="7.5" cy="11.5" r="1.2"/><circle cx="10.5" cy="7.5" r="1.2"/><circle cx="15.5" cy="8" r="1.2"/>',
 };
 function icon(name, cls) {
   return raw('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
@@ -204,7 +205,7 @@ async function api(method, path, body) {
   if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   let res;
   try { res = await fetch(path, opts); } catch (e) {
-    throw new ApiErr('The console is not reachable -- is `vcfa-import serve` still running?', 0);
+    throw new ApiErr('The console is not reachable — is `vcfa-import serve` still running?', 0);
   }
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
@@ -376,6 +377,7 @@ async function pollDock() {
     D.job = snap;
     D.next = snap.next;
     D.lines = D.lines.concat(fresh);
+    if (window.FX && fresh.length && snap.status === 'running') FX.logActivity(fresh.length);
     if (D.lines.length > 8000) D.lines = D.lines.slice(-8000);
     renderDock(false, fresh);
     if (snap.status === 'running') D.timer = setTimeout(pollDock, 1000);
@@ -386,11 +388,13 @@ function renderDock(full, fresh) {
   if (!D.id) { el.hidden = true; return; }
   el.hidden = false;
   const j = D.job;
+  el.classList.toggle('live', !!(j && j.status === 'running'));
   const prog = j && j.progress;
   const bar = html`<div class="dock-bar" data-act="toggleDock">
       ${statusIcon(j ? j.status : 'running')}
       <span class="t">${j ? j.title : 'Starting…'}</span>
       <span class="meta">${j ? html`${STATUS_WORD[j.status] || j.status} · ${fmtDur(elapsed(j))}` : ''}</span>
+      ${j && j.status === 'running' && window.FX ? FX.spark() : ''}
       ${prog && j.status === 'running' ? html`<div class="progress"><span style="width:${pct(prog.done, prog.total)}"></span></div><span class="meta">${n(prog.done)}/${n(prog.total)} ${prog.label}</span>`
         : (j && j.status === 'running' ? html`<div class="progress indet"><span></span></div>` : html`<span class="grow"></span>`)}
       ${j && j.stoppable ? html`<button class="btn sm danger-ghost" data-act="stopJob" data-id="${j.id}" ${attr(j.stop_requested, 'disabled')}>${icon('stop')} ${j.stop_requested ? 'Stopping…' : 'Stop'}</button>` : ''}
@@ -489,7 +493,7 @@ async function doRollback(sel) {
   const res = await modal({
     title: 'Hand ' + plural(p.revert, 'VM') + ' back to vCenter?', danger: true, ic: 'rollback', confirm: 'Roll back', typeWord: 'ROLLBACK', wide: true,
     body: html`<p>Sets <code>controlAction.rollbackAction: Immediate</code> on ${plural(p.batches.length, 'batch', 'batches')} and waits for the operator to revert ownership.
-      Rollback is per batch: every un-committed VM in these batches is reverted. <b>Committed VMs are never touched</b> -- a committed import cannot be reversed.</p>
+      Rollback is per batch: every un-committed VM in these batches is reverted. <b>Committed VMs are never touched</b> — a committed import cannot be reversed.</p>
       <div class="card mt-s"><div class="table-wrap" style="max-height:260px"><table class="t compact">
         <thead><tr><th>Batch</th><th>Namespace</th><th>Wave</th><th>State</th><th class="right">To revert</th><th class="right">Committed (kept)</th></tr></thead>
         <tbody>${p.batches.map((b) => html`<tr><td class="mono">${b.name}</td><td>${b.namespace}</td><td>${b.wave}</td><td>${batchTag(b.state)}</td><td class="right num">${b.revert}</td><td class="right num">${b.committed}</td></tr>`)}</tbody></table></div></div>
@@ -669,21 +673,21 @@ function renderNav() {
       <div class="row"><span>context</span><b title="${S.info.context || ''}">${S.info.context || 'current'}</b></div>
       <div class="row"><span>workdir</span><span title="${S.info.workdir}">${S.info.workdir}</span></div>`);
   }
+  if (window.FX) FX.navGlider();
 }
 function renderTopbar() {
   if (S.gated) return;
   const v = S.view, p = S.pulse, i = S.info;
-  const theme = document.documentElement.dataset.theme;
   mount($('#topbar'), html`<div><h1>${v ? v.title : ''}</h1>${v && v.sub ? html`<div class="sub">${v.sub}</div>` : ''}</div>
     <span class="spacer"></span>
     ${p && p.job ? html`<button class="jobchip" data-act="showJob" data-id="${p.job.id}"><span class="spinner"></span><span>${p.job.title}</span></button>` : ''}
     ${i ? html`<span class="ctxchip" title="kubectl context">ctx <b>${i.context || 'current'}</b></span>
       <span class="ctxchip" title="commitAction for imports">commit <b class="${i.settings.commit_action === 'Auto' ? 'warn-text' : ''}">${i.settings.commit_action}</b></span>` : ''}
-    <button class="btn ghost icon" data-act="theme" title="Toggle light / dark">${icon(theme === 'dark' ? 'sun' : 'moon')}</button>`);
+    <button class="btn ghost sm" data-act="palette" title="Command palette (Ctrl+K)">${icon('search')}<span class="kbd">ctrl k</span></button>
+    <button class="btn ghost icon" data-act="theme" title="Theme Studio">${icon('palette')}</button>`);
 }
 function applyTheme() {
-  const t = store.get('vcfa-theme');
-  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  if (window.FX) FX.applyTheme();
 }
 
 // ---------------------------------------------------------------- router
@@ -706,7 +710,9 @@ async function route() {
   const el = $('#view');
   el.innerHTML = '<div class="boot">Loading…</div>';
   window.scrollTo(0, 0);
+  if (window.FX) FX.beforeRoute();
   try { await v.enter(el, params); } catch (e) { if (S.view === v) mount(el, errorBox(e)); }
+  if (window.FX && S.view === v) FX.afterRoute(el);
 }
 async function refreshView() {
   const v = S.view;
@@ -733,6 +739,7 @@ function view(def) {
     if (!v.el || S.view !== v || !v.loaded) return;
     mount(v.el, def.paint(v));
     if (def.after) def.after(v);
+    if (window.FX) FX.afterRender(v.el, v);
   };
   return v;
 }
@@ -752,13 +759,8 @@ const GLOBAL_ACT = {
     if (!ok) return;
     try { await POST('/api/jobs/' + encodeURIComponent(t.dataset.id) + '/stop'); toast('Stop requested', 'In-flight batches will finish first.', 'warn'); pollDock(); } catch (e) { fail(e); }
   },
-  theme: () => {
-    const cur = document.documentElement.dataset.theme ||
-      (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-    store.set('vcfa-theme', cur === 'dark' ? 'light' : 'dark');
-    applyTheme();
-    renderTopbar();
-  },
+  theme: () => FX.openStudio(),
+  palette: () => FX.openPalette(),
   setToken: () => {
     const v = ($('#token-in').value || '').trim().replace(/^.*#t=/, '');
     if (!v) return;
@@ -824,6 +826,7 @@ async function pulse() {
     }
     renderNav();
     renderTopbar();
+    if (window.FX) FX.onPulse(p);
     const sig = JSON.stringify([p.counts, p.discovered, p.live_batches]);
     const v = S.view;
     if (v && v.onPulse) v.onPulse(v, p);
@@ -869,7 +872,7 @@ function jobSummary(j) {
 
 // ------------------------------------------------------------------ boot
 async function boot() {
-  applyTheme();
+  if (window.FX && !S.fxReady) { S.fxReady = true; FX.init(); }
   if (!S.token) { tokenGate(); return; }
   try {
     S.info = await GET('/api/info');

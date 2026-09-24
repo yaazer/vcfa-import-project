@@ -419,11 +419,84 @@ const SCENARIOS = {
 
   async theme() {
     await open('overview');
-    const before = getComputedStyle(document.body).backgroundColor;
+    const bg = () => getComputedStyle(document.body).backgroundColor;
+    const accent = () => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+    const before = bg();
     click('[data-act="theme"]');
-    await sleep(100);
-    check('theme toggle changes colours', getComputedStyle(document.body).backgroundColor !== before);
-    click('[data-act="theme"]');
+    check('the palette button opens the Theme Studio', await waitFor(() => document.querySelector('#fx-studio .swatch')));
+    check('every theme is offered', document.querySelectorAll('#fx-studio .swatch').length === FX.THEMES.length);
+    click('#fx-studio .swatch[data-id="glacier"]');
+    check('a light theme switches the whole palette', await waitFor(() => bg() !== before) && document.documentElement.style.colorScheme === 'light');
+    const a0 = accent();
+    const hue = document.querySelector('#fx-studio input[data-fx-in="shift"]');
+    hue.value = '90'; hue.dispatchEvent(new Event('input', { bubbles: true }));
+    check('the hue slider re-tints live', accent() !== a0, a0 + ' -> ' + accent());
+    check('status colours keep their meaning under a hue shift', /152/.test(getComputedStyle(document.documentElement).getPropertyValue('--s-committed')));
+    click('#fx-studio [data-fx="motion"][data-k="off"]');
+    check('motion Off is applied to the page', document.body.dataset.motion === 'off');
+    check('and remembered', JSON.parse(store.get('vcfa-fx')).motion === 'off');
+    click('#fx-studio [data-fx="resetFx"]');
+    check('reset restores Aurora', await waitFor(() => bg() === before) && FX.prefs.theme === 'aurora' && FX.prefs.shift === 0);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    check('Escape closes the studio', await waitFor(() => !document.querySelector('#fx-studio')));
+  },
+
+  async palette() {
+    await open('overview');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
+    const q = await waitFor(() => document.getElementById('cmdk-q'));
+    check('Ctrl+K opens the command palette', q);
+    type(q, 'triag');
+    await sleep(50);
+    check('it finds pages as you type', /Triage/.test(document.querySelector('.cmdk-item.on').textContent));
+    q.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    check('Enter runs the highlighted item', await waitFor(() => S.route === 'triage' && !document.getElementById('cmdk-q')));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: '/', bubbles: true }));
+    const q2 = await waitFor(() => document.getElementById('cmdk-q'));
+    check('/ opens it too', q2);
+    type(q2, 'web-0');
+    const vm = await waitFor(() => [...document.querySelectorAll('.cmdk-item')].find((i) => /web-0/.test(i.textContent)), 8000);
+    check('it finds VMs by name', vm);
+    const secs = [...document.querySelectorAll('.cmdk-sec')].map((x) => x.textContent);
+    check('sections are never repeated', new Set(secs).size === secs.length, secs.join(','));
+    if (vm) { vm.click(); check('picking a VM opens its drawer', await waitFor(() => document.querySelector('.drawer h2'))); }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    type(q2.isConnected ? q2 : document.createElement('input'), '');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
+    const q3 = await waitFor(() => document.getElementById('cmdk-q'));
+    type(q3, 'zzqqxx');
+    check('no match says so', await waitFor(() => document.querySelector('.cmdk-empty')));
+    q3.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    check('Escape closes it', await waitFor(() => !document.getElementById('cmdk-q')));
+  },
+
+  async stream() {
+    const pixels = () => {
+      const cv = document.querySelector('#fx-stream canvas');
+      if (!cv || !cv.width) return 0;
+      const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+      let lit = 0;
+      for (let i = 3; i < d.length; i += 16) if (d[i] > 200) lit++;
+      return lit;
+    };
+    for (const m of ['off', 'full']) {
+      FX.set({ motion: m });
+      await open(m === 'off' ? 'queue' : 'batches');
+      await open('overview');
+      check('[' + m + '] the stream canvas mounts', await waitFor(() => document.querySelector('#fx-stream canvas')));
+      check('[' + m + '] a particle per VM (or per unit at scale)', FX.stats.dots > 0, FX.stats.dots);
+      // Headless Chrome's virtual clock barely runs requestAnimationFrame, so
+      // frames are driven by hand; the animation itself is time-based.
+      check('[' + m + '] particles are drawn solid, not faded out', await waitFor(() => { FX.drawNow(); return pixels() > 50; }, 8000), pixels());
+    }
+    const lanes = [...document.querySelectorAll('.lane-h .ln-n')].map((x) => +x.dataset.count);
+    const c = (await GET('/api/overview')).counts;
+    check('lane totals add up to the estate', lanes[4] === (c.committed || 0), lanes.join(',') + ' vs committed ' + c.committed);
+    await open('execute');
+    check('the same stream follows you to Execute', await waitFor(() => { FX.drawNow(); return document.querySelector('#fx-stream canvas') && pixels() > 50; }, 8000));
+    check('Execute uses the compact form (no ring)', !document.querySelector('#view .hero-ring'));
+    check('a frame costs little', FX.stats.drawMs < 8, FX.stats.drawMs.toFixed(2) + 'ms');
+    FX.set({ motion: 'full' });
   },
 
   async scale() {
@@ -451,6 +524,10 @@ const SCENARIOS = {
     await open('queue');
     await timeIt('queue: sort by state + render', async () => { click('#view th[data-key="state"]'); });
     await timeIt('queue: filter chips + render', async () => { click('#view .chip[data-s="pending"]'); });
+    await open('overview');
+    check('1800 VMs stay within the particle budget', FX.stats.dots > 0 && FX.stats.dots <= 1600, FX.stats.dots);
+    await sleep(1500);
+    check('a stream frame at 1800 VMs costs under 8ms', FX.stats.drawMs < 8, FX.stats.drawMs.toFixed(2) + 'ms');
     for (const [k, v] of Object.entries(H.timings)) check('under 4s: ' + k, v < 4000, v + 'ms');
   },
 };
@@ -583,7 +660,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme"]
+             "resilience", "token", "theme", "palette", "stream"]
 
 
 def main():

@@ -1,5 +1,5 @@
 'use strict';
-/* VCFA Import Console -- the pages. Each is built with view() from core.js:
+/* VCFA Import Console — the pages. Each is built with view() from core.js:
  * load() fetches, paint() returns markup, act{} handles data-act clicks. */
 
 const PAGE = 100;
@@ -10,7 +10,7 @@ const inFolder = (path, folder) => folder === '' || path === folder || (path || 
 
 function kpi(lbl, value, sub, to, color) {
   return html`<div class="kpi ${to ? 'link' : ''}" style="--c:${color || 'transparent'}" ${to ? raw(`data-act="go" data-to="${esc(to.split('?')[0])}" data-q="${esc(to.split('?')[1] || '')}"`) : ''}>
-    <div class="v">${typeof value === 'number' ? n(value) : value}</div><div class="l">${lbl}</div>${sub ? html`<div class="s">${sub}</div>` : ''}</div>`;
+    <div class="v" ${typeof value === 'number' ? raw('data-count="' + value + '" data-key="kpi:' + esc(lbl) + '"') : ''}>${typeof value === 'number' ? n(value) : value}</div><div class="l">${lbl}</div>${sub ? html`<div class="s">${sub}</div>` : ''}</div>`;
 }
 
 // ================================================================= OVERVIEW
@@ -42,6 +42,7 @@ VIEWS.overview = view({
     const fail = (w) => (w.counts.failed || 0) + (w.counts.precheck_failed || 0);
     return html`
       ${nextStep(d, S.pulse)}
+      <div class="mt">${FX.streamHtml(d)}</div>
       <div class="kpis mt">
         ${kpi('Discovered', d.discovered.total, n(d.discovered.selected) + ' selected', 'select', 'var(--accent)')}
         ${kpi('In the queue', d.total, plural(d.waves.length, 'wave'), 'queue')}
@@ -50,9 +51,8 @@ VIEWS.overview = view({
         ${kpi('Awaiting commit', d.awaiting_commit, 'commitAction ' + S.info.settings.commit_action, 'execute', 'var(--s-awaiting_commit)')}
         ${kpi('Need attention', d.failed, 'failed or precheck failed', 'triage', 'var(--s-failed)')}
       </div>
-      <div class="card mt"><div class="card-h"><h3>Overall progress</h3><span class="sub">${n(d.committed)} of ${n(d.total)} committed</span>
-        <div class="tools">${st.import_seconds ? html`<span class="small muted">avg import ${fmtDur(st.import_seconds.avg)}</span>` : ''}</div></div>
-        <div class="card-b">${d.total ? html`${segbar(c, d.total, true)}${legend(c)}` : html`<span class="muted">The import queue is empty.</span>`}</div></div>
+      ${d.total ? html`<div class="card mt"><div class="card-b">${segbar(c, d.total, true)}${legend(c)}
+        ${st.import_seconds ? html`<div class="small faint mt-s">average import ${fmtDur(st.import_seconds.avg)}</div>` : ''}</div></div>` : ''}
       <div class="grid two mt">
         <div class="card"><div class="card-h"><h3>Waves</h3><span class="sub">run in order, lowest first</span>
           <div class="tools"><button class="btn sm" data-act="go" data-to="waves">Arrange ${icon('arrow')}</button></div></div>
@@ -61,7 +61,7 @@ VIEWS.overview = view({
               <td class="right num">${n(w.counts.committed || 0)}</td><td class="right num ${fail(w) ? 'bad-text' : ''}">${n(fail(w))}</td>
               <td class="right nowrap"><button class="btn xs" data-act="go" data-to="execute" data-q="stage=precheck&waves=${w.wave}" ${attr(!w.counts.pending, 'disabled')}>Precheck</button>
                 <button class="btn xs" data-act="go" data-to="execute" data-q="stage=import&waves=${w.wave}" ${attr(!w.counts.precheck_passed, 'disabled')}>Import</button></td></tr>`)}
-          </tbody></table></div>` : html`<div class="card-b muted">No waves yet -- stage VMs first.</div>`}</div>
+          </tbody></table></div>` : html`<div class="card-b muted">No waves yet — stage VMs first.</div>`}</div>
         <div class="card"><div class="card-h"><h3>Namespaces</h3><span class="sub">target Supervisor namespaces</span></div>
           ${d.namespaces.length ? html`<div class="table-wrap"><table class="t"><thead><tr><th>Namespace</th><th style="width:40%">Progress</th><th class="right">VMs</th><th class="right">Done</th></tr></thead><tbody>
             ${d.namespaces.map((x) => html`<tr class="click" data-act="go" data-to="queue" data-q="ns=${encodeURIComponent(x.namespace)}"><td class="mono small">${x.namespace}</td><td>${segbar(x.counts, x.total)}</td><td class="right num">${n(x.total)}</td><td class="right num">${n(x.counts.committed || 0)}</td></tr>`)}
@@ -126,7 +126,7 @@ VIEWS.discover = view({
       <div class="card"><div class="card-h"><h3>Inventory cache</h3>${o.meta.discovered_at ? html`<span class="sub">${o.meta.vcenter} · ${o.meta.discovered_at}</span>` : ''}</div>
         ${o.discovered.total ? html`<div class="card-b stack">
           <div class="kpis">${kpi('VMs', o.discovered.total, '')}${kpi('Selected', o.discovered.selected, '')}${kpi('Clusters', clusters.length, plural(dcs.length, 'datacenter'))}${kpi('Networks', nets.length, '')}</div>
-          ${noTools ? html`<div class="note warn">${plural(noTools, 'VM')} report VM Tools not running -- they will most likely fail precheck.</div>` : ''}
+          ${noTools ? html`<div class="note warn">${plural(noTools, 'VM')} report VM Tools not running — they will most likely fail precheck.</div>` : ''}
           <div><div class="section-title" style="margin-top:4px">Top-level folders</div>
             <div class="chips">${Object.entries(top).sort((a, b) => b[1] - a[1]).map(([k, c]) => html`<span class="chip" data-act="go" data-to="select" data-q="folder=${encodeURIComponent(k === '(datacenter root)' ? '' : k)}">${icon('folder')} ${k} <span class="n">${n(c)}</span></span>`)}</div></div>
         </div>
@@ -268,7 +268,7 @@ VIEWS.select = view({
           ${pager(rows.length, v.page, PAGE)}
         </div>
         <div class="callout stickybar" style="background:var(--panel)"><div class="ic">${icon('select')}</div>
-          <div class="grow"><h3>${plural(selCount, 'VM')} selected</h3><p>${noNs ? plural(noNs, 'selected VM') + ' without a namespace -- the folder or portgroup map decides in the next step.' : 'Namespace and wave can come from the maps in the next step.'}
+          <div class="grow"><h3>${plural(selCount, 'VM')} selected</h3><p>${noNs ? plural(noNs, 'selected VM') + ' without a namespace — the folder or portgroup map decides in the next step.' : 'Namespace and wave can come from the maps in the next step.'}
             ${v.meta.discovered_at ? ' · discovered ' + v.meta.discovered_at : ''}</p></div>
           <button class="btn danger-ghost sm" data-act="clearAll" ${attr(!selCount, 'disabled')}>Clear selection</button>
           <button class="btn primary" data-act="go" data-to="stage" ${attr(!selCount, 'disabled')}>Map & Stage ${icon('arrow')}</button></div>
@@ -415,15 +415,15 @@ VIEWS.stage = view({
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'n')}</div>
           <div class="card-f"><button class="btn sm" data-act="addRow" data-m="n">${icon('plus')} Add entry</button><span class="small muted">In a VPC namespace, name the Subnet as it appears in the VPC's own namespace.</span></div></div>
       </div>
-      <div class="card mt"><div class="card-h"><h3>Result</h3><span class="sub">live preview -- nothing is staged until you click Stage</span>
+      <div class="card mt"><div class="card-h"><h3>Result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
         <div class="tools"><label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default namespace</span>
-          <input class="input sm" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none -- report instead" style="width:200px"></label>
+          <input class="input sm" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none — report instead" style="width:200px"></label>
           <label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default wave</span>
           <input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px"></label></div></div>
         <div id="stage-preview">${stagePreview(v)}</div></div>
       <div class="callout stickybar" style="background:var(--panel)"><div class="ic">${icon('stage')}</div>
         <div class="grow"><h3 id="stage-count">${plural(p.records.length, 'VM')} ready to stage</h3>
-          <p id="stage-dirty">${dirty ? html`<span class="warn-text">The maps have unsaved edits -- staging saves them.</span>` : 'Maps saved.'} Staging again later is safe: VMs already in flight are never changed.</p></div>
+          <p id="stage-dirty">${dirty ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span>` : 'Maps saved.'} Staging again later is safe: VMs already in flight are never changed.</p></div>
         <button class="btn" data-act="saveMaps">Save maps</button>
         <button class="btn primary" data-act="stage" ${attr(!p.records.length, 'disabled')}>Stage ${icon('arrow')}</button></div>`;
   },
@@ -492,7 +492,7 @@ async function runPreview(v) {
   const c = $('#stage-count');
   if (c) c.textContent = plural(v.preview.records.length, 'VM') + ' ready to stage';
   const d = $('#stage-dirty');
-  if (d) mount(d, JSON.stringify([v.fr, v.nr]) !== v.saved ? html`<span class="warn-text">The maps have unsaved edits -- staging saves them.</span> Staging again later is safe.` : 'Maps saved. Staging again later is safe: VMs already in flight are never changed.');
+  if (d) mount(d, JSON.stringify([v.fr, v.nr]) !== v.saved ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span> Staging again later is safe.` : 'Maps saved. Staging again later is safe: VMs already in flight are never changed.');
 }
 const schedulePreview = debounce((v) => runPreview(v), 400);
 function mapTable(v, m) {
@@ -536,7 +536,7 @@ function stagePreview(v) {
       ${kpi('Unmapped networks', Object.keys(p.unmapped_networks).length, 'VMs keep no subnet for them', null, Object.keys(p.unmapped_networks).length ? 'var(--warn)' : '')}</div>
     ${p.by_wave.length ? html`<div class="row wrap"><span class="small muted">By wave</span>${p.by_wave.map(([w, c]) => html`<span class="chip static">Wave ${w} <span class="n">${n(c)}</span></span>`)}
       <span class="small muted" style="margin-left:14px">By namespace</span>${p.by_namespace.map(([ns, c]) => html`<span class="chip static mono">${ns} <span class="n">${n(c)}</span></span>`)}</div>` : ''}
-    ${p.problems.length ? html`<details class="note bad"><summary><b>${plural(p.problems.length, 'VM')} cannot be staged</b> -- expand for details</summary><ul class="plain small">${p.problems.slice(0, 60).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
+    ${p.problems.length ? html`<details class="note bad"><summary><b>${plural(p.problems.length, 'VM')} cannot be staged</b> — expand for details</summary><ul class="plain small">${p.problems.slice(0, 60).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
   </div>
   ${p.records.length ? html`<div class="table-wrap" style="border-top:1px solid var(--line)"><table class="t compact"><thead><tr><th>VM</th><th>Folder</th><th>Namespace</th><th>Wave</th><th>Subnets</th><th>Notes</th><th>Queue</th></tr></thead><tbody>
     ${recs.map((r) => html`<tr><td><span class="vm-name">${r.vm_name}<small>${r.moref}</small></span></td><td class="small">${r.folder || '/'}</td><td class="mono small">${r.namespace}</td>
@@ -678,7 +678,7 @@ function waveColumn(v, w, idx, waves, hitSet, q) {
       const movable = g.filter((x) => !x.locked);
       const selN = movable.filter((x) => v.sel.has(x.moref)).length;
       return html`<div class="fgroup">
-        <div class="fgroup-h" data-act="toggleGroup" data-key="${key}" draggable="${movable.length ? 'true' : 'false'}" data-drag="group" data-wave="${w}" data-folder="${folder}" title="${folder || '(datacenter root)'} -- drag to move the whole folder">
+        <div class="fgroup-h" data-act="toggleGroup" data-key="${key}" draggable="${movable.length ? 'true' : 'false'}" data-drag="group" data-wave="${w}" data-folder="${folder}" title="${folder || '(datacenter root)'} — drag to move the whole folder">
           <span class="caret ${open ? 'open' : ''}" style="display:grid">${icon('chevron')}</span>
           <input type="checkbox" data-act="pickGroup" data-wave="${w}" data-folder="${folder}" ${attr(selN && selN === movable.length, 'checked')} ${attr(!movable.length, 'disabled')}>
           ${icon('folder')}<span class="name">${folder || '(root)'}</span><span class="tiny muted">${n(g.length)}</span></div>
@@ -731,6 +731,7 @@ VIEWS.execute = view({
     ];
     return html`
       <div class="steps">${steps.map(([st, t, d], i) => html`<div class="step ${st}"><span class="n">${st === 'done' ? icon('check') : i + 1}</span><div><h4>${t}</h4><p>${d}</p></div></div>`)}</div>
+      <div class="mt">${FX.streamHtml(o, { compact: true })}</div>
       ${job && ['execute', 'rollback', 'watch', 'commit'].includes(job.kind) ? html`<div class="callout mt"><div class="ic"><span class="spinner"></span></div>
         <div class="grow"><h3>${job.title}</h3><p>${job.stop_requested ? 'Stopping: in-flight batches are being polled to completion.' : 'Running for ' + fmtDur(elapsed(job)) + '. Waves update live below; the full log is in the panel at the bottom.'}</p></div>
         <button class="btn" data-act="showJob" data-id="${job.id}">Log</button>
@@ -759,7 +760,7 @@ VIEWS.execute = view({
               </div>
               <div class="stack mt-s" style="gap:8px">
                 <label class="check"><input type="checkbox" data-change="opt" data-k="include_failed" ${attr(opt.include_failed, 'checked')}> Also retry VMs that ${imp ? 'failed import' : 'failed precheck'}</label>
-                <label class="check"><input type="checkbox" data-change="opt" data-k="dry_run" ${attr(opt.dry_run, 'checked')}> Dry run -- render manifests, apply nothing</label>
+                <label class="check"><input type="checkbox" data-change="opt" data-k="dry_run" ${attr(opt.dry_run, 'checked')}> Dry run — render manifests, apply nothing</label>
                 ${imp ? html`<label class="check"><input type="checkbox" data-change="opt" data-k="rollback_failed" ${attr(opt.rollback_failed, 'checked')}> After the run, hand failed imports back to vCenter</label>
                   <label class="check"><input type="checkbox" data-change="opt" data-k="no_precheck" ${attr(opt.no_precheck, 'checked')}> <span class="warn-text">Import VMs that have not passed precheck</span></label>` : ''}
               </div></details>
