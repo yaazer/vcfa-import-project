@@ -3667,23 +3667,32 @@ def t_cli_unicode_output():
 
 
 CHAOS_KUBECTL = r'''
-import os, random, subprocess, sys
+import os, subprocess, sys
 FAKE = {fake!r}
+# Deterministic chaos: every Nth read / write fails (N = 1 / rate). Each call is
+# a fresh process, so a random roll here could not be seeded -- and a quiet run
+# once injected too few faults to prove anything.
 rates = {{"get": float(os.environ.get("CHAOS_GET", "0")),
          "api-resources": float(os.environ.get("CHAOS_GET", "0")),
          "apply": float(os.environ.get("CHAOS_APPLY", "0")),
          "patch": float(os.environ.get("CHAOS_APPLY", "0"))}}
 args = sys.argv[1:]
-verb = next((a for a in args if not a.startswith("-") and a not in ("fake-supervisor",)), "")
 i = 0
 while i < len(args) and args[i].startswith("--"):
     i += 2 if "=" not in args[i] else 1
 verb = args[i] if i < len(args) else ""
-if random.random() < rates.get(verb, 0):
-    with open(os.environ["CHAOS_LOG"], "a") as fh:
-        fh.write(verb + "\n")
-    sys.stderr.write("Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout\n")
-    sys.exit(1)
+rate = rates.get(verb, 0)
+if rate > 0:
+    kind = "read" if verb in ("get", "api-resources") else "write"
+    with open(os.environ["CHAOS_LOG"] + "." + kind, "ab") as fh:   # one byte per call: a shared counter
+        fh.write(b".")
+        n = fh.tell()
+    every = max(1, round(1 / rate))
+    if n % every == every // 2:        # mid-cycle: the 6th write already fails, not only the 12th
+        with open(os.environ["CHAOS_LOG"], "a") as fh:
+            fh.write(verb + "\n")
+        sys.stderr.write("Unable to connect to the server: dial tcp 10.0.0.1:6443: i/o timeout\n")
+        sys.exit(1)
 sys.exit(subprocess.call([sys.executable, FAKE] + args))
 '''
 
@@ -3699,12 +3708,12 @@ def t_e2e_web_chaos():
             kubectl="{} {}".format(Path(sys.executable).as_posix(), chaos.as_posix()))
         os.environ.update(CHAOS_GET="0.25", CHAOS_APPLY="0.08", CHAOS_LOG=str(Path(tmp, "chaos.log")))
         try:
-            import random as _r
-            _r.seed(7)
             pre = _run_job(c, "execute", {"stage": "precheck", "confirm": True})
             imp = _run_job(c, "execute", {"stage": "import", "confirm": True})
             injected = Path(tmp, "chaos.log").read_text().splitlines()
-            assert len(injected) >= 8, "chaos actually happened: {}".format(len(injected))
+            reads = sum(1 for v in injected if v in ("get", "api-resources"))
+            writes = len(injected) - reads
+            assert reads >= 5 and writes >= 1, "chaos actually happened: {} reads, {} writes failed".format(reads, writes)
             counts = c.ok("GET", "/api/overview")["counts"]
             eq(counts, {"committed": 16},
                "every VM committed despite {} injected faults (precheck {}, import {})".format(
