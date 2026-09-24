@@ -3597,6 +3597,32 @@ def t_e2e_web_misc():
             env.__exit__()
 
 
+@test("web demo: a busy default port falls back; an explicit busy port is refused")
+def t_web_demo_ports():
+    import socket
+    sys.path.insert(0, str(ROOT / "tools"))
+    import web_demo
+    holders = []
+    try:
+        for port in range(web_demo.DEFAULT_PORT, web_demo.DEFAULT_PORT + 20):
+            s = socket.socket()
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                s.close()
+                continue           # already taken by something else: just as good
+            holders.append(s)
+            if len(holders) == 2:
+                break
+        chosen = web_demo.pick_port(None)
+        assert chosen is not None and web_demo._port_free(chosen), chosen
+        assert chosen not in [h.getsockname()[1] for h in holders]
+        eq(web_demo.pick_port(holders[0].getsockname()[1]), None, "an explicit busy port is refused")
+    finally:
+        for h in holders:
+            h.close()
+
+
 @test("stress/cli: Unicode VM names never crash CLI output piped on Windows")
 def t_cli_unicode_output():
     from vcfaimport import state as vst
@@ -3782,7 +3808,7 @@ E2E = [
     t_e2e_web_preflight_problems, t_e2e_web_vcenter_failures, t_e2e_web_vanished_batch,
     t_e2e_web_crash_resume, t_e2e_web_cli_interplay, t_e2e_web_load_during_run,
     t_e2e_web_retry_abandon, t_e2e_web_scope_limits, t_e2e_web_chaos,
-    t_e2e_web_misc, t_cli_unicode_output,
+    t_e2e_web_misc, t_cli_unicode_output, t_web_demo_ports,
 ]
 
 SLOW = [t_e2e_scale, t_e2e_web_scale]
