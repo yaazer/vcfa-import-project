@@ -105,6 +105,16 @@ const ICONS = {
   palette: '<path d="M12 3a9 9 0 100 18c1.1 0 1.7-.9 1.4-1.9-.3-.8.3-1.6 1.1-1.6H17a4 4 0 004-4c0-5-4-8.5-9-8.5z"/><circle cx="7.5" cy="11.5" r="1.2"/><circle cx="10.5" cy="7.5" r="1.2"/><circle cx="15.5" cy="8" r="1.2"/>',
 };
 function icon(name, cls) {
+  // A design-language skin (skins.js) redraws some icons in its own style. A skin whose
+  // icons are full-colour art (not `everywhere`) only draws them where the call site marks
+  // an icon slot with the `art` class (navigation, palette, empty states, folder rows):
+  // inside a tinted callout box or a button, colour art fights the tone.
+  const skin = document.documentElement.dataset.skin;
+  const set = skin && window.SKINS && window.SKINS[skin];
+  if (set && set.icons[name] && (set.everywhere || /(^|\s)art(\s|$)/.test(cls || ''))) {
+    return raw('<svg viewBox="0 0 24 24" ' + set.attrs + ' aria-hidden="true" class="skin-ic' +
+      (cls ? ' ' + cls : '') + '">' + set.icons[name] + '</svg>');
+  }
   return raw('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
     'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"' +
     (cls ? ' class="' + cls + '"' : '') + '>' + (ICONS[name] || '') + '</svg>');
@@ -185,7 +195,7 @@ function legend(counts) {
     html`<span>${dot(s)} ${label(s)} <b>${n(counts[s])}</b></span>`)}</div>`;
 }
 function emptyState(ic, title, text, action) {
-  return html`<div class="empty"><div class="ic">${icon(ic)}</div><h3>${title}</h3><p>${text}</p>${action || ''}</div>`;
+  return html`<div class="empty"><div class="ic">${icon(ic, 'art')}</div><h3>${title}</h3><p>${text}</p>${action || ''}</div>`;
 }
 function errorBox(e) {
   return html`<div class="callout bad"><div class="ic">${icon('triage')}</div><div><h3>Something went wrong</h3><p>${e.message || e}</p></div></div>`;
@@ -708,7 +718,7 @@ function renderNav() {
   const p = S.pulse;
   mount($('#nav'), NAV.map((it) => it.group ? html`<div class="nav-group">${it.group}</div>` :
     html`<a class="nav-item ${S.route === it.id ? 'active' : ''}" href="#/${it.id}">
-      ${it.step ? html`<span class="nav-step ${stepDone(it.id, p) && S.route !== it.id ? 'done' : ''}">${stepDone(it.id, p) && S.route !== it.id ? '✓' : it.step}</span>` : icon(it.icon)}
+      ${it.step ? html`<span class="nav-step ${stepDone(it.id, p) && S.route !== it.id ? 'done' : ''}">${stepDone(it.id, p) && S.route !== it.id ? '✓' : it.step}</span>` : icon(it.icon, 'art')}
       <span>${it.label}</span>${navBadge(it.id, p)}</a>`));
   if (S.info) {
     mount($('#side-foot'), html`<div class="row"><span>version</span><b>${S.info.version}</b></div>

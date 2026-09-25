@@ -87,6 +87,7 @@ store.set('vcfa-token', HP.get('bad') ? 'wrong-token' : HP.get('t'));
 store.set('vcfa-welcome', 'done');
 // Headless Chrome runs without a GPU, so Auto rendering resolves to Lite; &quality=full forces the glass.
 if (HP.get('quality') && window.FX) FX.prefs.quality = HP.get('quality');
+if (HP.get('fxtheme') && window.FX) FX.prefs.theme = HP.get('fxtheme');
 if (HP.get('theme')) store.set('vcfa-theme', HP.get('theme'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function flush() {
@@ -522,7 +523,24 @@ const SCENARIOS = {
     click('#fx-studio [data-fx="motion"][data-k="off"]');
     check('motion Off is applied to the page', document.body.dataset.motion === 'off');
     check('and remembered', JSON.parse(store.get('vcfa-fx')).motion === 'off');
+    // design-language skins: their own chrome, fonts and icons, no aurora
+    const root = document.documentElement;
+    click('#fx-studio .swatch[data-id="vmware-modern"]');
+    check('VMware Modern turns on the Clarity skin', await waitFor(() => root.dataset.skin === 'clarity') && root.style.colorScheme === 'dark');
+    check('the Clarity skin draws its own nav icons', await waitFor(() => document.querySelector('#nav .nav-item svg.skin-ic')));
+    check('Clarity buttons are uppercase', getComputedStyle(document.querySelector('#view .btn, #topbar .btn') || document.body).textTransform === 'uppercase');
+    check('a skin has no aurora, even with Full rendering', getComputedStyle(document.getElementById('fx-aurora')).display === 'none');
+    check('hue shift does not apply to a skin', document.querySelector('#fx-studio input[data-fx-in="shift"]').disabled);
+    check('a skin keeps its exact accent', accent() === '#49afd9', accent());
+    check('and its fonts', /Clarity City/.test(getComputedStyle(document.body).fontFamily), getComputedStyle(document.body).fontFamily);
+    click('#fx-studio .swatch[data-id="vcenter-classic"]');
+    check('vCenter Classic turns on the classic skin', await waitFor(() => root.dataset.skin === 'classic') && root.style.colorScheme === 'light');
+    check('with its blue gradient title bar', /gradient/.test(getComputedStyle(document.querySelector('.topbar')).backgroundImage));
+    check('and its colour icons in the navigation', await waitFor(() => document.querySelector('#nav .nav-item svg.skin-ic')));
+    check('but not inside tinted callout boxes', !document.querySelector('#view .callout .ic svg.skin-ic'));
+    check('status colours keep their meaning in a skin', /#3a9a3a/i.test(getComputedStyle(root).getPropertyValue('--s-committed')));
     click('#fx-studio [data-fx="resetFx"]');
+    check('reset drops the skin', await waitFor(() => !root.dataset.skin) && !document.querySelector('#nav svg.skin-ic'));
     check('reset restores Aurora', await waitFor(() => bg() === before) && FX.prefs.theme === 'aurora' && FX.prefs.shift === 0);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     check('Escape closes the studio', await waitFor(() => !document.querySelector('#fx-studio')));
@@ -1128,6 +1146,10 @@ def main():
         plan.append(("pages with Full rendering (glass)", "main", "pages", "&quality=full", (1440, 900)))
     if not args.only or "light" in (args.only or []):
         plan.append(("pages in light theme", "main", "pages", "&theme=light", (1440, 900)))
+    if not args.only or "skins" in (args.only or []):
+        plan.append(("pages in VMware Modern", "main", "pages", "&fxtheme=vmware-modern&quality=full", (1440, 900)))
+        plan.append(("pages in vCenter Classic", "main", "pages", "&fxtheme=vcenter-classic&quality=full", (1440, 900)))
+        plan.append(("pages in vCenter Classic @ 390px", "main", "pages", "&fxtheme=vcenter-classic&narrow=1", (390, 844)))
     if args.scale or "scale" in (args.only or []):
         plan.append(("scale: 1800 VMs", "scale", "scale", "", (1440, 900)))
 
