@@ -7,7 +7,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
 from .config import SAMPLE_CONFIG, Config, ConfigError
@@ -255,6 +255,7 @@ def cmd_discover(args) -> int:
 
     client = VCenterClient(server, user, password, insecure=args.insecure,
                            timeout=args.timeout, log=log)
+    extras: Dict[str, Any] = {}
     try:
         client.connect()
         vms = discover(
@@ -266,11 +267,13 @@ def cmd_discover(args) -> int:
             concurrency=args.concurrency,
             progress=progress,
             log=log,
+            extras=extras,
         )
     finally:
         client.close()
 
     summary = store.upsert_discovered(vms)
+    service.record_discovery(store, server, extras)
     store.set_meta("vcenter", server)
     store.set_meta("discovered_at", time.strftime("%Y-%m-%d %H:%M:%S"))
     counts = store.discovered_counts()
@@ -1067,6 +1070,36 @@ def cmd_namespaces(args) -> int:
     return 0
 
 
+def cmd_portgroups(args) -> int:
+    _cfg, store, _kube, _engine = _open(args)
+    data = service.vcenter_portgroups(store)
+    for note in data["notes"]:
+        log(note)
+    if data["portgroups"]:
+        log(report.table(["portgroup", "type", "VMs", "selected"],
+                         [[p["name"], p["type"].replace("_", " ").lower(), p["vms"] or "", p["selected"] or ""]
+                          for p in data["portgroups"]], indent="  "))
+        if data["discovered_at"]:
+            log("  as of the discovery at {}".format(data["discovered_at"]))
+    return 0
+
+
+def cmd_subnets(args) -> int:
+    _cfg, store, kube, _engine = _open(args)
+    names = [n["name"] for n in service.cluster_namespaces(kube)["namespaces"]]
+    names += [r["namespace"] for r in store.query_vms() if r["namespace"]]
+    data = service.cluster_subnets(kube, sorted(set(names)))
+    for note in data["notes"]:
+        log(note)
+    if not data["subnets"]:
+        log("no subnets found")
+        return 0
+    log(report.table(["subnet", "kind", "namespace", "display name"],
+                     [[s["name"], s["kind"], s["namespace"], s["display"]] for s in data["subnets"]], indent="  "))
+    log("  map a portgroup to the name in the first column (subnetInfo carries no namespace)")
+    return 0
+
+
 def cmd_readiness(args) -> int:
     from . import readiness
     _cfg, store, _kube, _engine = _open(args)
@@ -1520,6 +1553,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--refresh", action="store_true")
 
     add("namespaces", cmd_namespaces, "list the Supervisor namespaces you can map VMs to")
+    add("portgroups", cmd_portgroups, "list vCenter portgroups (as of the last discovery) with VM counts")
+    add("subnets", cmd_subnets, "list the Subnets and SubnetSets on the Supervisor you can map portgroups to")
 
     sp = add("readiness", cmd_readiness, "spot likely precheck failures from vCenter facts (advisory)")
     add_filters(sp)

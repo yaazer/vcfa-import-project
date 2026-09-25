@@ -4662,7 +4662,91 @@ def t_e2e_cluster_namespaces():
             os.environ.update(saved)
 
 
+@test("portgroup suggestions: vCenter's list from the last discovery, with VM counts")
+def t_vcenter_portgroups():
+    from vcfaimport import service
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        eq(service.vcenter_portgroups(store)["portgroups"], [])
+        store.upsert_discovered([
+            {"moref": "vm-1", "name": "a", "nics": [{"device_key": 4000, "network_name": "VLAN197-Prod"}]},
+            {"moref": "vm-2", "name": "b", "nics": [{"device_key": 4000, "network_name": "VLAN197-Prod"},
+                                                    {"device_key": 4001, "network_name": "VLAN200-DB"}]}])
+        store.set_selected(["vm-2"], True)
+        d = service.vcenter_portgroups(store)
+        eq([(x["name"], x["vms"], x["selected"]) for x in d["portgroups"]],
+           [("VLAN197-Prod", 2, 1), ("VLAN200-DB", 1, 1)], "before vCenter's list is kept: the VMs' own")
+        assert d["complete"] is False and "discover again" in d["notes"][0], d
+        service.record_discovery(store, "vc.lab", {"networks": [
+            {"name": "VLAN197-Prod", "type": "DISTRIBUTED_PORTGROUP"}, {"name": "VLAN300-Spare", "type": "STANDARD_PORTGROUP"}]})
+        d = service.vcenter_portgroups(store)
+        eq([(x["name"], x["type"], x["vms"]) for x in d["portgroups"]],
+           [("VLAN197-Prod", "DISTRIBUTED_PORTGROUP", 2), ("VLAN200-DB", "", 1), ("VLAN300-Spare", "STANDARD_PORTGROUP", 0)])
+        eq((d["complete"], d["notes"]), (True, []))
+        service.record_discovery(store, "vc.lab", {})          # a pass that learned no list keeps the old one
+        eq(len(service.vcenter_portgroups(store)["portgroups"]), 3)
+        store.close()
+
+
+@test("e2e: portgroups kept at discovery; subnets listed cluster-wide, or per namespace when not allowed")
+def t_e2e_portgroups_subnets():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from vcfaimport import service
+    from vcfaimport.kube import Kubectl
+    server, port = fake_vcenter.serve(count=8)
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy")
+            env.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                       VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            # the VPC case from the lab: the tenant namespace, and its subnet in the VPC's namespace
+            _seed_cluster(tmp, ["migration-testing-ns-kcvm5", "testing-vpc-k826r"],
+                          ["testing-vpc-k826r/migration-testing", "migration-testing-ns-kcvm5/subnet-local"])
+            cfg_path = _write_config(tmp)
+            _run_cli(["-c", cfg_path, "discover"], env, tmp)
+            out = _run_cli(["-c", cfg_path, "portgroups"], env, tmp).stdout
+            for name in ("VLAN197-Prod", "DMZ-Uplink", "VLAN300-Spare", "Lab-Isolated"):
+                assert name in out, (name, out)
+            assert "standard portgroup" in out and "as of the discovery" in out, out
+
+            os.environ.update(env)
+            cfg = Config.load(cfg_path)
+            d = service.cluster_subnets(Kubectl(cfg), ["migration-testing-ns-kcvm5"])
+            got = {(x["name"], x["namespace"]) for x in d["subnets"]}
+            eq(got, {("migration-testing", "testing-vpc-k826r"), ("subnet-local", "migration-testing-ns-kcvm5")})
+            eq((d["complete"], d["notes"]), (True, []), "SubnetSets not on this cluster is not an error")
+            vpc = next(x for x in d["subnets"] if x["name"] == "migration-testing")
+            eq((vpc["kind"], vpc["api_group"]), ("Subnet", "crd.nsx.vmware.com"))
+            local = next(x for x in d["subnets"] if x["name"] == "subnet-local")
+            eq(local["display"], "local", "a display name different from the name is kept")
+
+            os.environ["FAKE_KUBECTL_SUBNET_LIST"] = "forbidden"
+            d = service.cluster_subnets(Kubectl(cfg), ["migration-testing-ns-kcvm5"])
+            eq({x["name"] for x in d["subnets"]}, {"subnet-local"}, "per namespace: only what we may read")
+            eq(d["complete"], False)
+            assert "not allowed" in d["notes"][0] and "VPC" in d["notes"][0], d["notes"]
+            out = _run_cli(["-c", cfg_path, "subnets"], dict(env, FAKE_KUBECTL_SUBNET_LIST="forbidden"), tmp).stdout
+            assert "subnet-local" in out and "not allowed" in out, out
+            os.environ.pop("FAKE_KUBECTL_SUBNET_LIST")
+
+            c = _Console(tmp, Config.load(cfg_path))
+            try:
+                pg = c.ok("GET", "/api/vcenter/portgroups")
+                assert {"VLAN300-Spare", "Lab-Isolated"} <= {x["name"] for x in pg["portgroups"]}, pg
+                sn = c.ok("GET", "/api/cluster/subnets")
+                eq({x["name"] for x in sn["subnets"]}, {"migration-testing", "subnet-local"})
+            finally:
+                c.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+
+
 UNIT = [
+    t_vcenter_portgroups,
     t_stage_ns_conflicts,
     t_serve_open_headless, t_python_version_message,
     t_web_docs, t_help_doc_anchors,
@@ -4698,6 +4782,7 @@ UNIT = [
 ]
 
 E2E = [
+    t_e2e_portgroups_subnets,
     t_e2e_cluster_namespaces,
     t_e2e_web_governance, t_e2e_cli_governance,
     t_fake_operator_name_collision,

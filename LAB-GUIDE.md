@@ -200,7 +200,7 @@ open the Theme Studio (palette icon) and choose **Rendering: Lite**.
 | lab step | in the console |
 |---|---|
 | 4 discover / select | **Discover** (type the password in the page), then **Select VMs**: tick `Migration/Wave1` in the folder tree. The **Ready** column warns about VMs likely to fail precheck |
-| 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` in the folder map, and the VM's portgroup → subnet `migration-testing` with its namespace left blank. The namespaces on the Supervisor are listed above the maps (click one to fill the field you are in) and suggested as you type; a name that is not there is flagged. Check the preview -- it also warns if two maps name different namespaces for a VM -- then **Stage** |
+| 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` in the folder map, and the VM's portgroup → subnet `migration-testing` with its namespace left blank. The *What you can map to* card above the maps lists the namespaces, the subnets (`migration-testing` shows under its VPC namespace, `testing-vpc-k826r`) and the vCenter portgroups: click one to fill the field you are in, or type to get suggestions; a name that is not there is flagged. Check the preview -- it also warns if two maps name different namespaces for a VM -- then **Stage** |
 | 5 preflight / plan | **Execute → Run preflight**; the batch plan is shown before every run |
 | 6 precheck | **Execute → Precheck → wave 1**; follow the log panel. A DNS stall on the Supervisor shows up in **Triage** as *DNS lookup from the Supervisor timed out* |
 | 7 import, held | **Execute → Import** (dry run first if you like); VMs stop at *awaiting commit* |
@@ -267,7 +267,8 @@ ever removed and re-added may have 4001.
 
 Select them and assign the target. `vcfa-import namespaces` lists the
 namespaces you can use -- from the Supervisor, or from your kubeconfig's
-contexts if this login may not list them:
+contexts if this login may not list them. `vcfa-import subnets` and
+`vcfa-import portgroups` do the same for subnets and portgroups:
 
 ```bash
 vcfa-import select --folder Lab/Import --namespace <target-namespace> --wave 1

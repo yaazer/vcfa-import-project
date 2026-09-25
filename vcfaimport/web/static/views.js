@@ -473,30 +473,119 @@ const nsMissingText = () => (CNS.data && CNS.data.complete ? 'Not a namespace on
 const nsInputAttrs = (value) => (nsKnown(value) === false ? raw(' title="' + esc(nsMissingText()) + '"') : '');
 const nsInputClass = (value) => (nsKnown(value) === false ? 'unknown' : '');
 // The namespace field a click on a suggested namespace fills: the last one focused.
+// Portgroups (from the last discovery) and subnets (from the Supervisor), like the namespaces.
+const CPG = { data: null };
+function loadPortgroups() {   // a cheap read of the local cache: fetched on every page load
+  return GET('/api/vcenter/portgroups').then((d) => { CPG.data = d; return d; })
+    .catch((e) => { CPG.data = { portgroups: [], complete: false, notes: [e.message] }; return CPG.data; });
+}
+const CSN = { data: null, p: null };
+function loadSubnets(refresh) {
+  if (CSN.p && !refresh) return CSN.p;
+  CSN.p = GET('/api/cluster/subnets' + (refresh ? '?refresh=1' : ''))
+    .then((d) => { CSN.data = d; return d; })
+    .catch((e) => { CSN.data = { subnets: [], complete: false, notes: [e.message] }; return CSN.data; });
+  return CSN.p;
+}
+/** fnmatch-style pattern (as the portgroup map uses) to a case-insensitive RegExp. */
+function globRe(pattern) {
+  const body = pattern.toLowerCase().replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.').replace(/\[!/g, '[^');
+  try { return new RegExp('^' + body + '$'); } catch (e) { return null; }
+}
+/** false when a portgroup-map key matches no portgroup vCenter listed; null without a list. */
+function pgKnown(key) {
+  key = (key || '').trim();
+  const d = CPG.data;
+  if (!key || !d || !d.portgroups.length) return null;
+  const re = globRe(key);
+  return d.portgroups.some((x) => x.name.toLowerCase() === key.toLowerCase() || (re && re.test(x.name.toLowerCase())));
+}
+/** false when a subnet is not on the Supervisor -- judged only on a complete listing: a partial
+ * one (listing not allowed) can miss a VPC's subnets, and would flag correct names. */
+function subnetKnown(name) {
+  name = (name || '').trim();
+  const d = CSN.data;
+  if (!name || !d || !d.complete || !d.subnets.length) return null;
+  return d.subnets.some((x) => x.name === name);
+}
+const FIELD_CHECK = {
+  namespace: [nsKnown, nsMissingText],
+  portgroup: [pgKnown, () => 'Matches no portgroup in vCenter (as of the last discovery) — check the spelling'],
+  subnet: [subnetKnown, () => 'Not a Subnet or SubnetSet on the Supervisor — check the spelling. A VPC’s subnets are named as in the VPC’s own namespace'],
+};
+const fieldBad = (kind, value) => !!FIELD_CHECK[kind] && FIELD_CHECK[kind][0](value) === false;
+const fieldAttrs = (kind, value) => (fieldBad(kind, value) ? raw(' title="' + esc(FIELD_CHECK[kind][1]()) + '"') : '');
+function pgOptions(extra) {
+  const seen = new Set(), out = [];
+  for (const x of (CPG.data ? CPG.data.portgroups : [])) { seen.add(x.name); out.push(html`<option value="${x.name}">`); }
+  for (const x of extra || []) if (x && !seen.has(x)) { seen.add(x); out.push(html`<option value="${x}">`); }
+  return out;
+}
+function subnetOptions(extra) {
+  const seen = new Set(), out = [];
+  for (const x of (CSN.data ? CSN.data.subnets : [])) if (!seen.has(x.name)) { seen.add(x.name); out.push(html`<option value="${x.name}">`); }
+  for (const x of extra || []) if (x && !seen.has(x)) { seen.add(x); out.push(html`<option value="${x}">`); }
+  return out;
+}
+// The field a click on a suggestion fills: the last field focused, if it is of the same kind.
+// Focusing any other field clears it (a button, like the suggestion itself, does not).
+const PICK = { kind: null, id: null };
 document.addEventListener('focusin', (e) => {
   const t = e.target;
-  if (t && t.matches && t.matches('input[data-col="namespace"], #def-ns, #bulk-ns')) CNS.target = t.id;
+  if (!t || !t.matches) return;
+  const kind = t.matches('input[data-col="namespace"], #def-ns, #bulk-ns') ? 'namespace'
+    : t.matches('input[data-col="subnet"]') ? 'subnet' : t.matches('input[data-col="portgroup"]') ? 'portgroup' : null;
+  if (kind) { PICK.kind = kind; PICK.id = t.id; if (kind === 'namespace') CNS.target = t.id; }
+  else if (t.matches('input, select, textarea')) { PICK.kind = null; PICK.id = null; }
 });
-function nsPanel(v) {
-  const c = CNS.data;
-  if (!c) return html`<div class="card mt nsbar"><div class="card-b small muted"><span class="spinner"></span> Looking up the namespaces on the Supervisor…</div></div>`;
-  const inUse = new Set([].concat(v.fr, v.nr, v.tr).map((r) => (r.namespace || '').trim()).concat([(v.defaults.ns || '').trim()]).filter(Boolean));
-  const missing = [...inUse].filter((n) => nsKnown(n) === false).sort();
-  const shown = c.namespaces.slice(0, 40);
-  return html`<div class="card mt nsbar"><div class="card-b">
-    <div class="row wrap" style="gap:6px">
-      <span class="small muted nsbar-l">${c.complete ? 'Namespaces on the Supervisor' : 'Namespaces you can use'} ${tip('cluster_namespaces')}</span>
-      ${shown.map((n) => html`<button type="button" class="chip nschip ${inUse.has(n.name) ? 'on' : ''}" data-act="pickNs" data-ns="${n.name}"
-        title="${NS_SEEN[n.source] || ''} · click to put it in the namespace field you last clicked">${n.name}</button>`)}
-      ${c.namespaces.length > shown.length ? html`<span class="small muted">+${n(c.namespaces.length - shown.length)} more — type in a Namespace field to search them</span>` : ''}
-      ${c.namespaces.length ? '' : html`<span class="small muted">none found</span>`}
-      <span class="grow"></span>
-      <button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again">${icon('refresh')} Refresh</button>
-    </div>
-    ${c.notes.map((x) => html`<div class="tiny faint mt-s">${x}</div>`)}
-    ${missing.length ? html`<div class="note warn mt-s"><b>${plural(missing.length, 'namespace')} in these maps ${c.complete ? 'not found on the Supervisor' : 'not among your kubeconfig namespaces'}:</b>
-      <span class="mono">${missing.join(', ')}</span>. Check the spelling; VMs mapped there would fail preflight.</div>` : ''}
-  </div></div>`;
+function pickTarget(kind) {
+  const el = PICK.kind === kind && PICK.id ? document.getElementById(PICK.id) : null;
+  return el && el.isConnected ? el : null;
+}
+function fillField(el, value) {
+  el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.focus();
+}
+function targetsPanel(v) {
+  const c = CNS.data, sn = CSN.data, pg = CPG.data;
+  const trimmed = (rows, col) => rows.map((r) => (r[col] || '').trim()).filter(Boolean);
+  const usedNs = new Set(trimmed([].concat(v.fr, v.nr, v.tr), 'namespace').concat(trimmed([v.defaults], 'ns')));
+  const usedSubnets = new Set(trimmed(v.nr, 'subnet'));
+  const usedPg = new Set(trimmed(v.nr, 'portgroup'));
+  const missingNs = [...usedNs].filter((x) => nsKnown(x) === false).sort();
+  const badSubnets = [...usedSubnets].filter((x) => subnetKnown(x) === false).sort();
+  const badPg = [...usedPg].filter((x) => pgKnown(x) === false).sort();
+  const looking = html`<span class="small muted"><span class="spinner"></span> looking…</span>`;
+  const more = (total, shown, what) => (total > shown ? html`<span class="small muted">+${n(total - shown)} more — type in a ${what} field to search them</span>` : '');
+  const none = (what) => html`<span class="small muted">${what}</span>`;
+  const nsRow = !c ? looking : html`${c.namespaces.slice(0, 40).map((x) => html`<button type="button" class="chip nschip ${usedNs.has(x.name) ? 'on' : ''}" data-act="pickNs" data-ns="${x.name}"
+      title="${NS_SEEN[x.source] || ''} · click to put it in the namespace field you last clicked">${x.name}</button>`)}
+    ${more(c.namespaces.length, 40, 'Namespace')}${c.namespaces.length ? '' : none('none found')}`;
+  const snRow = !sn ? looking : html`${sn.subnets.slice(0, 40).map((x) => html`<button type="button" class="chip nschip sbchip ${usedSubnets.has(x.name) ? 'on' : ''}" data-act="pickSubnet"
+      data-name="${x.name}" data-kind="${x.kind}" title="${x.kind} in namespace ${x.namespace}${x.display ? ' · shown in VCF Automation as ' + x.display : ''} · click to put it in the subnet field you last clicked">${x.name}<small>${x.namespace}</small></button>`)}
+    ${more(sn.subnets.length, 40, 'Subnet')}${sn.subnets.length ? '' : none('none visible to you')}`;
+  const pgs = pg ? pg.portgroups.slice().sort((a, b) => (b.selected - a.selected) || (b.vms - a.vms) || a.name.localeCompare(b.name)) : [];
+  const pgRow = !pg ? looking : html`${pgs.slice(0, 40).map((x) => html`<button type="button" class="chip nschip pgchip ${usedPg.has(x.name) ? 'on' : ''}" data-act="pickPg" data-name="${x.name}"
+      title="${(x.type || 'network').replace(/_/g, ' ').toLowerCase()} · ${plural(x.vms, 'discovered VM')} (${n(x.selected)} selected) · click to fill the portgroup field you last clicked, or to add it to the portgroup map">${x.name}${x.vms ? html`<small>${n(x.selected || x.vms)}</small>` : ''}</button>`)}
+    ${more(pgs.length, 40, 'Portgroup')}${pgs.length ? '' : none('discover first')}`;
+  const row = (label, key, body) => html`<div class="tgt-row"><span class="small muted nsbar-l">${label} ${tip(key)}</span><div class="tgt-chips">${body}</div></div>`;
+  const notes = [].concat(c ? c.notes : [], sn ? sn.notes : [], pg ? pg.notes : []);
+  return html`<div class="card mt nsbar"><div class="card-h"><h3>What you can map to</h3>
+      <span class="sub">from the Supervisor and the last vCenter discovery${sn && sn.checked_at ? ' · checked ' + fmtTime(sn.checked_at) : ''}</span>
+      <div class="tools"><button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again and re-read the discovery">${icon('refresh')} Refresh</button></div></div>
+    <div class="card-b stack" style="gap:10px">
+      ${row(c && !c.complete ? 'Namespaces you can use' : 'Namespaces on the Supervisor', 'cluster_namespaces', nsRow)}
+      ${row('Subnets on the Supervisor', 'cluster_subnets', snRow)}
+      ${row('Portgroups in vCenter', 'vcenter_portgroups', pgRow)}
+      ${notes.map((x) => html`<div class="tiny faint">${x}</div>`)}
+      ${missingNs.length ? html`<div class="note warn"><b>${plural(missingNs.length, 'namespace')} in these maps ${c.complete ? 'not found on the Supervisor' : 'not among your kubeconfig namespaces'}:</b>
+        <span class="mono">${missingNs.join(', ')}</span>. Check the spelling; VMs mapped there would fail preflight.</div>` : ''}
+      ${badSubnets.length ? html`<div class="note warn"><b>${plural(badSubnets.length, 'subnet')} in the portgroup map not found on the Supervisor:</b>
+        <span class="mono">${badSubnets.join(', ')}</span>. Check the spelling; in a VPC namespace use the name from the VPC’s own namespace.</div>` : ''}
+      ${badPg.length ? html`<div class="note warn"><b>${plural(badPg.length, 'portgroup entry', 'portgroup entries')} match no portgroup in vCenter:</b>
+        <span class="mono">${badPg.join(', ')}</span>. Check the spelling (as of the last discovery).</div>` : ''}
+    </div></div>`;
 }
 function nsConflicts(p) {
   const list = p.ns_conflicts || [];
@@ -520,7 +609,10 @@ VIEWS.stage = view({
     v.tr = m.tag.rows.map((r) => Object.assign({}, r));
     v.saved = mapsSig(v);
     v.preview = await POST('/api/stage/preview', stageBody(v));
-    loadClusterNs().then(() => { if (S.view === v && v.loaded) v.render(); });
+    const redraw = () => { if (S.view === v && v.loaded) v.render(); };
+    loadClusterNs().then(redraw);
+    loadSubnets().then(redraw);
+    loadPortgroups().then(redraw);
   },
   paint(v) {
     const p = v.preview;
@@ -531,8 +623,10 @@ VIEWS.stage = view({
       <div class="note info">A VM's <b>namespace</b> comes from, in order: the namespace set on it in Select, the tag map, the folder map (most specific folder wins), the portgroup map, then the default below.
         <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.
         Name a VM's namespace in one place — usually the folder map — and use the portgroup map for subnets.</div>
-      ${nsPanel(v)}
+      ${targetsPanel(v)}
       <datalist id="ns-options">${nsOptions(inMaps)}</datalist>
+      <datalist id="pg-options">${pgOptions(uniq(v.nr.map((r) => r.portgroup)).sort())}</datalist>
+      <datalist id="subnet-options">${subnetOptions(uniq(v.nr.map((r) => r.subnet)).sort())}</datalist>
       <div class="grid two mt">
         <div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
           <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage)}</div></div>
@@ -564,20 +658,40 @@ VIEWS.stage = view({
   act: {
     cell(t, e, v) {
       rowsOf(v, t.dataset.m)[+t.dataset.i][t.dataset.col] = t.value;
-      if (t.dataset.col === 'namespace') markNs(t);
+      if (FIELD_CHECK[t.dataset.col]) markField(t, t.dataset.col);
       schedulePreview(v);
     },
     pickNs(t, e, v) {
-      const el = CNS.target && document.getElementById(CNS.target);
-      if (!el || !el.isConnected) {
-        toast('Click into a Namespace field first', 'Then pick a namespace here — or start typing in the field to search them.', 'info', 4500);
-        return;
-      }
-      el.value = t.dataset.ns;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.focus();
+      const el = pickTarget('namespace');
+      if (!el) { toast('Click into a Namespace field first', 'Then pick a namespace here — or start typing in the field to search them.', 'info', 4500); return; }
+      fillField(el, t.dataset.ns);
     },
-    async nsRefresh(t, e, v) { await loadClusterNs(true); v.render(); },
+    pickSubnet(t, e, v) {
+      const el = pickTarget('subnet');
+      if (!el) { toast('Click into a Subnet field first', 'Then pick a subnet here — or start typing in the field to search them.', 'info', 4500); return; }
+      fillField(el, t.dataset.name);
+      const m = /^n-(\d+)-subnet$/.exec(el.id), row = m && v.nr[+m[1]];
+      // subnetInfo names the kind too: a SubnetSet needs it on that row unless it is the default.
+      if (row && t.dataset.kind === 'SubnetSet' && !row.subnet_kind && S.info.settings.subnet_kind !== 'SubnetSet') {
+        row.subnet_kind = 'SubnetSet';
+        toast('Kind set to SubnetSet for this portgroup', 'It is a SubnetSet, not a Subnet (see Advanced columns).', 'info', 5000);
+        schedulePreview(v);
+      }
+    },
+    pickPg(t, e, v) {
+      const name = t.dataset.name, el = pickTarget('portgroup');
+      if (el) { fillField(el, name); return; }
+      const at = v.nr.findIndex((r) => (r.portgroup || '') === name);
+      if (at < 0) {
+        v.nr.push({ portgroup: name, namespace: '', subnet: '', wave: '', device_key: '', subnet_kind: '', subnet_api_group: '' });
+        v.render();
+        schedulePreview(v);
+      }
+      const f = document.getElementById('n-' + (at < 0 ? v.nr.length - 1 : at) + '-subnet');
+      if (f) f.focus();
+      if (at >= 0) toast(name + ' is already in the portgroup map', 'Its subnet field is selected.', 'info', 3500);
+    },
+    async nsRefresh(t, e, v) { await Promise.all([loadClusterNs(true), loadSubnets(true), loadPortgroups()]); v.render(); },
     addRow(t, e, v) {
       const m = t.dataset.m;
       const rows = rowsOf(v, m);
@@ -628,11 +742,12 @@ VIEWS.stage = view({
     },
   },
 });
-function markNs(input) {
-  const bad = nsKnown(input.value) === false;
+function markField(input, kind) {
+  const bad = fieldBad(kind, input.value);
   input.classList.toggle('unknown', bad);
-  if (bad) input.title = nsMissingText(); else input.removeAttribute('title');
+  if (bad) input.title = FIELD_CHECK[kind][1](); else input.removeAttribute('title');
 }
+const markNs = (input) => markField(input, 'namespace');
 function stageBody(v) {
   return { folder_rows: v.fr, network_rows: v.nr, tag_rows: v.tr, default_namespace: v.defaults.ns, default_wave: parseInt(v.defaults.wave, 10) || 1 };
 }
@@ -667,12 +782,12 @@ function mapTable(v, m) {
   const rows = rowsOf(v, m);
   const cols = m === 'f' ? [['folder', 'Folder', ''], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', ''], ['group', 'Batch group', '']]
     : m === 't' ? [['tag', 'Tag (Category:Tag)', ''], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', ''], ['group', 'Batch group', '']]
-    : [['portgroup', 'Portgroup', ''], ['subnet', 'Subnet', ''], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', '']]
+    : [['portgroup', 'Portgroup', 'pg-options'], ['subnet', 'Subnet', 'subnet-options'], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', '']]
       .concat(v.adv ? [['device_key', 'Device key', ''], ['subnet_kind', 'Kind', ''], ['subnet_api_group', 'API group', '']] : []);
   if (!rows.length) return html`<div class="card-b small muted">No entries yet. Use <b>+ Map</b> next to a ${m === 'f' ? 'folder' : m === 't' ? 'tag' : 'network'} above, or add one.</div>`;
   return html`<div class="table-wrap" style="max-height:340px" data-scroll="map-${m}"><table class="t maptable"><thead><tr>${cols.map((c) => html`<th>${c[1]}</th>`)}<th></th></tr></thead><tbody>
-    ${rows.map((r, i) => html`<tr>${cols.map(([k, , list]) => html`<td style="${k === 'wave' || k === 'device_key' ? 'width:70px' : ''}"><input class="input ${k === 'folder' || k === 'portgroup' || k === 'tag' ? 'mono' : ''} ${k === 'namespace' ? nsInputClass(r[k]) : ''}"
-      id="${m}-${i}-${k}" data-input="cell" data-m="${m}" data-i="${i}" data-col="${k}" value="${r[k] || ''}" ${list ? raw(`list="${list}"`) : ''} ${k === 'wave' || k === 'device_key' ? raw('inputmode="numeric"') : ''}${k === 'namespace' ? nsInputAttrs(r[k]) : ''}></td>`)}
+    ${rows.map((r, i) => html`<tr>${cols.map(([k, , list]) => html`<td style="${k === 'wave' || k === 'device_key' ? 'width:70px' : ''}"><input class="input ${k === 'folder' || k === 'portgroup' || k === 'tag' ? 'mono' : ''} ${fieldBad(k, r[k]) ? 'unknown' : ''}"
+      id="${m}-${i}-${k}" data-input="cell" data-m="${m}" data-i="${i}" data-col="${k}" value="${r[k] || ''}" ${list ? raw(`list="${list}"`) : ''} ${k === 'wave' || k === 'device_key' ? raw('inputmode="numeric"') : ''}${fieldAttrs(k, r[k])}></td>`)}
       <td style="width:34px"><button class="btn ghost icon sm" data-act="delRow" data-m="${m}" data-i="${i}" title="Remove">${icon('x')}</button></td></tr>`)}</tbody></table></div>`;
 }
 function covFolders(cov) {

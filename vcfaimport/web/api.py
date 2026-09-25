@@ -759,12 +759,14 @@ class WebApp:
                                    timeout=timeout, log=job.log)
             try:
                 client.connect()
+                extras: Dict[str, Any] = {}
                 vms = discover(client, progress=lambda d, t: job.set_progress(
-                    d, t, "VM details read"), log=job.log, **opts)
+                    d, t, "VM details read"), log=job.log, extras=extras, **opts)
             finally:
                 client.close()
             with self._job_workspace(job) as ws:
                 summary = ws.store.upsert_discovered(vms)
+                service.record_discovery(ws.store, server, extras)
                 ws.store.set_meta("vcenter", server)
                 ws.store.set_meta("discovered_at", _local_now())
                 counts = ws.store.discovered_counts()
@@ -1029,6 +1031,26 @@ class WebApp:
         data["checked_at"] = _local_now()
         data["context"] = self.cfg.context or ""
         self._ns_cache = (time.time(), data)
+        return data
+
+    def vcenter_portgroups(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            return service.vcenter_portgroups(self.store)
+
+    def cluster_subnets(self, q, body) -> Dict[str, Any]:
+        """Subnet suggestions; cached like the namespaces, since each look is several kubectl calls."""
+        cached = getattr(self, "_subnet_cache", None)
+        if cached and not q.get("refresh") and time.time() - cached[0] < 120:
+            return cached[1]
+        names = [n["name"] for n in self.cluster_namespaces({"refresh": q.get("refresh")}, {})["namespaces"]]
+        with self.lock:
+            names += [r["namespace"] for r in self.store.query_vms() if r["namespace"]]
+            for rows in self._map_rows():
+                names += [r.get("namespace", "") for r in rows]
+            names += [r.get("namespace", "") for r in self._tag_rows()]
+        data = service.cluster_subnets(Kubectl(self.cfg), sorted(set(n for n in names if n)))
+        data["checked_at"] = _local_now()
+        self._subnet_cache = (time.time(), data)
         return data
 
     def docs(self, q, body, name: str) -> Dict[str, Any]:
@@ -1371,6 +1393,8 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/me", "me"),
         ("GET", r"/api/docs/(?P<name>[a-z]+)", "docs"),
         ("GET", r"/api/cluster/namespaces", "cluster_namespaces"),
+        ("GET", r"/api/cluster/subnets", "cluster_subnets"),
+        ("GET", r"/api/vcenter/portgroups", "vcenter_portgroups"),
         ("GET", r"/api/readiness", "readiness_summary"),
         ("GET", r"/api/apps", "apps"),
         ("GET", r"/api/approvals", "approvals"),
