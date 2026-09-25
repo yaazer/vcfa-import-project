@@ -50,6 +50,8 @@ def folder_path(fid: str) -> str:
         fid = parent
     return "/".join(reversed(parts))
 NETWORKS = ["VLAN197-Prod", "VLAN200-DB", "VLAN210-App", "DMZ-Uplink"]
+# Portgroups no VM uses (yet): mapping suggestions must list these too.
+SPARE_NETWORKS = [("VLAN300-Spare", "DISTRIBUTED_PORTGROUP"), ("Lab-Isolated", "STANDARD_PORTGROUP")]
 
 # vSphere tags: an "Application" category that spans folders (so apps are not
 # just folders by another name) and a "Tier" category derived from the name.
@@ -255,7 +257,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/vcenter/network":
             self._send(200, [{"network": "dvportgroup-{}".format(100 + i), "name": name,
                               "type": "DISTRIBUTED_PORTGROUP"}
-                             for i, name in enumerate(NETWORKS)])
+                             for i, name in enumerate(NETWORKS)]
+                       + [{"network": "network-{}".format(200 + i), "name": name, "type": kind}
+                          for i, (name, kind) in enumerate(SPARE_NETWORKS)])
             return
 
         if path == "/api/vcenter/host":

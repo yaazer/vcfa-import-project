@@ -463,6 +463,11 @@ def main(argv: list) -> int:
             return 0
 
         if base in ("subnet", "subnets"):
+            if name is None and not ns and os.environ.get("FAKE_KUBECTL_SUBNET_LIST") == "forbidden":
+                sys.stderr.write('Error from server (Forbidden): subnets.crd.nsx.vmware.com is forbidden: User '
+                                 '"sso:admin@vsphere.local" cannot list resource "subnets" in API group '
+                                 '"crd.nsx.vmware.com" at the cluster scope\n')
+                return 1
             if name is None:
                 # A listing: everything seeded for this namespace, shaped like the API.
                 items = []

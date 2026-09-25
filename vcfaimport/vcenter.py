@@ -362,15 +362,19 @@ class VCenterClient:
         except VCenterError:
             return []
 
-    def networks(self) -> Dict[str, str]:
-        out: Dict[str, str] = {}
+    def network_list(self) -> List[Dict[str, str]]:
+        """Every network vCenter knows: {id, name, type} (DISTRIBUTED_PORTGROUP, STANDARD_PORTGROUP, ...)."""
+        out: List[Dict[str, str]] = []
         try:
             for net in self.get("/vcenter/network") or []:
                 if net.get("network"):
-                    out[net["network"]] = net.get("name", "")
+                    out.append({"id": net["network"], "name": net.get("name", ""), "type": net.get("type", "")})
         except VCenterError:
             pass
         return out
+
+    def networks(self) -> Dict[str, str]:
+        return {n["id"]: n["name"] for n in self.network_list()}
 
     def hosts(self) -> Dict[str, str]:
         out: Dict[str, str] = {}
@@ -510,6 +514,7 @@ def discover(
     concurrency: int = 12,
     progress: Optional[Callable[[int, int], None]] = None,
     log: Optional[Callable[[str], None]] = None,
+    extras: Optional[Dict[str, Any]] = None,
 ) -> List[DiscoveredVm]:
     """Pull the full VM inventory. One list call, then details in parallel."""
     say = log or (lambda msg: None)
@@ -520,8 +525,13 @@ def discover(
     if not listing:
         return []
 
-    networks = client.networks()
+    network_list = client.network_list()
+    networks = {n["id"]: n["name"] for n in network_list}
     say("  {} network(s) resolved".format(len(networks)))
+    if extras is not None:
+        # Kept by the caller, so portgroup fields can suggest every portgroup --
+        # including ones no discovered VM uses yet.
+        extras["networks"] = [{"name": n["name"], "type": n["type"]} for n in network_list if n["name"]]
 
     folder_of: Dict[str, str] = {}
     dc_of: Dict[str, str] = {}

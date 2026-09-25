@@ -284,7 +284,7 @@ const SCENARIOS = {
     check('the Supervisor\'s namespaces are listed while mapping', chip && /prod-web-ns1/.test(document.querySelector('.nsbar').textContent),
       document.querySelector('.nsbar') && document.querySelector('.nsbar').textContent.slice(0, 160));
     check('system namespaces are left out', !/kube-system|vmware-system|svc-/.test(document.querySelector('.nsbar').textContent));
-    const nsOpts = [...document.querySelectorAll('#ns-options option, #ns-list option')];
+    const nsOpts = [...document.querySelectorAll('#ns-options option, #ns-list option, #pg-options option, #subnet-options option')];
     check('every namespace field suggests them', nsOpts.some((o) => o.value === 'prod-db-ns2'));
     // Some browsers show an option's label in place of its value: the name itself must be what shows.
     check('the suggestions show the namespace names themselves', nsOpts.length && nsOpts.every((o) => !o.hasAttribute('label') && (!o.textContent || o.textContent === o.value)),
@@ -301,6 +301,32 @@ const SCENARIOS = {
     check('and listed above the maps', await waitFor(() => { S.view.render(); return /prod-web-nsl/.test((document.querySelector('.nsbar .note.warn') || {}).textContent || ''); }, 4000));
     click('[data-act="delRow"][data-m="f"][data-i="' + k + '"]');
     await waitFor(() => S.view.fr.length === k, 3000);
+
+    // portgroups from the last discovery, subnets from the Supervisor
+    const pgChip = await waitFor(() => [...document.querySelectorAll('.nsbar .pgchip')].find((x) => x.dataset.name === 'VLAN300-Spare'), 10000);
+    check('every vCenter portgroup is listed, even one no VM uses', pgChip);
+    const sbChip = await waitFor(() => [...document.querySelectorAll('.nsbar .sbchip')].find((x) => x.dataset.name === 'subnet-vlan197'), 10000);
+    check('the Supervisor\'s subnets are listed with their namespace', sbChip && /^(prod-web-ns1|prod-db-ns2|dmz-ns3)$/.test((sbChip.querySelector('small') || {}).textContent || ''), sbChip && sbChip.textContent);
+    check('portgroup and subnet fields suggest them', document.querySelector('#pg-options option[value="VLAN300-Spare"]') && document.querySelector('#subnet-options option[value="subnet-vlan200"]'));
+    check('the portgroup and subnet columns are wired to them', document.getElementById('n-0-portgroup').getAttribute('list') === 'pg-options' && document.getElementById('n-0-subnet').getAttribute('list') === 'subnet-options');
+    document.getElementById('def-wave').focus();          // no portgroup field in focus: the click adds a row
+    const nBefore = S.view.nr.length;
+    pgChip.click();
+    check('clicking an unmapped portgroup adds it to the portgroup map', await waitFor(() => S.view.nr.length === nBefore + 1 && S.view.nr[nBefore].portgroup === 'VLAN300-Spare', 3000));
+    check('and puts you in its subnet field', await waitFor(() => document.activeElement && document.activeElement.id === 'n-' + nBefore + '-subnet', 3000), document.activeElement && document.activeElement.id);
+    [...document.querySelectorAll('.nsbar .sbchip')].find((x) => x.dataset.name === 'subnet-dmz').click();
+    check('clicking a subnet fills the subnet field you are in', await waitFor(() => S.view.nr[nBefore].subnet === 'subnet-dmz', 3000), S.view.nr[nBefore].subnet);
+    type('#n-' + nBefore + '-subnet', 'subnet-dmx');
+    check('a subnet not on the Supervisor is flagged', document.getElementById('n-' + nBefore + '-subnet').classList.contains('unknown'));
+    type('#n-' + nBefore + '-portgroup', 'VLAN9*');
+    check('a portgroup pattern that matches nothing is flagged', document.getElementById('n-' + nBefore + '-portgroup').classList.contains('unknown'));
+    type('#n-' + nBefore + '-portgroup', 'vlan3*');
+    check('a pattern matches portgroups case-insensitively, as staging does', !document.getElementById('n-' + nBefore + '-portgroup').classList.contains('unknown'));
+    document.getElementById('def-wave').focus();
+    [...document.querySelectorAll('.nsbar .sbchip')][0].click();
+    check('a subnet click with no subnet field in focus explains what to do', await waitFor(() => [...document.querySelectorAll('.toast')].some((x) => /Subnet field first/.test(x.textContent)), 3000));
+    click('[data-act="delRow"][data-m="n"][data-i="' + nBefore + '"]');
+    await waitFor(() => S.view.nr.length === nBefore, 3000);
 
     // two maps disagree about a VM's namespace
     const ni = S.view.nr.findIndex((r) => r.portgroup === 'DMZ-Uplink');   // the Databases VMs' network in the fake vCenter

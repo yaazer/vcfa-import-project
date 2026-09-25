@@ -900,3 +900,10 @@ body[data-fx="lite"] .dock.live::before, body[data-fx="lite"] .jobchip, body[dat
 button.chip.nschip { background: transparent; font: inherit; font-family: var(--mono); font-size: 12px; color: var(--muted); padding: 3px 10px; }
 button.chip.nschip.on { color: var(--fg); }
 .maptable input.unknown, .input.unknown { border-color: color-mix(in oklab, var(--warn) 70%, transparent); background: var(--warn-soft); }
+
+/* ------------------------------------------------ what you can map to */
+.tgt-row { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 10px; align-items: start; }
+.tgt-row .nsbar-l { padding-top: 4px; }
+.tgt-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+button.chip.nschip small { margin-left: 6px; font-size: 10.5px; color: var(--faint); font-family: var(--sans); }
+@media (max-width: 860px) { .tgt-row { grid-template-columns: minmax(0, 1fr); gap: 4px; } }

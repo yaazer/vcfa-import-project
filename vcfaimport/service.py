@@ -673,3 +673,100 @@ def cluster_namespaces(kube: Kubectl) -> Dict[str, Any]:
         }.get(why, "Could not list namespaces ({}); showing {}.".format(why, source)))
     out["namespaces"] = [{"name": n, "source": src} for n, src in sorted(names.items())]
     return out
+
+
+# ------------------------------------------------------------ vCenter portgroups
+def record_discovery(store: st.Store, server: str, extras: Optional[Dict[str, Any]]) -> None:
+    """What a discovery pass learned besides the VMs: vCenter's network list."""
+    if extras and extras.get("networks") is not None:
+        store.set_meta("vc_networks", {"server": server, "networks": extras["networks"]})
+
+
+def vcenter_portgroups(store: st.Store) -> Dict[str, Any]:
+    """Portgroups to suggest while mapping: every network vCenter listed at the
+    last discovery, plus any a discovered VM uses; with how many (selected) VMs
+    sit on each. No vCenter call -- that would need the password again."""
+    kept = store.get_meta("vc_networks") or {}
+    types: Dict[str, str] = {n["name"]: n.get("type", "") for n in (kept.get("networks") or []) if n.get("name")}
+    vms: Dict[str, int] = {}
+    selected: Dict[str, int] = {}
+    for r in store.query_discovered():
+        for net in {n.strip() for n in (r["networks"] or "").split(",") if n.strip()}:
+            vms[net] = vms.get(net, 0) + 1
+            if r["selected"]:
+                selected[net] = selected.get(net, 0) + 1
+    names = sorted(set(types) | set(vms), key=str.lower)
+    return {
+        "portgroups": [{"name": n, "type": types.get(n, ""), "vms": vms.get(n, 0), "selected": selected.get(n, 0)}
+                       for n in names],
+        "complete": bool(kept),
+        "discovered_at": store.get_meta("discovered_at"),
+        "notes": [] if kept else (["Only the portgroups your discovered VMs use: discover again to list every "
+                                   "portgroup in vCenter."] if names else ["Nothing discovered yet: run Discover first."]),
+    }
+
+
+# ------------------------------------------------------------ Supervisor subnets
+# Kinds a VM's subnetInfo can name (see config subnet_kind / subnet_api_group).
+SUBNET_RESOURCES = (("subnets.crd.nsx.vmware.com", "Subnet"), ("subnetsets.crd.nsx.vmware.com", "SubnetSet"))
+
+
+def cluster_subnets(kube: Kubectl, namespaces: Sequence[str] = ()) -> Dict[str, Any]:
+    """Subnets and SubnetSets to suggest while mapping, with the namespace each
+    lives in (a VPC namespace's subnets live in the VPC's own namespace) and
+    its display name. Lists cluster-wide when allowed; otherwise namespace by
+    namespace for the ones given. `complete` is False when some could not be read."""
+    out: Dict[str, Any] = {"subnets": [], "complete": True, "notes": []}
+    found: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    def take(listing: Dict[str, Any], kind: str, group: str) -> None:
+        for item in (listing or {}).get("items") or []:
+            meta = item.get("metadata") or {}
+            name, ns = meta.get("name", ""), meta.get("namespace", "")
+            if not name:
+                continue
+            display = ((meta.get("annotations") or {}).get("vmware-system-display-name")
+                       or (meta.get("labels") or {}).get("vmware-system-display-name") or "")
+            found[(ns, kind, name)] = {"name": name, "namespace": ns, "kind": item.get("kind") or kind,
+                                       "api_group": group, "display": display if display != name else ""}
+
+    for resource, kind in SUBNET_RESOURCES:
+        group = resource.split(".", 1)[1]
+        try:
+            proc = kube.run(["get", resource, "-A", "-o", "json"], check=False, timeout=25, retries=0)
+        except KubectlError as exc:
+            out["complete"] = False
+            out["notes"].append("Could not list {}s: {}".format(kind, str(exc).splitlines()[-1][:160] if str(exc) else "kubectl failed"))
+            break
+        if proc.returncode == 0:
+            try:
+                take(json.loads(proc.stdout or "{}"), kind, group)
+            except ValueError:
+                out["complete"] = False
+            continue
+        err = (proc.stderr or "").strip()
+        if "doesn't have a resource type" in err or "the server doesn't have" in err:
+            continue                       # this kind does not exist on this cluster
+        # Not allowed (or not answered) cluster-wide: read the namespaces we know instead.
+        unreadable = []
+        for ns in list(dict.fromkeys(n for n in namespaces if n))[:25]:
+            p2 = kube.run(["get", resource, "-n", ns, "-o", "json"], check=False, timeout=20, retries=0)
+            if p2.returncode == 0:
+                try:
+                    take(json.loads(p2.stdout or "{}"), kind, group)
+                except ValueError:
+                    unreadable.append(ns)
+            elif "doesn't have a resource type" not in (p2.stderr or ""):
+                unreadable.append(ns)
+        out["complete"] = False
+        why = "not allowed" if "forbidden" in err.lower() else "no answer" if TRANSIENT_HINT.search(err) else "failed"
+        note = "Listing {}s across the Supervisor {}; read namespace by namespace ({})".format(
+            kind, why, ", ".join(sorted(set(namespaces))) or "none known")
+        if unreadable:
+            note += "; could not read: " + ", ".join(unreadable)
+        out["notes"].append(note + ". A VPC's subnets live in the VPC's own namespace, which may be missing here.")
+    out["subnets"] = sorted(found.values(), key=lambda s_: (s_["name"].lower(), s_["namespace"]))
+    return out
+
+
+TRANSIENT_HINT = re.compile(r"i/o timeout|connection refused|unable to connect|deadline exceeded", re.I)
