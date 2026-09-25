@@ -451,10 +451,13 @@ function loadClusterNs(refresh) {
   return CNS.p;
 }
 const NS_SEEN = { cluster: 'on the Supervisor', both: 'on the Supervisor', kubeconfig: 'in your kubeconfig' };
-/** <option>s for a namespace datalist: the known namespaces first, then any other names in use. */
+/** <option>s for a namespace datalist: the known namespaces first, then any other names in use.
+ * Value only, no label: Edge and Chrome on Windows show an option's label *instead of* its
+ * value, which hid every namespace name behind "on the Supervisor". The strip above the
+ * maps says where the names came from. */
 function nsOptions(extra) {
   const seen = new Set(), out = [];
-  for (const n of (CNS.data ? CNS.data.namespaces : [])) { seen.add(n.name); out.push(html`<option value="${n.name}" label="${NS_SEEN[n.source] || ''}">`); }
+  for (const n of (CNS.data ? CNS.data.namespaces : [])) { seen.add(n.name); out.push(html`<option value="${n.name}">`); }
   for (const x of extra || []) if (x && !seen.has(x)) { seen.add(x); out.push(html`<option value="${x}">`); }
   return out;
 }

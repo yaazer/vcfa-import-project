@@ -284,7 +284,11 @@ const SCENARIOS = {
     check('the Supervisor\'s namespaces are listed while mapping', chip && /prod-web-ns1/.test(document.querySelector('.nsbar').textContent),
       document.querySelector('.nsbar') && document.querySelector('.nsbar').textContent.slice(0, 160));
     check('system namespaces are left out', !/kube-system|vmware-system|svc-/.test(document.querySelector('.nsbar').textContent));
-    check('every namespace field suggests them', [...document.querySelectorAll('#ns-options option')].some((o) => o.value === 'prod-db-ns2' && o.label));
+    const nsOpts = [...document.querySelectorAll('#ns-options option, #ns-list option')];
+    check('every namespace field suggests them', nsOpts.some((o) => o.value === 'prod-db-ns2'));
+    // Some browsers show an option's label in place of its value: the name itself must be what shows.
+    check('the suggestions show the namespace names themselves', nsOpts.length && nsOpts.every((o) => !o.hasAttribute('label') && (!o.textContent || o.textContent === o.value)),
+      nsOpts.slice(0, 3).map((o) => o.value + '/' + o.label).join(' '));
     click('[data-act="addRow"][data-m="f"]:not([data-key])');
     const k = await waitFor(() => { const i = S.view.fr.length - 1; return document.getElementById('f-' + i + '-namespace') ? i + 1 : 0; }) - 1;
     document.getElementById('f-' + k + '-namespace').focus();
