@@ -1,2 +1,2 @@
 portgroup,namespace,subnet,wave,device_key,subnet_kind,subnet_api_group
-mgmt-tools,,migration-testing,1,,,
+mgmt-tools,migration-testing-ns-kcvm5,migration-testing,1,,,

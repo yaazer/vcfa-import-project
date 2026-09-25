@@ -1014,7 +1014,12 @@ from the console, and each is stored in the same workspace.
 Discovery also reads what vCenter knows that predicts a precheck failure: VMware
 Tools not running, a disk that is not a plain VMDK (RDM), an ISO left connected,
 a disconnected NIC, no NICs, old virtual hardware, no guest IP. Each VM gets a
-grade -- *ready*, *check first* or *likely to fail* -- with the reason and the fix:
+grade -- *ready*, *check first* or *likely to fail* -- with the reason and the fix.
+
+An ISO left connected grades *likely to fail* even though the operator's precheck
+passes it: it often means an OS install is still running. Tools cannot tell you
+that either -- an installer runs `open-vm-tools` itself, so Tools reads *running*
+before the OS is on disk.
 
 ```bash
 vcfa-import readiness --selected          # exit 4 when something is likely to fail

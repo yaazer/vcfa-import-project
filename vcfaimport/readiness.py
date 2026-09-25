@@ -57,8 +57,11 @@ RULES: List[Rule] = [
     {"code": "powered_off", "level": WARN, "title": "Powered off",
      "advice": "Tools cannot report while the VM is off, and the import may need it running. Power it on or confirm it should move cold.",
      "test": lambda r, f: bool(r["power_state"]) and not _on(r)},
-    {"code": "iso_connected", "level": WARN, "title": "A CD-ROM has an ISO attached",
-     "advice": "The ISO's datastore path may not exist on the target. Disconnect it before importing.",
+    {"code": "iso_connected", "level": BLOCK, "title": "A CD-ROM has an ISO attached",
+     # The operator's precheck passes a connected ISO (seen 2026-09-25, a guest
+     # mid-install): nothing downstream catches it, so it blocks here.
+     "advice": "An OS install may still be running, and the ISO's datastore path may not exist on "
+               "the target. Finish the install, disconnect the ISO, then re-discover.",
      "test": lambda r, f: bool(f.get("iso_connected"))},
     {"code": "nic_disconnected", "level": WARN, "title": "A network adapter is disconnected",
      "advice": "Check it is meant to be down; the import maps it to a subnet regardless.",

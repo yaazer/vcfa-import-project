@@ -137,6 +137,10 @@ learned from a real cluster — the fakes should model what was observed.
   spelling left committed VMs stuck at `awaiting_commit` and failed prechecks reading as
   "still running" until the 90-minute batch timeout. See `COMPLETE_CONDITIONS` /
   `COND_PRECHECK_OK` in `status.py` — do not collapse them back to the batch names.
+- **Precheck passes a VM with an ISO connected** (2026-09-25): a guest mid-install
+  got `PrecheckSucceeded=True`. Tools read `RUNNING` too -- the Ubuntu installer
+  runs open-vm-tools -- so Tools status cannot detect an unfinished install.
+  Readiness grades `iso_connected` as block for this reason.
 - A batch `status` may also carry `operationPlacements` (seen 2026-09-23; unparsed).
 - Not yet observed: the per-op lists for failed/completed/rolled-back operations, the
   target VM resource name field. `status.py` tries several spellings; confirm when seen.

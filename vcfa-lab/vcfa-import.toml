@@ -9,7 +9,7 @@ api_version    = "mobility-operator.vmware.com/v1alpha3"
 
 [import]
 mode               = "preserve"   # preserve keeps the existing IP addressing
-commit_action      = "Auto"       # Auto | Wait  (Wait = manual commit gate)
+commit_action      = "Wait"       # Auto | Wait  (Wait = manual commit gate; lab: review before commit)
 # Rollback is never set at creation time -- see `vcfa-import rollback --help`.
 subnet_api_group   = "crd.nsx.vmware.com"
 subnet_kind        = "Subnet"
@@ -30,7 +30,7 @@ failure_rate_abort      = 0.25   # halt the wave once 25% of results have failed
 failure_rate_min_sample = 8
 max_vms_per_run         = 0      # 0 = unlimited
 require_precheck        = true
-# readiness_exclude_blocked = false   # keep VMs readiness marks "blocked" out of precheck
+readiness_exclude_blocked = true    # keep VMs readiness marks "blocked" out of precheck (e.g. ISO still attached)
 
 [governance]
 # require_approval = ["import", "commit"]   # a second person approves these (console and CLI)

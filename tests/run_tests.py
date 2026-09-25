@@ -3895,6 +3895,9 @@ def t_readiness_rules():
     eq(readiness.grade(readiness.assess(_disc_row(**dict(good, tools_status="NOT_RUNNING")))), "block")
     assert "non_vmdk_disk" in codes(facts_json=json.dumps({"disk_backings": ["VMDK_FILE", "RDM"]}))
     assert "iso_connected" in codes(facts_json=json.dumps({"iso_connected": True}))
+    # The operator's precheck passes a connected ISO, so readiness must block it.
+    eq(readiness.grade(readiness.assess(_disc_row(**dict(
+        good, facts_json=json.dumps({"iso_connected": True}))))), "block")
     assert "nic_disconnected" in codes(facts_json=json.dumps({"nic_states": ["CONNECTED", "NOT_CONNECTED"]}))
     assert "old_hardware" in codes(facts_json=json.dumps({"hw_version": "VMX_08"}))
     assert "no_nics" in codes(nics_json="[]")
