@@ -1430,7 +1430,7 @@ function jobsTab(v) {
     <div class="card"><div class="joblist" data-scroll="jobs">${v.jobs.map((x) => html`<div class="jobitem ${x.id === v.jobId ? 'on' : ''}" data-act="pickJob" data-id="${x.id}">
       ${statusIcon(x.status)}<div class="grow" style="min-width:0"><div class="t ellipsis">${x.title}</div><div class="m">${fmtTime(x.started_at, true)} · ${fmtDur(elapsed(x))}${x.user && x.user !== 'owner' ? ' · ' + x.user : ''}</div></div></div>`)}</div></div>
     <div class="card">${j ? html`<div class="card-h">${statusIcon(j.status)}<div class="grow"><h3>${j.title}</h3>
-        <div class="sub">${STATUS_WORD[j.status] || j.status} · started ${fmtTime(j.started_at, true)} by ${j.user || 'owner'} · ${fmtDur(elapsed(j))}${j.error ? html` · <span class="bad-text">${j.error}</span>` : ''}</div></div>
+        <div class="sub">${jobWord(j)} · started ${fmtTime(j.started_at, true)} by ${j.user || 'owner'} · ${fmtDur(elapsed(j))}${j.error ? html` · <span class="bad-text">${j.error}</span>` : ''}</div></div>
         ${j.status === 'running' ? html`<button class="btn sm" data-act="follow" data-id="${j.id}">Follow live</button>` : ''}</div>
       <div class="toolbar"><div class="search">${icon('search')}<input class="input sm" id="act-filter" placeholder="Filter lines" value="${v.filter}" data-input="logFilter"></div>
         <label class="check small"><input type="checkbox" data-change="errOnly" ${attr(v.errOnly, 'checked')}> Problems only</label>

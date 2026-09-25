@@ -938,6 +938,8 @@ class WebApp:
 
         def run(job: Job) -> Dict[str, Any]:
             with self._job_workspace(job) as ws:
+                # Stop ends the wait for the operator; the revert itself carries on.
+                job.on_stop(ws.engine.request_rollback_stop)
                 batches, notes = ws.engine.rollback_targets(**sel)
                 for note in notes:
                     job.log("  ! " + note)
@@ -953,11 +955,11 @@ class WebApp:
             for err in result["errors"]:
                 job.log("  ! " + err)
             bad = result["errors"] or result["pending"]
-            return dict(result, status=WARNING if bad else None)
+            return dict(result, status=STOPPED if job.stop_requested else WARNING if bad else None)
 
         params = dict(sel, action=action, delete=delete, wait=wait)
-        return self._start("rollback", "Roll back to vCenter", params, run,
-                               lock=self._lock_for("rollback"))
+        return self._start("rollback", "Roll back to vCenter", params, run, stoppable=True,
+                           lock=self._lock_for("rollback"))
 
     def _job_abandon(self, body: Dict[str, Any]) -> Job:
         _require_confirm(body)

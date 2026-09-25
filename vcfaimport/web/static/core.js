@@ -387,6 +387,8 @@ function statusIcon(status) {
   return html`<span class="status-ic ${status}">${icon(ic)}</span>`;
 }
 const STATUS_WORD = { running: 'running', succeeded: 'finished', warning: 'finished with warnings', failed: 'failed', stopped: 'stopped' };
+// A job the console was restarted under: not stopped by anyone, cut short.
+const jobWord = j => j.interrupted ? 'interrupted' : (STATUS_WORD[j.status] || j.status);
 function followJob(id, open) {
   if (D.id !== id) { D.id = id; D.next = 0; D.lines = []; D.job = null; D.filter = ''; }
   if (open !== undefined) D.open = open;
@@ -420,7 +422,7 @@ function renderDock(full, fresh) {
   const bar = html`<div class="dock-bar" data-act="toggleDock">
       ${statusIcon(j ? j.status : 'running')}
       <span class="t">${j ? j.title : 'Starting…'}</span>
-      <span class="meta">${j ? html`${STATUS_WORD[j.status] || j.status} · ${fmtDur(elapsed(j))}` : ''}</span>
+      <span class="meta">${j ? html`${jobWord(j)} · ${fmtDur(elapsed(j))}` : ''}</span>
       ${j && j.status === 'running' && window.FX ? FX.spark() : ''}
       ${prog && j.status === 'running' ? html`<div class="progress"><span style="width:${pct(prog.done, prog.total)}"></span></div><span class="meta">${n(prog.done)}/${n(prog.total)} ${prog.label}</span>`
         : (j && j.status === 'running' ? html`<div class="progress indet"><span></span></div>` : html`<span class="grow"></span>`)}
@@ -915,7 +917,7 @@ async function jobFinished(id) {
   let j;
   try { j = await GET('/api/jobs/' + encodeURIComponent(id) + '?since=999999999'); } catch (e) { return; }
   const kind = { succeeded: 'ok', warning: 'warn', failed: 'bad', stopped: 'warn' }[j.status] || 'info';
-  toast(j.title + ' ' + (STATUS_WORD[j.status] || j.status), j.error || jobSummary(j), kind, 8000);
+  toast(j.title + ' ' + jobWord(j), j.error || jobSummary(j), kind, 8000);
   if (D.id === id) pollDock();
   const v = S.view;
   if (v && v.onJobDone) v.onJobDone(v, j); else refreshView();

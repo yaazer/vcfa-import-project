@@ -28,6 +28,13 @@ MAX_JOBS_KEPT = 60
 RUNNING, SUCCEEDED, WARNING, FAILED, STOPPED = "running", "succeeded", "warning", "failed", "stopped"
 
 
+# A job left "running" by a console that exited. Batches it applied or patched
+# carry on on the cluster; the VMs keep their in-flight state until a refresh
+# reads the outcome.
+INTERRUPTED_NOTE = ("interrupted: the console stopped while this job ran. Anything it started "
+                    "on the cluster carried on without it -- refresh to record the outcome.")
+
+
 class JobBusy(Exception):
     """Another job is already running."""
 
@@ -209,9 +216,18 @@ class JobManager:
                 continue   # truncated or foreign file: skip it, never refuse to start
             if meta.get("status") == RUNNING:
                 # The console stopped while this ran. The campaign state is
-                # durable; only the job's own bookkeeping was cut short.
+                # durable; only the job's own bookkeeping was cut short -- and
+                # whatever it was waiting on went on without it.
                 meta["status"] = STOPPED
-                meta["error"] = "the console was stopped while this job ran"
+                meta["error"] = INTERRUPTED_NOTE
+                meta["interrupted"] = True
+                meta.setdefault("finished_at", None)
+                try:   # say so on disk too, so no later reader sees "running"
+                    tmp = path.with_name(path.name + ".tmp")
+                    tmp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+                    tmp.replace(path)
+                except OSError:
+                    pass
             self._jobs[meta["id"]] = PastJob(meta, path.with_suffix(".log"))
 
     @property

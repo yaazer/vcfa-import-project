@@ -523,6 +523,45 @@ def t_status_child_completed_spelling():
     eq(operator_status(batch, cfg, "import").bucket, "succeeded")
 
 
+@test("a child's RollbackCompleted condition is read as rolled back")
+def t_status_child_rollback_condition():
+    """Observed 2026-09-25: a reverted child keeps its import conditions where the
+    import stopped (VirtualMachineReadyForImport False, placement failed) and adds
+    RollbackCompleted. Child status wins over the batch's rolledBackOps, so reading
+    only the import conditions kept the VM "running" and `rollback` waited 30 min.
+    """
+    cfg = Config()
+    batch = {"metadata": {"name": "imp-w2-x-001-ceda1"},
+             "spec": {"defaultSpec": {"controlAction": {"commitAction": "Auto"}}},
+             "status": {"conditions": [
+                 {"type": "Complete", "status": "True", "reason": "True"},
+                 {"type": "ReadyForCommit", "status": "False", "reason": "ObjectNotReady",
+                  "message": "placement failed: ubuntu-21 ... CannotAccessVmDevice"},
+                 {"type": "ReadyForImport", "status": "True", "reason": "True"}],
+                 "rolledBackCount": 1, "rolledBackOps": ["ubuntu-21-3090-bf6fc"]}}
+
+    def child(done, reason=None):
+        rb = {"type": "RollbackCompleted", "status": "True" if done else "False",
+              "reason": "True" if done else (reason or "ObjectNotReady")}
+        return {"metadata": {"name": "ubuntu-21-3090-bf6fc",
+                             "ownerReferences": [{"name": "imp-w2-x-001-ceda1"}]},
+                "spec": {"virtualMachineID": "vm-3090"},
+                "status": {"conditions": [
+                    {"type": "PrecheckSucceeded", "status": "True", "reason": "True"},
+                    {"type": "VirtualMachineReadyForImport", "status": "False",
+                     "reason": "VirtualMachineRelocateFailure",
+                     "message": "waiting for placement results from importoperationbatch"},
+                    rb]}}
+
+    eq(batch_status(batch, cfg, [child(True)], stage="import").by_moref()["vm-3090"].bucket,
+       "rolled_back", "RollbackCompleted: True is a finished revert")
+    eq(batch_status(batch, cfg, [child(False)], stage="import").by_moref()["vm-3090"].bucket,
+       "running", "still reverting")
+    failed = batch_status(batch, cfg, [child(False, "RollbackError")], stage="import").by_moref()["vm-3090"]
+    eq(failed.bucket, "failed")
+    assert "rollback" in failed.phase.lower(), "the engine flags ROLLBACK FAILED on this"
+
+
 @test("a child's PrecheckSucceeded verdict is read directly")
 def t_status_child_precheck_condition():
     """Observed 2026-09-21/23: a precheck child carries PrecheckSucceeded alone.
@@ -2417,6 +2456,57 @@ def t_web_jobs():
         eq(again.get(job.id).snapshot()["log"][1][2], "second")
         eq(again.get(job.id).status, STOPPED)
         eq(SUCCEEDED, "succeeded")
+
+        # A console that died mid-job left "running" on disk: a restart reads it
+        # as interrupted, says what to do, and rewrites the file.
+        meta_path = Path(tmp, "20260925-155902-006-rollback.json")
+        meta_path.write_text(json.dumps({"id": "20260925-155902-006-rollback", "kind": "rollback",
+                                         "title": "Roll back to vCenter", "status": "running"}),
+                             encoding="utf-8")
+        cut = JobManager(Path(tmp)).get("20260925-155902-006-rollback").summary()
+        eq(cut["status"], STOPPED)
+        assert cut["interrupted"] and "refresh" in cut["error"], cut
+        assert not cut["stoppable"]
+        on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
+        eq((on_disk["status"], on_disk["interrupted"]), (STOPPED, True))
+
+
+@test("rollback: Stop patches no further batches and ends the wait, not the revert")
+def t_rollback_stop():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+
+    class Kube:
+        dry_run = False
+        patched = []
+
+        def patch(self, resource, name, ns, body):
+            self.patched.append(name)
+            engine.request_rollback_stop()      # Stop pressed right after the first patch
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config()
+        cfg.workdir = tmp
+        cfg.poll_interval_seconds = 30
+        store = _store(tmp)
+        for i, batch in ((1, "imp-a"), (2, "imp-b")):
+            _record(store, moref="vm-{}".format(i), name="web-{}".format(i))
+            store.create_batch(batch, "ns-a", "run-1", 1, "import", 1)
+            store.set_vm_state("vm-{}".format(i), vst.S_IMPORTING, stage="import", batch_name=batch)
+        lines = []
+        engine = Engine(cfg, store, Kube(), lines.append)
+        import time
+        started = time.time()
+        result = engine.rollback([store.get_batch("imp-a", "ns-a"), store.get_batch("imp-b", "ns-a")])
+        assert time.time() - started < 5, "Stop must not sit out a poll interval"
+        eq(Kube.patched, ["imp-a"], "the second batch is never patched")
+        eq(store.get_vm("vm-1")["state"], vst.S_ROLLING_BACK, "the revert carries on")
+        eq(store.get_vm("vm-2")["state"], vst.S_IMPORTING, "untouched")
+        eq(result["pending"], ["imp-a"])
+        assert any("stopped first" in e for e in result["errors"]), result
+        assert "stopped waiting" in store.get_batch("imp-a", "ns-a")["message"], dict(store.get_batch("imp-a", "ns-a"))
+        assert any("no further batches will be patched" in m for m in lines), lines
+        store.close()
 
 
 @test("e2e web: discover, select, stage, arrange, precheck, import, triage, roll back, retry")
@@ -4765,6 +4855,8 @@ UNIT = [
     t_status_classify, t_status_children, t_status_inline, t_status_empty,
     t_status_operator_precheck, t_status_child_does_not_mask_pass, t_status_operator_stall,
     t_status_child_completed_spelling, t_status_child_precheck_condition,
+    t_status_child_rollback_condition,
+    t_rollback_stop,
     t_status_operator_import,
     t_status_conditions,
     t_filter_and, t_filter_folder, t_folder_map, t_folder_map_precedence, t_folder_tree,

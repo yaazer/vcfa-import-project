@@ -277,8 +277,15 @@ COMPLETE_CONDITIONS = (COND_COMPLETE, COND_COMPLETED_ALT)
 # Children report their precheck verdict here; batches have no equivalent and
 # express a passed precheck as ReadyForImport: True.
 COND_PRECHECK_OK = "PrecheckSucceeded"
+# A child states a finished revert here, alongside RollbackCustomResourceCompleted,
+# RollbackVirtualMachineLocationCompleted and RollbackVirtualMachinePropertyCompleted
+# (observed 2026-09-25); its import conditions stay where the import stopped. The
+# batch lists the same operations in rolledBackOps -- and says Complete: True.
+# Reading only the import conditions kept a reverted child "running", and child
+# status wins over the batch, so `rollback` waited out its whole timeout.
+COND_ROLLBACK_DONE = "RollbackCompleted"
 OPERATOR_CONDITIONS = (COND_READY_IMPORT, COND_READY_COMMIT, COND_COMPLETE,
-                       COND_COMPLETED_ALT, COND_PRECHECK_OK)
+                       COND_COMPLETED_ALT, COND_PRECHECK_OK, COND_ROLLBACK_DONE)
 REASON_WORKING = ("objectnotready", "notready", "inprogress", "pending", "reconciling")
 
 READY_OPS_KEYS = ("readyOps", "readyOperations")
@@ -358,8 +365,21 @@ def operator_status(
         """A False condition carrying a real reason: the operator has decided."""
         return bool(cond) and not _is_true(cond) and not working(cond)
 
+    rollback_done = conds.get(COND_ROLLBACK_DONE)
+
     # --- batch-level verdict -------------------------------------------------
-    if precheck and precheck_ok is not None:
+    if rollback_done is not None:
+        # A revert outranks wherever the import stopped.
+        if _is_true(rollback_done):
+            bucket, phase, message = BUCKET_ROLLED_BACK, COND_ROLLBACK_DONE, message_of(rollback_done)
+        elif working(rollback_done):
+            bucket, phase, message = BUCKET_RUNNING, "RollbackInProgress", message_of(rollback_done)
+        else:
+            # Keep "Rollback" in the phase: the engine marks the VM ROLLBACK FAILED on it.
+            bucket = BUCKET_FAILED
+            phase = "RollbackFailed: " + (reason_of(rollback_done) or COND_ROLLBACK_DONE)
+            message = message_of(rollback_done)
+    elif precheck and precheck_ok is not None:
         # A child ImportOperation states its precheck verdict outright. Without
         # this, a failed precheck child (PrecheckSucceeded: False, reason e.g.
         # VirtualMachineAlreadyExists) fell through to the phase heuristics,

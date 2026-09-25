@@ -73,6 +73,14 @@ class Engine:
             self.log("! stop requested -- no new batches will be applied; "
                      "in-flight batches will be polled to completion")
 
+    def request_rollback_stop(self) -> None:
+        """Stop for a rollback: patch no further batches and stop waiting. A revert
+        already requested carries on -- the operator does not take it back."""
+        if not self._stopping:
+            self._stopping = True
+            self.log("! stop requested -- no further batches will be patched; batches already "
+                     "given rollbackAction keep reverting on the cluster (refresh to follow up)")
+
     @property
     def stopping(self) -> bool:
         return self._stopping
@@ -1086,6 +1094,9 @@ class Engine:
 
         for row in batches:
             ns, name = row["namespace"], row["name"]
+            if self._stopping:
+                result["errors"].append("{}/{}: not rolled back -- stopped first".format(ns, name))
+                continue
             members = [v for v in self.store.query_vms(batch_name=name) if v["namespace"] == ns]
             to_revert = [v for v in members if v["state"] in self.ROLLBACKABLE_STATES]
             committed = [v for v in members if v["state"] == st.S_COMMITTED]
@@ -1147,8 +1158,13 @@ class Engine:
         self.log("  waiting up to {}m for the operator to revert ownership...".format(
             int(timeout_s // 60)))
 
-        while waiting and time.time() - started < timeout_s:
-            time.sleep(self.cfg.poll_interval_seconds)
+        while waiting and time.time() - started < timeout_s and not self._stopping:
+            # Sleep in short steps so Stop answers within a second, not a poll interval.
+            nap_until = time.time() + self.cfg.poll_interval_seconds
+            while time.time() < nap_until and not self._stopping:
+                time.sleep(min(1.0, max(0.0, nap_until - time.time())))
+            if self._stopping:
+                break
             cache: Dict[str, Tuple[Dict[str, Any], List[Dict[str, Any]]]] = {}
             for (ns, name), row in list(waiting.items()):
                 if ns not in cache:
@@ -1174,8 +1190,14 @@ class Engine:
         for (ns, name), row in waiting.items():
             left = [v for v in self.store.query_vms(batch_name=name)
                     if v["namespace"] == ns and v["state"] == st.S_ROLLING_BACK]
-            msg = "rollback not confirmed within {}m; {} VM(s) still reverting".format(
-                int(timeout_s // 60), len(left))
+            if self._stopping:
+                # Stop ends the wait, not the revert: rollbackAction is already on the
+                # batch and the operator carries on. A refresh records the outcome.
+                msg = ("stopped waiting; {} VM(s) still reverting on the cluster -- "
+                       "refresh to record the outcome".format(len(left)))
+            else:
+                msg = "rollback not confirmed within {}m; {} VM(s) still reverting".format(
+                    int(timeout_s // 60), len(left))
             self.store.set_batch_state(name, ns, st.B_ROLLING_BACK, msg)
             self.store.log_event(msg, "warn", batch=name)
             self.log("  ! {}/{}: {}".format(ns, name, msg))

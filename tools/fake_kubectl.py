@@ -313,9 +313,16 @@ def child_conditions(phase: str, message: str, precheck: bool = False) -> dict:
                                cond("ReadyForCommit", False, "OperationFailed"),
                                cond("Completed", False, "OperationFailed")]}
     if phase in ("RollingBack", "RolledBack"):
-        return {"conditions": [cond("PrecheckSucceeded", True),
-                               cond("ReadyForCommit", False, phase),
-                               cond("Completed", False, phase)]}
+        # Observed 2026-09-25: the import conditions stay where the import stopped
+        # (here a placement failure); the revert is reported by Rollback* conditions.
+        reverted = phase == "RolledBack"
+        stuck = cond("VirtualMachineReadyForImport", False, "VirtualMachineRelocateFailure")
+        stuck["message"] = "waiting for placement results from importoperationbatch"
+        return {"conditions": [cond("PrecheckSucceeded", True), cond("NetworkBackingReady", True),
+                               stuck, cond("VirtualMachineSetManagedBySucceeded", True)]
+                + [cond(k, reverted) for k in ("RollbackCompleted", "RollbackCustomResourceCompleted",
+                                               "RollbackVirtualMachineLocationCompleted",
+                                               "RollbackVirtualMachinePropertyCompleted")]}
     return {"conditions": [cond("ReadyForCommit", False), cond("Completed", False)]}
 
 
