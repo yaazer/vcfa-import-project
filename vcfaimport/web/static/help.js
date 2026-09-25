@@ -70,6 +70,8 @@ const GLOSSARY = {
   attempts: { t: 'Attempts', d: 'How many times the VM went into a batch. Automatic retries stop at max_retries; a forced retry goes past it.' },
   stalled: { t: 'Stalled', d: 'The batch passed batch_timeout_minutes without a verdict, so nothing polls it. Refresh to pick up a late result; roll back if it stays stuck.' },
   ledger: { t: 'Ledger', d: 'Append-only JSONL of every state change with who made it. It survives a rebuilt database; ship it to a SIEM or a change record.', doc: RM('the-tracker') },
+  cluster_namespaces: { t: 'Namespaces you can map to', d: 'Read from the Supervisor. If this login may not list them (common for tenant users), they come from your kubeconfig instead: kubectl vsphere login adds a context for each namespace you can use. Click one to fill the namespace field you last clicked; names not in the list are flagged.', doc: RM('stage-the-selection-for-import') },
+  ns_conflict: { t: 'Conflicting namespace entries', d: 'Two sources name different namespaces for the same VM — say the folder map and the portgroup map. The first in the order Select, tag map, folder map, portgroup map wins; the others are ignored. Name a VM’s namespace in one place, usually the folder map.', tone: 'warn', doc: RM('stage-the-selection-for-import') },
   selection: { t: 'Folders are the unit of collection', d: 'Ticking a folder selects its whole subtree. Selecting is cumulative — deselect explicitly.', doc: RM('collect-by-folder') },
 };
 const STATE_TIPS = {

@@ -234,6 +234,49 @@ class Kubectl:
             return None
         return False
 
+    def list_namespaces(self):
+        """(names, why): every namespace on the cluster, or (None, reason).
+
+        The reason tells "not allowed" (a Supervisor often forbids listing
+        namespaces to tenant users) from "the API server never answered" --
+        neither may be read as "there are none". One quick try: this feeds
+        suggestions, not a decision."""
+        proc = self.run(["get", "namespaces", "-o", "json"], check=False, timeout=20, retries=0)
+        if proc.returncode == 0:
+            try:
+                items = json.loads(proc.stdout or "{}").get("items") or []
+            except (ValueError, AttributeError):
+                return None, "kubectl returned something that is not a namespace list"
+            return sorted({((i or {}).get("metadata") or {}).get("name", "") for i in items} - {""}), ""
+        err = (proc.stderr or "").strip()
+        if self._unanswered(proc):
+            return None, "unanswered"
+        if "forbidden" in err.lower():
+            return None, "forbidden"
+        return None, (err.splitlines()[-1][:200] if err else "kubectl exited {}".format(proc.returncode))
+
+    def kubeconfig_namespaces(self):
+        """(names, why): namespaces of the kubeconfig contexts for the same cluster
+        as the configured (or current) context. `kubectl vsphere login` writes one
+        context per namespace the user may use, so this works without any API
+        call and without permission to list namespaces."""
+        proc = self.run(["config", "view", "-o", "json"], check=False, timeout=20, retries=0)
+        if proc.returncode != 0:
+            return [], "kubeconfig not readable"
+        try:
+            doc = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return [], "kubeconfig not readable"
+        contexts = [c for c in (doc.get("contexts") or []) if isinstance(c, dict)]
+        want = self.cfg.context or doc.get("current-context") or ""
+        mine = next((c for c in contexts if c.get("name") == want), None)
+        if mine is None:
+            return [], "context '{}' is not in the kubeconfig".format(want) if want else "no current context"
+        cluster = (mine.get("context") or {}).get("cluster")
+        names = {(c.get("context") or {}).get("namespace") or "" for c in contexts
+                 if (c.get("context") or {}).get("cluster") == cluster}
+        return sorted(names - {""}), ""
+
     # ------------------------------------------------------------ mutations
     def apply(self, manifest_yaml: str, namespace: str) -> str:
         if self.dry_run:

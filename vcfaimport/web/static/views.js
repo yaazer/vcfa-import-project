@@ -218,7 +218,11 @@ VIEWS.select = view({
     v.page = 0;
     v.open = v.open || new Set();
   },
-  async load(v) { const d = await GET('/api/discovered'); v.vms = d.vms; v.meta = d.meta; v.byMoref = new Map(v.vms.map((x) => [x.moref, x])); },
+  async load(v) {
+    const d = await GET('/api/discovered');
+    v.vms = d.vms; v.meta = d.meta; v.byMoref = new Map(v.vms.map((x) => [x.moref, x]));
+    loadClusterNs().then(() => { if (S.view === v && v.loaded) v.render(); });
+  },
   filtered(v) {
     const f = v.f, q = f.q.trim().toLowerCase().split(/\s+/).filter(Boolean);
     return v.vms.filter((x) => {
@@ -288,7 +292,7 @@ VIEWS.select = view({
             <button class="btn sm" data-act="bulkWave" ${attr(!inViewSel, 'disabled')}>Set wave</button>${tip('wave')}
             <input class="input sm" id="bulk-app" list="app-list" placeholder="application" style="width:140px">
             <button class="btn sm" data-act="bulkApp" ${attr(!inViewSel, 'disabled')}>Set app</button>
-            <datalist id="ns-list">${nss.map((x) => html`<option value="${x}">`)}</datalist>
+            <datalist id="ns-list">${nsOptions(nss)}</datalist>
             <datalist id="app-list">${apps.map((x) => html`<option value="${x}">`)}</datalist>
           </div>
           <div class="table-wrap"><table class="t">
@@ -434,6 +438,76 @@ function treeHtml(v) {
   return out;
 }
 
+// ====================================================== NAMESPACES ON THE SUPERVISOR
+/* Suggestions for every namespace field: fetched once per page load (the server
+ * caches them too), never blocking a page. `complete` means the Supervisor listed
+ * them itself; otherwise they are the kubeconfig's contexts for that Supervisor. */
+const CNS = { data: null, p: null, target: null };
+function loadClusterNs(refresh) {
+  if (CNS.p && !refresh) return CNS.p;
+  CNS.p = GET('/api/cluster/namespaces' + (refresh ? '?refresh=1' : ''))
+    .then((d) => { CNS.data = d; return d; })
+    .catch((e) => { CNS.data = { namespaces: [], complete: false, notes: [e.message] }; return CNS.data; });
+  return CNS.p;
+}
+const NS_SEEN = { cluster: 'on the Supervisor', both: 'on the Supervisor', kubeconfig: 'in your kubeconfig' };
+/** <option>s for a namespace datalist: the known namespaces first, then any other names in use.
+ * Value only, no label: Edge and Chrome on Windows show an option's label *instead of* its
+ * value, which hid every namespace name behind "on the Supervisor". The strip above the
+ * maps says where the names came from. */
+function nsOptions(extra) {
+  const seen = new Set(), out = [];
+  for (const n of (CNS.data ? CNS.data.namespaces : [])) { seen.add(n.name); out.push(html`<option value="${n.name}">`); }
+  for (const x of extra || []) if (x && !seen.has(x)) { seen.add(x); out.push(html`<option value="${x}">`); }
+  return out;
+}
+/** false when the name is missing from a known list; null when there is no list to judge by. */
+function nsKnown(name) {
+  const c = CNS.data;
+  name = (name || '').trim();
+  if (!c || !c.namespaces.length || !name) return null;
+  return c.namespaces.some((n) => n.name === name);
+}
+const nsMissingText = () => (CNS.data && CNS.data.complete ? 'Not a namespace on the Supervisor — check the spelling'
+  : 'Not among the namespaces in your kubeconfig — check the spelling, or log in again with kubectl vsphere login');
+const nsInputAttrs = (value) => (nsKnown(value) === false ? raw(' title="' + esc(nsMissingText()) + '"') : '');
+const nsInputClass = (value) => (nsKnown(value) === false ? 'unknown' : '');
+// The namespace field a click on a suggested namespace fills: the last one focused.
+document.addEventListener('focusin', (e) => {
+  const t = e.target;
+  if (t && t.matches && t.matches('input[data-col="namespace"], #def-ns, #bulk-ns')) CNS.target = t.id;
+});
+function nsPanel(v) {
+  const c = CNS.data;
+  if (!c) return html`<div class="card mt nsbar"><div class="card-b small muted"><span class="spinner"></span> Looking up the namespaces on the Supervisor…</div></div>`;
+  const inUse = new Set([].concat(v.fr, v.nr, v.tr).map((r) => (r.namespace || '').trim()).concat([(v.defaults.ns || '').trim()]).filter(Boolean));
+  const missing = [...inUse].filter((n) => nsKnown(n) === false).sort();
+  const shown = c.namespaces.slice(0, 40);
+  return html`<div class="card mt nsbar"><div class="card-b">
+    <div class="row wrap" style="gap:6px">
+      <span class="small muted nsbar-l">${c.complete ? 'Namespaces on the Supervisor' : 'Namespaces you can use'} ${tip('cluster_namespaces')}</span>
+      ${shown.map((n) => html`<button type="button" class="chip nschip ${inUse.has(n.name) ? 'on' : ''}" data-act="pickNs" data-ns="${n.name}"
+        title="${NS_SEEN[n.source] || ''} · click to put it in the namespace field you last clicked">${n.name}</button>`)}
+      ${c.namespaces.length > shown.length ? html`<span class="small muted">+${n(c.namespaces.length - shown.length)} more — type in a Namespace field to search them</span>` : ''}
+      ${c.namespaces.length ? '' : html`<span class="small muted">none found</span>`}
+      <span class="grow"></span>
+      <button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again">${icon('refresh')} Refresh</button>
+    </div>
+    ${c.notes.map((x) => html`<div class="tiny faint mt-s">${x}</div>`)}
+    ${missing.length ? html`<div class="note warn mt-s"><b>${plural(missing.length, 'namespace')} in these maps ${c.complete ? 'not found on the Supervisor' : 'not among your kubeconfig namespaces'}:</b>
+      <span class="mono">${missing.join(', ')}</span>. Check the spelling; VMs mapped there would fail preflight.</div>` : ''}
+  </div></div>`;
+}
+function nsConflicts(p) {
+  const list = p.ns_conflicts || [];
+  if (!list.length) return '';
+  return html`<details class="note warn" ${attr(list.length <= 5, 'open')}><summary><b>${plural(list.length, 'VM')} with conflicting namespace entries</b> — the first source wins ${tip('ns_conflict')}</summary>
+    <ul class="plain small">${list.slice(0, 60).map((c) => html`<li><b>${c.vm_name}</b> → <span class="mono">${c.namespace}</span> from the ${c.source};
+      ignored ${c.ignored.map((i) => html`<span class="mono">${i.namespace}</span> (${i.source})`).reduce((a, x, k) => (k ? html`${a}, ${x}` : x), '')}</li>`)}</ul>
+    ${list.length > 60 ? html`<div class="small">and ${n(list.length - 60)} more</div>` : ''}
+    <div class="small">Fix whichever map is wrong, or clear the namespace in one of them so only one source names it.</div></details>`;
+}
+
 // ============================================================ MAP & STAGE
 VIEWS.stage = view({
   title: 'Map & Stage', sub: 'Step 3 · decide namespace, wave and subnet, then build the import queue',
@@ -446,16 +520,19 @@ VIEWS.stage = view({
     v.tr = m.tag.rows.map((r) => Object.assign({}, r));
     v.saved = mapsSig(v);
     v.preview = await POST('/api/stage/preview', stageBody(v));
+    loadClusterNs().then(() => { if (S.view === v && v.loaded) v.render(); });
   },
   paint(v) {
     const p = v.preview;
     if (!p.selected) return emptyState('select', 'No VMs selected', 'Select the VMs to import first; this step decides where each one goes.', html`<button class="btn primary" data-act="go" data-to="select">Select VMs</button>`);
     const dirty = mapsSig(v) !== v.saved;
-    const nsOptions = uniq([].concat(v.fr.map((r) => r.namespace), v.nr.map((r) => r.namespace), v.tr.map((r) => r.namespace), p.records.map((r) => r.namespace))).sort();
+    const inMaps = uniq([].concat(v.fr.map((r) => r.namespace), v.nr.map((r) => r.namespace), v.tr.map((r) => r.namespace), p.records.map((r) => r.namespace))).sort();
     return html`
       <div class="note info">A VM's <b>namespace</b> comes from, in order: the namespace set on it in Select, the tag map, the folder map (most specific folder wins), the portgroup map, then the default below.
-        <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.</div>
-      <datalist id="ns-options">${nsOptions.map((x) => html`<option value="${x}">`)}</datalist>
+        <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.
+        Name a VM's namespace in one place — usually the folder map — and use the portgroup map for subnets.</div>
+      ${nsPanel(v)}
+      <datalist id="ns-options">${nsOptions(inMaps)}</datalist>
       <div class="grid two mt">
         <div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
           <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage)}</div></div>
@@ -474,7 +551,7 @@ VIEWS.stage = view({
         <div class="card-f"><button class="btn sm" data-act="addRow" data-m="t">${icon('plus')} Add entry</button><span class="small muted">Tags are <code>Category:Tag</code>; globs allowed, e.g. <code>Application:*</code>. An exact tag beats a glob.</span></div></details>
       <div class="card mt"><div class="card-h"><h3>Result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
         <div class="tools"><label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default namespace ${tip('default_namespace')}</span>
-          <input class="input sm" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none — report instead" style="width:200px"></label>
+          <input class="input sm ${nsInputClass(v.defaults.ns)}" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none — report instead" style="width:200px"${nsInputAttrs(v.defaults.ns)}></label>
           <label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default wave ${tip('default_wave')}</span>
           <input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px"></label></div></div>
         <div id="stage-preview">${stagePreview(v)}</div></div>
@@ -487,8 +564,20 @@ VIEWS.stage = view({
   act: {
     cell(t, e, v) {
       rowsOf(v, t.dataset.m)[+t.dataset.i][t.dataset.col] = t.value;
+      if (t.dataset.col === 'namespace') markNs(t);
       schedulePreview(v);
     },
+    pickNs(t, e, v) {
+      const el = CNS.target && document.getElementById(CNS.target);
+      if (!el || !el.isConnected) {
+        toast('Click into a Namespace field first', 'Then pick a namespace here — or start typing in the field to search them.', 'info', 4500);
+        return;
+      }
+      el.value = t.dataset.ns;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.focus();
+    },
+    async nsRefresh(t, e, v) { await loadClusterNs(true); v.render(); },
     addRow(t, e, v) {
       const m = t.dataset.m;
       const rows = rowsOf(v, m);
@@ -506,7 +595,7 @@ VIEWS.stage = view({
     delRow(t, e, v) { rowsOf(v, t.dataset.m).splice(+t.dataset.i, 1); v.render(); schedulePreview(v); },
     tagOpen(t, e, v) { v.tagOpen = t.open; },
     adv(t, e, v) { v.adv = t.checked; v.render(); },
-    defNs(t, e, v) { v.defaults.ns = t.value; schedulePreview(v); },
+    defNs(t, e, v) { v.defaults.ns = t.value; markNs(t); schedulePreview(v); },
     defWave(t, e, v) { v.defaults.wave = t.value; schedulePreview(v); },
     page(t, e, v) { v.recPage = +t.dataset.page; mount($('#stage-preview'), stagePreview(v)); },
     async saveMaps(t, e, v) {
@@ -524,6 +613,7 @@ VIEWS.stage = view({
         title: 'Stage ' + plural(p.records.length, 'VM') + ' into the import queue?', ic: 'stage', confirm: 'Stage',
         body: html`<p>${n(p.records.length - already)} new · ${n(already - locked)} already queued and updated · ${n(locked)} in flight or done and left untouched.</p>
           ${p.problems.length ? html`<div class="note warn">${plural(p.problems.length, 'VM')} cannot be placed and will be left out (see the list under Result).</div>` : ''}
+          ${(p.ns_conflicts || []).length ? html`<div class="note warn mt-s">${plural(p.ns_conflicts.length, 'VM')} have conflicting namespace entries; each goes to the first one (see Result).</div>` : ''}
           <p class="small muted">The maps are saved at the same time. Nothing is sent to the cluster.</p>`,
       });
       if (!ok) return;
@@ -538,6 +628,11 @@ VIEWS.stage = view({
     },
   },
 });
+function markNs(input) {
+  const bad = nsKnown(input.value) === false;
+  input.classList.toggle('unknown', bad);
+  if (bad) input.title = nsMissingText(); else input.removeAttribute('title');
+}
 function stageBody(v) {
   return { folder_rows: v.fr, network_rows: v.nr, tag_rows: v.tr, default_namespace: v.defaults.ns, default_wave: parseInt(v.defaults.wave, 10) || 1 };
 }
@@ -576,8 +671,8 @@ function mapTable(v, m) {
       .concat(v.adv ? [['device_key', 'Device key', ''], ['subnet_kind', 'Kind', ''], ['subnet_api_group', 'API group', '']] : []);
   if (!rows.length) return html`<div class="card-b small muted">No entries yet. Use <b>+ Map</b> next to a ${m === 'f' ? 'folder' : m === 't' ? 'tag' : 'network'} above, or add one.</div>`;
   return html`<div class="table-wrap" style="max-height:340px" data-scroll="map-${m}"><table class="t maptable"><thead><tr>${cols.map((c) => html`<th>${c[1]}</th>`)}<th></th></tr></thead><tbody>
-    ${rows.map((r, i) => html`<tr>${cols.map(([k, , list]) => html`<td style="${k === 'wave' || k === 'device_key' ? 'width:70px' : ''}"><input class="input ${k === 'folder' || k === 'portgroup' || k === 'tag' ? 'mono' : ''}"
-      id="${m}-${i}-${k}" data-input="cell" data-m="${m}" data-i="${i}" data-col="${k}" value="${r[k] || ''}" ${list ? raw(`list="${list}"`) : ''} ${k === 'wave' || k === 'device_key' ? raw('inputmode="numeric"') : ''}></td>`)}
+    ${rows.map((r, i) => html`<tr>${cols.map(([k, , list]) => html`<td style="${k === 'wave' || k === 'device_key' ? 'width:70px' : ''}"><input class="input ${k === 'folder' || k === 'portgroup' || k === 'tag' ? 'mono' : ''} ${k === 'namespace' ? nsInputClass(r[k]) : ''}"
+      id="${m}-${i}-${k}" data-input="cell" data-m="${m}" data-i="${i}" data-col="${k}" value="${r[k] || ''}" ${list ? raw(`list="${list}"`) : ''} ${k === 'wave' || k === 'device_key' ? raw('inputmode="numeric"') : ''}${k === 'namespace' ? nsInputAttrs(r[k]) : ''}></td>`)}
       <td style="width:34px"><button class="btn ghost icon sm" data-act="delRow" data-m="${m}" data-i="${i}" title="Remove">${icon('x')}</button></td></tr>`)}</tbody></table></div>`;
 }
 function covFolders(cov) {
@@ -611,10 +706,11 @@ function stagePreview(v) {
     ${p.by_wave.length ? html`<div class="row wrap"><span class="small muted">By wave</span>${p.by_wave.map(([w, c]) => html`<span class="chip static">Wave ${w} <span class="n">${n(c)}</span></span>`)}
       <span class="small muted" style="margin-left:14px">By namespace</span>${p.by_namespace.map(([ns, c]) => html`<span class="chip static mono">${ns} <span class="n">${n(c)}</span></span>`)}</div>` : ''}
     ${p.problems.length ? html`<details class="note bad"><summary><b>${plural(p.problems.length, 'VM')} cannot be staged</b> — expand for details</summary><ul class="plain small">${p.problems.slice(0, 60).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
+    ${nsConflicts(p)}
     ${(p.app_moves || []).length ? html`<details class="note info"><summary><b>${plural(p.app_moves.length, 'application')} aligned to one wave</b> — apps are kept together</summary><ul class="plain small">${p.app_moves.slice(0, 40).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
   </div>
   ${p.records.length ? html`<div class="table-wrap" style="border-top:1px solid var(--line)"><table class="t compact"><thead><tr><th>VM</th><th>Folder</th><th>App</th><th>Namespace</th><th>Wave</th><th>Subnets</th><th>Notes</th><th>Queue</th></tr></thead><tbody>
-    ${recs.map((r) => html`<tr><td><span class="vm-name">${r.vm_name}<small>${r.moref}</small></span></td><td class="small">${r.folder || '/'}</td><td>${appTag(r.app)}</td><td class="mono small">${r.namespace}</td>
+    ${recs.map((r) => html`<tr><td><span class="vm-name">${r.vm_name}<small>${r.moref}</small></span></td><td class="small">${r.folder || '/'}</td><td>${appTag(r.app)}</td><td class="mono small ${nsKnown(r.namespace) === false ? 'warn-text' : ''}"${nsKnown(r.namespace) === false ? raw(' title="' + esc(nsMissingText()) + '"') : ''}>${r.namespace}</td>
       <td class="num">${r.wave}</td><td class="mono small">${r.subnets.join(', ') || html`<span class="warn-text">none</span>`}</td><td class="small muted">${r.notes}</td>
       <td>${r.queue_state ? html`${pill(r.queue_state)}${r.locked ? html` <span class="tag" title="In flight or done: staging will not change it">locked</span>` : ''}` : html`<span class="tag info">new</span>`}</td></tr>`)}</tbody></table></div>
     ${pager(p.records.length, v.recPage, 50)}` : ''}`;

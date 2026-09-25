@@ -471,6 +471,14 @@ def cmd_stage(args) -> int:
                    tag_mapping=tag_mapping)
     for move in result.app_moves[:20]:
         log("  ~ " + move)
+    if result.ns_conflicts:
+        log("namespace conflicts -- the first source wins; fix whichever map is wrong:")
+        for c in result.ns_conflicts[:30]:
+            log("  ! {} ({}): {} from the {}; ignored {}".format(
+                c["vm_name"], c["moref"], c["namespace"], c["source"],
+                ", ".join("{} ({})".format(i["namespace"], i["source"]) for i in c["ignored"])))
+        if len(result.ns_conflicts) > 30:
+            log("  ... and {} more".format(len(result.ns_conflicts) - 30))
 
     if result.unmapped_folders:
         log("folders with no entry in the folder map:")
@@ -1046,6 +1054,19 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_namespaces(args) -> int:
+    cfg, _store, kube, _engine = _open(args)
+    data = service.cluster_namespaces(kube)
+    for note in data["notes"]:
+        log(note)
+    if not data["namespaces"]:
+        log("no namespaces found")
+        return 0
+    label = {"cluster": "on the Supervisor", "kubeconfig": "kubeconfig context", "both": "on the Supervisor, kubeconfig context"}
+    log(report.table(["namespace", "seen"], [[n["name"], label[n["source"]]] for n in data["namespaces"]], indent="  "))
+    return 0
+
+
 def cmd_readiness(args) -> int:
     from . import readiness
     _cfg, store, _kube, _engine = _open(args)
@@ -1497,6 +1518,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--html", help="output path for the HTML report")
     sp.add_argument("--csv", help="output path for the per-VM CSV")
     sp.add_argument("--refresh", action="store_true")
+
+    add("namespaces", cmd_namespaces, "list the Supervisor namespaces you can map VMs to")
 
     sp = add("readiness", cmd_readiness, "spot likely precheck failures from vCenter facts (advisory)")
     add_filters(sp)

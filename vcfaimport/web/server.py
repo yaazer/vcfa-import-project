@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import os
 import json
 import os
 import pkgutil
@@ -43,6 +44,16 @@ STATIC_TYPES = {
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
        "base-uri 'none'; form-action 'none'")
+
+
+def can_open_browser() -> bool:
+    """False on a Linux or BSD box with no desktop session (a typical jump box).
+
+    There, webbrowser.open() falls back to a text browser (lynx, w3m) that
+    would take over the terminal the console is logging to."""
+    if sys.platform.startswith(("win", "darwin")):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _static(name: str) -> Optional[bytes]:
@@ -296,7 +307,10 @@ def serve(app: WebApp, host: str, port: int, token: Optional[str] = None,
     log("  Ctrl-C to stop. Batches already on the cluster keep running; the next")
     log("  run (or Watch) picks them up again.")
     app.start_scheduler()
-    if open_browser:
+    if open_browser and not can_open_browser():
+        log("  --open: no desktop session on this machine, so no browser was started.")
+        log("  Open the link above from your own browser (SSH tunnel: see the lab guide).")
+    elif open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever(poll_interval=0.5)

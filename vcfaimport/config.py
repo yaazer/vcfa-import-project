@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -227,7 +228,8 @@ class Config:
 
 def _read_toml(path: Path) -> Dict[str, Any]:
     if tomllib is None:
-        raise ConfigError("TOML config requires Python 3.11 or newer")
+        raise ConfigError("TOML config requires Python 3.11 or newer (this is {}); on Ubuntu 22.04 "
+                          "install python3.11 and run the tool with it".format(sys.version.split()[0]))
     try:
         with path.open("rb") as fh:
             return tomllib.load(fh)
