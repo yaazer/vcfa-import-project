@@ -85,11 +85,29 @@ you to Execute while a run is in progress. Behind the glass, a slow aurora
 reacts to the campaign: failures tint it with a hazard colour, held commits
 turn it amber, a running job quickens it, and a finished campaign blooms.
 
-- **Theme Studio** (palette icon, top right): seven themes -- Aurora, Nebula,
-  Solar Flare, Phosphor, Graphite, Glacier, Daylight -- plus a hue shift, glow
+- **Theme Studio** (palette icon, top right): nine themes. Seven are generated -- Aurora, Nebula,
+  Solar Flare, Phosphor, Graphite, Glacier, Daylight -- with a hue shift, glow
   intensity, and motion (Full / Calm / Off). Palettes are generated in OKLCH so
   every hue stays legible, and status colours keep their meaning in every theme.
   Your operating system's *reduce motion* setting selects Off automatically.
+- **Design-language themes**: two more themes restyle the whole console after
+  familiar VMware tools, with their own layout details, fonts and icons rather
+  than just colours. They are flat by design (no aurora, glow or glass), so hue
+  shift and glow do not apply to them.
+  - *VMware Modern*: the dark Clarity look of the HTML5 vSphere Client. It has
+    slate panels, outlined uppercase buttons, underlined tabs and fields, and
+    thin line icons.
+  - *vCenter Classic*: the Flex-era Web Client. It has a blue gradient title
+    bar, grey-blue panels with gradient headers, glossy buttons, zebra tables
+    and colourful filled icons in the navigation.
+
+  Fonts are never downloaded, because the jump box may be air-gapped:
+  - *Clarity City* or *Metropolis* is used if installed, otherwise Avenir or
+    Segoe UI.
+  - Classic uses Arial or Tahoma.
+
+  The icons are original drawings in each style. The themes are inspired by
+  these tools and are not affiliated with VMware.
 - **Command palette** (`Ctrl+K` or `/`): jump to any page, VM or batch, run
   preflight/refresh/watch/verify, or switch theme, from the keyboard.
 - **Stream lanes**: the Migration Stream flows by stage, or regroups its

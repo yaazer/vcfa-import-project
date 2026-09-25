@@ -795,7 +795,7 @@ function covFolders(cov) {
   return cov.folders.map((f) => {
     const mapped = f.pattern !== null;
     const miss = !mapped && f.explicit_namespace < f.vms;
-    return html`<div class="covrow ${miss ? 'miss' : ''}">${icon('folder')}<span class="p" title="${f.folder}">${f.folder || '(datacenter root)'}</span>
+    return html`<div class="covrow ${miss ? 'miss' : ''}">${icon('folder', 'art')}<span class="p" title="${f.folder}">${f.folder || '(datacenter root)'}</span>
       <span class="small muted">${plural(f.vms, 'VM')}</span><span class="arrow">→</span>
       ${mapped ? html`<span class="small"><span class="mono">${f.namespace || html`<span class="faint">no namespace</span>`}</span>${f.wave ? ' · wave ' + f.wave : ''}
         ${f.pattern !== f.folder ? html`<span class="tag" title="matched by ${f.pattern}">via ${f.pattern}</span>` : ''}</span>`
@@ -988,7 +988,7 @@ function waveColumn(v, w, idx, waves, hitSet, q) {
         <div class="fgroup-h" data-act="toggleGroup" data-key="${key}" draggable="${movable.length ? 'true' : 'false'}" data-drag="group" data-wave="${w}" data-folder="${folder}" title="${folder || '(datacenter root)'} — drag to move the whole folder">
           <span class="caret ${open ? 'open' : ''}" style="display:grid">${icon('chevron')}</span>
           <input type="checkbox" data-act="pickGroup" data-wave="${w}" data-folder="${folder}" ${attr(selN && selN === movable.length, 'checked')} ${attr(!movable.length, 'disabled')}>
-          ${icon('folder')}<span class="name">${folder || '(root)'}</span><span class="tiny muted">${n(g.length)}</span></div>
+          ${icon('folder', 'art')}<span class="name">${folder || '(root)'}</span><span class="tiny muted">${n(g.length)}</span></div>
         ${open ? html`<div class="fgroup-b">${g.map((x) => html`<div class="vmrow ${x.locked ? 'locked' : ''} ${hitSet.has(x.moref) ? 'hit' : ''}" ${x.locked ? '' : raw(`draggable="true" data-drag="vm" data-moref="${esc(x.moref)}"`)}>
           <input type="checkbox" data-act="pick" data-moref="${x.moref}" ${attr(v.sel.has(x.moref), 'checked')} ${attr(x.locked, 'disabled')}>
           ${dot(x.state)}<span class="name" title="${x.vm_name} · ${x.moref} · ${label(x.state)}${x.app ? ' · app ' + x.app : ''}">${x.vm_name}</span>${x.app ? html`<span class="tag app xs">${x.app}</span>` : ''}

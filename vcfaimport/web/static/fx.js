@@ -26,6 +26,48 @@ const FX = (() => {
     { id: 'graphite', label: 'Graphite', tag: 'quiet monochrome', mode: 'dark', h1: 250, h2: 250, h3: 250, hb: 250, c: 0.16 },
     { id: 'glacier', label: 'Glacier', tag: 'ice blue, light', mode: 'light', h1: 238, h2: 200, h3: 285, hb: 235, c: 1 },
     { id: 'daylight', label: 'Daylight', tag: 'warm paper, light', mode: 'light', h1: 268, h2: 22, h3: 172, hb: 75, c: 0.9 },
+    // Design-language skins: exact colours (vars), plus structure, fonts and icons of their own
+    // (html[data-skin] in app.css, SKINS in skins.js). Flat by design: no aurora, grain or glass.
+    { id: 'vmware-modern', label: 'VMware Modern', tag: 'vSphere Client, Clarity dark', mode: 'dark', skin: 'clarity',
+      h1: 200, h2: 205, h3: 150, hb: 215, c: 0.6,
+      swatch: { bg: '#1b2a32', bar: '#22343c', fg: '#e9ecef', dots: ['#49afd9', '#0095d3', '#60b515'] },
+      vars: {
+      '--bg0': '#1b2a32', '--bg1': '#17242b', '--glass': '#21333b', '--glass-2': '#29414c', '--glass-strong': '#1d2e36',
+      '--panel': '#21333b', '--panel-2': '#28404b', '--panel-3': '#324f61', '--line': '#3a4f5b', '--line-2': '#566a76', '--hi': 'transparent',
+      '--fg': '#e9ecef', '--muted': '#adbbc4', '--faint': '#8c9ba5',
+      '--accent': '#49afd9', '--accent-2': '#0095d3', '--accent-3': '#57c8ea', '--accent-soft': 'rgba(73, 175, 217, .16)',
+      '--accent-fg': '#0c1a20', '--info-soft': 'rgba(73, 175, 217, .12)',
+      '--glow-1': '#49afd9', '--glow-2': '#0095d3', '--glow-3': '#57c8ea', '--grid-dot': 'transparent',
+      '--ok': '#60b515', '--ok-soft': 'rgba(96, 181, 21, .16)', '--bad': '#f35e44', '--bad-soft': 'rgba(243, 94, 68, .16)',
+      '--warn': '#ffdc0b', '--warn-soft': 'rgba(255, 220, 11, .13)',
+      '--shadow': 'none', '--shadow-lg': '0 8px 28px rgba(0, 0, 0, .5)', '--radius': '3px', '--radius-sm': '3px',
+      '--sans': '"Clarity City", "Metropolis", "Avenir Next", "Avenir", "Segoe UI", "Helvetica Neue", Arial, sans-serif',
+      '--display': '"Clarity City", "Metropolis", "Avenir Next", "Avenir", "Segoe UI", "Helvetica Neue", Arial, sans-serif',
+      '--mono': '"Roboto Mono", "Cascadia Mono", Consolas, "Courier New", monospace',
+      '--s-pending': '#8c9ba5', '--s-precheck_running': '#49afd9', '--s-precheck_passed': '#00bfa9', '--s-precheck_failed': '#ff9c32',
+      '--s-importing': '#a36ad4', '--s-awaiting_commit': '#ffdc0b', '--s-committed': '#60b515', '--s-failed': '#f35e44',
+      '--s-rolling_back': '#c78fe5', '--s-rolled_back': '#9460b8', '--s-skipped': '#5b6b75',
+    } },
+    { id: 'vcenter-classic', label: 'vCenter Classic', tag: 'Flex Web Client, blue and grey', mode: 'light', skin: 'classic',
+      h1: 215, h2: 210, h3: 130, hb: 220, c: 0.6,
+      swatch: { bg: '#dce5ee', bar: 'linear-gradient(180deg, #4b8ed0, #2566a8)', fg: '#1f2d3a', dots: ['#7cc242', '#f5c342', '#4a90d9'] },
+      vars: {
+      '--bg0': '#dce5ee', '--bg1': '#d1dce8', '--glass': '#ffffff', '--glass-2': '#f4f7fa', '--glass-strong': '#ffffff',
+      '--panel': '#ffffff', '--panel-2': '#eef3f8', '--panel-3': '#dde7f1', '--line': '#c3d1de', '--line-2': '#9fb3c7', '--hi': 'rgba(255, 255, 255, .9)',
+      '--fg': '#1f2d3a', '--muted': '#44576a', '--faint': '#6a7e92',
+      '--accent': '#2a6db0', '--accent-2': '#1d5a96', '--accent-3': '#3d8ed8', '--accent-soft': 'rgba(42, 109, 176, .12)',
+      '--accent-fg': '#ffffff', '--info-soft': 'rgba(42, 109, 176, .08)',
+      '--glow-1': '#3d8ed8', '--glow-2': '#2a6db0', '--glow-3': '#7cc242', '--grid-dot': 'transparent',
+      '--ok': '#2f8f2f', '--ok-soft': 'rgba(58, 154, 58, .13)', '--bad': '#c52b2b', '--bad-soft': 'rgba(199, 49, 49, .1)',
+      '--warn': '#b86e00', '--warn-soft': 'rgba(217, 138, 0, .13)',
+      '--shadow': '0 1px 2px rgba(20, 50, 80, .14)', '--shadow-lg': '0 10px 28px rgba(20, 50, 80, .3)', '--radius': '3px', '--radius-sm': '2px',
+      '--sans': 'Arial, "Helvetica Neue", Helvetica, Tahoma, Verdana, sans-serif',
+      '--display': 'Arial, "Helvetica Neue", Helvetica, Tahoma, sans-serif',
+      '--mono': '"Courier New", Consolas, "Lucida Console", monospace',
+      '--s-pending': '#7d8da0', '--s-precheck_running': '#3d8ed8', '--s-precheck_passed': '#1b9e9e', '--s-precheck_failed': '#e07b00',
+      '--s-importing': '#6a4fc2', '--s-awaiting_commit': '#d9a300', '--s-committed': '#3a9a3a', '--s-failed': '#c73131',
+      '--s-rolling_back': '#9b59b6', '--s-rolled_back': '#7e57a8', '--s-skipped': '#a9b6c3',
+    } },
   ];
   const RQ_DEFAULT = { soft: false, why: '', checked: false };
   const DEFAULTS = { theme: 'aurora', shift: 0, glow: 100, motion: null, reactive: true, density: 'comfortable', streamBy: 'stage', quality: 'auto' };
@@ -42,7 +84,7 @@ const FX = (() => {
   const H = { h1: 190, h2: 285, h3: 155, hb: 255, mode: 'dark' };   // resolved hues of the live theme
 
   function palette(t) {
-    const s = +P.shift || 0, c = t.c;
+    const s = t.skin ? 0 : (+P.shift || 0), c = t.c;     // a design language keeps its own colours
     const h1 = t.h1 + s, h2 = t.h2 + s, h3 = t.h3 + s, hb = t.hb + s * 0.6;
     Object.assign(H, { h1, h2, h3, hb, mode: t.mode });
     const v = { '--h1': wrap(h1), '--h2': wrap(h2), '--h3': wrap(h3), '--hb': wrap(hb), '--c': c, '--glow': (P.glow / 100).toFixed(2) };
@@ -90,8 +132,10 @@ const FX = (() => {
         '--s-rolled_back': ok(0.52, 0.17, 295), '--s-skipped': ok(0.75, 0.02, hb),
       });
     }
+    if (t.vars) Object.assign(v, t.vars);
     return v;
   }
+  const skin = () => theme().skin || '';
 
   // ------------------------------------------------------- rendering quality
   /* Full: glass (backdrop blur), aurora, grain, pointer effects. Lite: the same
@@ -164,6 +208,7 @@ const FX = (() => {
     for (const k in vars) root.style.setProperty(k, vars[k]);
     root.style.colorScheme = t.mode;
     root.dataset.theme = t.mode;
+    if (t.skin) root.dataset.skin = t.skin; else delete root.dataset.skin;
     document.body.dataset.motion = P.motion;
     document.body.dataset.density = P.density === 'compact' ? 'compact' : 'comfortable';
     document.body.dataset.fx = quality();
@@ -610,7 +655,7 @@ const FX = (() => {
     const lite = isLite();
     // The aurora drifts slowly: 20 frames a second look the same as 60 and cost a third.
     const auroraFps = P.motion === 'calm' ? 8 : 20;
-    if (!lite && t - AU.last > 1000 / auroraFps) { AU.last = t; drawAurora(t); }
+    if (!lite && !skin() && t - AU.last > 1000 / auroraFps) { AU.last = t; drawAurora(t); }
     let busy = false;
     if (ST.canvas && ST.canvas.isConnected) {
       // full rate while particles move; a gentle twinkle rate when idle (Full only)
@@ -631,7 +676,7 @@ const FX = (() => {
   }
   function kick() {
     if (!raf && P.motion !== 'off' && !document.hidden) raf = requestAnimationFrame(loop);
-    if (P.motion === 'off') { if (!isLite()) drawAurora(0); if (ST.canvas) drawStream(performance.now()); }
+    if (P.motion === 'off') { if (!isLite() && !skin()) drawAurora(0); if (ST.canvas) drawStream(performance.now()); }
   }
 
   // ------------------------------------------------------------- motion
@@ -820,7 +865,7 @@ const FX = (() => {
     list.innerHTML = fmt(PAL.items.map((it, i) => {
       const head = it.sec !== sec ? html`<div class="cmdk-sec">${it.sec}</div>` : '';
       sec = it.sec;
-      return html`${head}<div class="cmdk-item ${i === PAL.sel ? 'on' : ''}" data-fx="runItem" data-i="${i}">${icon(it.ic)}<span>${it.label}</span><span class="hint">${it.hint}</span></div>`;
+      return html`${head}<div class="cmdk-item ${i === PAL.sel ? 'on' : ''}" data-fx="runItem" data-i="${i}">${icon(it.ic, 'art')}<span>${it.label}</span><span class="hint">${it.hint}</span></div>`;
     }));
     const on = list.querySelector('.cmdk-item.on');
     if (on) on.scrollIntoView({ block: 'nearest' });
@@ -842,6 +887,13 @@ const FX = (() => {
     const el = document.getElementById('fx-studio');
     if (!el) return;
     const sw = (t) => {
+      if (t.swatch) {      // a design language: preview its chrome, not a gradient
+        const x = t.swatch;
+        return html`<button class="swatch skin-swatch ${P.theme === t.id ? 'on' : ''}" data-fx="pickTheme" data-id="${t.id}" style="background:${x.bg};color:${x.fg}">
+          <span class="skin-bar" style="background:${x.bar}"></span>
+          <span class="dots">${x.dots.map((d) => html`<i style="background:${d}"></i>`)}</span>
+          <b>${t.label}</b><small>${t.tag}</small></button>`;
+      }
       const bg = t.mode === 'dark' ? ok(0.16, 0.03 * t.c, t.hb) : ok(0.97, 0.012 * t.c, t.hb);
       const fg = t.mode === 'dark' ? ok(0.96, 0.01, t.hb) : ok(0.25, 0.03, t.hb);
       const L = t.mode === 'dark' ? 0.66 : 0.8, C = (t.mode === 'dark' ? 0.2 : 0.13) * t.c;
@@ -855,10 +907,12 @@ const FX = (() => {
         <button class="btn ghost icon" data-fx="closeStudio" aria-label="Close">${icon('x')}</button></div>
       <div class="studio-b">
         <div><div class="section-title" style="margin-top:0">Theme</div><div class="swatches">${THEMES.map(sw)}</div></div>
-        <label class="field"><span>Hue shift <b class="num">${P.shift > 0 ? '+' : ''}${P.shift}°</b></span>
-          <div class="hue-track"></div><input type="range" min="-180" max="180" step="5" value="${P.shift}" data-fx-in="shift"></label>
-        <label class="field"><span>Glow <b class="num">${P.glow}%</b></span>
-          <input type="range" min="0" max="160" step="5" value="${P.glow}" data-fx-in="glow"></label>
+        ${theme().skin ? html`<div class="note info small">${theme().label} follows a real design language: its own colours, fonts and icons, flat with no glow —
+          so hue shift and glow do not apply. Its fonts are used when installed (${theme().skin === 'clarity' ? 'Clarity City or Metropolis; otherwise Avenir or Segoe UI' : 'Arial and Tahoma'}).</div>` : ''}
+        <label class="field ${theme().skin ? 'off' : ''}"><span>Hue shift <b class="num">${P.shift > 0 ? '+' : ''}${P.shift}°</b></span>
+          <div class="hue-track"></div><input type="range" min="-180" max="180" step="5" value="${P.shift}" data-fx-in="shift" ${attr(!!theme().skin, 'disabled')}></label>
+        <label class="field ${theme().skin ? 'off' : ''}"><span>Glow <b class="num">${P.glow}%</b></span>
+          <input type="range" min="0" max="160" step="5" value="${P.glow}" data-fx-in="glow" ${attr(!!theme().skin, 'disabled')}></label>
         <div class="field"><span>Motion</span><div class="seg">${[['full', 'Full'], ['calm', 'Calm'], ['off', 'Off']].map(([k, l]) =>
           html`<button class="${P.motion === k ? 'on' : ''}" data-fx="motion" data-k="${k}">${l}</button>`)}</div>
           <small>Off also stops the background and the particle stream. Your OS "reduce motion" setting picks Off by default.</small></div>
@@ -886,12 +940,18 @@ const FX = (() => {
     if (S.view && S.view.render) S.view.render();
   }
   function set(changes) {
+    const before = skin();
     Object.assign(P, changes);
     savePrefs();
     applyTheme();
     kick();
     renderStudio();
     if (S.pulse) renderTopbar();
+    // A skin brings its own icons: redraw what shows them.
+    if (skin() !== before && S.info) {
+      if (typeof renderNav === 'function') renderNav();
+      if (S.view && S.view.render) S.view.render();
+    }
   }
 
   const ACTIONS = {
@@ -957,7 +1017,7 @@ const FX = (() => {
   }
 
   return {
-    THEMES, prefs: P, stats, init, quality, rendering: () => Object.assign({ quality: quality() }, RQ), applyTheme, onPulse, beforeRoute, afterRoute, afterRender, navGlider,
+    THEMES, prefs: P, stats, init, quality, skin, rendering: () => Object.assign({ quality: quality() }, RQ), applyTheme, onPulse, beforeRoute, afterRoute, afterRender, navGlider,
     streamHtml, streamModel, ring, logActivity, spark, openPalette, openStudio, set, kick,
     // one stream frame on demand (tests drive time; browsers use requestAnimationFrame)
     drawNow: () => drawStream(performance.now()),

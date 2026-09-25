@@ -37,6 +37,10 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - UI colours are tokens (`app.css` defaults = Aurora; `fx.js` regenerates them per
   theme in OKLCH). Never hard-code a colour in a view. Status colours (`--s-*`)
   keep their hue in every theme -- green is always committed, red always failed.
+- Design-language skins (`skin:` in `fx.js` THEMES -> `html[data-skin]`) carry exact
+  colours in `vars`, their structure in the `app.css` skin block and icons in `skins.js`.
+  Colour-art icon sets (not `everywhere`) only render where `icon(name, 'art')` marks
+  the slot (nav, palette, empty states, folder rows). Skins are flat: no aurora or glass.
 - Animation is time-based, never per-frame, and every effect must degrade to a
   complete static render under Motion: Off (the OS reduce-motion default). `fx.js`
   hooks fail soft: the console must work if the look breaks.
@@ -87,7 +91,7 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/settings.py` | workspace settings overlay: `FIELDS` with ranges, `apply`, `update`, `describe` |
 | `vcfaimport/notify.py` | Teams / Slack / webhook / email channels, `EVENTS`, retrying delivery |
 | `vcfaimport/verify.py` | post-import checks: power, Tools, IP kept, ping, TCP ports |
-| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `views.js` (pages), `gov.js` (Change control, Settings, badges, saved views), `help.js` (glossary + `?` tooltips, welcome tour, offline Markdown viewer for the guides), `app.css` (token design system) |
+| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `skins.js` (icon sets of the design-language skins), `views.js` (pages), `gov.js` (Change control, Settings, badges, saved views), `help.js` (glossary + `?` tooltips, welcome tour, offline Markdown viewer for the guides), `app.css` (token design system) |
 | `tools/web_demo.py` | the console against the fakes: `--keep ./webdemo` |
 | `tools/ui_perf.py` | rendering cost in software compositing (a GPU-less jump box): traces Full vs Lite |
 | `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge (`govern` runs in its own workspace) |

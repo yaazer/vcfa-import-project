@@ -131,7 +131,7 @@ def smoke(pyz: Path, exe: Path | None) -> None:
     # The web console's UI ships as package data; a build without it serves a blank page.
     with zipfile.ZipFile(pyz) as zf:
         names = set(zf.namelist())
-    missing = [f for f in ("index.html", "core.js", "fx.js", "views.js", "gov.js", "help.js", "app.css")
+    missing = [f for f in ("index.html", "core.js", "skins.js", "fx.js", "views.js", "gov.js", "help.js", "app.css")
                if "vcfaimport/web/static/" + f not in names]
     missing += [f for f in DOC_FILES if "vcfaimport/web/docs/" + f not in names]
     if missing:
