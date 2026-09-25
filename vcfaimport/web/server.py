@@ -15,6 +15,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
+import os
 import pkgutil
 import re
 import secrets
@@ -252,7 +253,9 @@ class Handler(BaseHTTPRequestHandler):
 
 class ConsoleServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = False
+    # POSIX: rebinding past TIME_WAIT right after a Ctrl-C; a live listener still
+    # refuses. Windows SO_REUSEADDR would let two consoles share a port: keep it off.
+    allow_reuse_address = os.name != "nt"
 
 
 def make_server(app: WebApp, host: str = "127.0.0.1", port: int = 8765,
