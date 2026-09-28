@@ -62,21 +62,38 @@ execute, then follow progress and triage failures. It is the same engine,
 state database and ledger as the CLI. The two can be used interchangeably on
 one workspace, and a batch started from either shows up in both.
 
+**Layout.** The sidebar leads with the five stages as a vertical stepper,
+Discover → Select VMs → Map & Stage → Waves → Execute:
+- A tick marks each stage that is done.
+- A line under each stage says where it stands, such as *75 selected* or
+  *48 of 75 committed*.
+- The next stage to do is outlined.
+
+Each stage page is one column of numbered sections that you work down, and it
+ends with a bar leading to the next stage. Below the stepper, two collapsible
+groups hold everything else:
+- **Monitor**: Overview, Import queue, Batches, Triage and Activity.
+- **Admin**: Change control, Settings and Help.
+
+A group opens by itself when you land on one of its pages. While a group is
+closed, its alerts still show on it, such as a red failure count. The open or
+closed state is remembered per browser.
+
 | page | what you do there |
 |---|---|
-| **Overview** | Campaign totals, progress by wave, namespace and application (with time left per wave), live batches, recent failures, requests waiting for approval, the next change window, and a *next step* prompt that tells you what to do now |
+| **Overview** (Monitor) | Campaign totals, progress by wave, namespace and application (with time left per wave), live batches, recent failures, requests waiting for approval, the next change window, and a *next step* prompt that tells you what to do now |
 | **1 Discover** | Connect to vCenter (server/user pre-filled from `VCFA_VC_*`; the password is used once and never stored) and read the inventory, with a live progress bar |
-| **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), search and facet filters (including **readiness**, vCenter **tag** and **application**), shift-click ranges, bulk namespace/wave/app, saved views |
-| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A *What you can map to* card lists the Supervisor's namespaces, its Subnets and SubnetSets (each with the namespace it lives in, VPC ones included) and every vCenter portgroup from the last discovery; each is suggested as you type in the matching field, a click fills the field you are in (or adds an unmapped portgroup to the map), and names that do not exist are flagged; if two maps name different namespaces for a VM, the preview says which one won. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
-| **4 Waves** | A board with one column per wave and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
+| **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), then the VM list with search and facet filters (including **readiness**, vCenter **tag** and **application**), shift-click ranges and saved views. An optional, folded-away bar sets a namespace, wave or application on the selection by hand |
+| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A folded *What you can map to* panel (its summary counts them; open it when you need the list, and filter it by name) lists the Supervisor's namespaces, its Subnets and SubnetSets (each with the namespace it lives in, VPC ones included) and every vCenter portgroup from the last discovery; each is suggested as you type in the matching field, a click fills the field you are in (or adds an unmapped portgroup to the map), and names that do not exist are flagged; if two maps name different namespaces for a VM, the preview says which one won. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
+| **4 Waves** | One row per wave, top to bottom, with its folders and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
 | **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. Includes a commit gate, a *Watch* for batches left over from an earlier session, an ETA per wave, what is held back and why, post-import verification, and *Schedule…* to run it in a change window instead |
-| **Import queue** | Every VM with state, application and verification filters and saved views; bulk retry / skip / move wave / verify / roll back / abandon |
-| **Batches** | Every `ImportOperationBatch` with its members, the manifest that was applied, and its events |
-| **Triage** | Failures grouped by cause (VM-specific details are normalised away), each with the likely fix and the right buttons: retry, skip, abandon, roll back. Also stalled VMs, rolled-back VMs, and batches safe to clean up |
-| **Activity & logs** | Every job's full log (searchable, *problems only*), the event log with who did what, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
-| **Change control** | Change windows on a week timeline (plan one and see whether the work fits before it closes), and the approvals queue for the two-person rule |
-| **Settings** | Guardrails (pacing, safety, governance, applications, verification) with their file values and allowed ranges, notification channels with a *Test* button, and people: personal links for viewers, operators and admins |
-| **Help & guides** | The welcome tour, a step-by-step *first import*, this README and the lab guide rendered offline with a table of contents, and a searchable glossary |
+| **Import queue** (Monitor) | Every VM with state, application and verification filters and saved views; bulk retry / skip / move wave / verify / roll back / abandon |
+| **Batches** (Monitor) | Every `ImportOperationBatch` with its members, the manifest that was applied, and its events |
+| **Triage** (Monitor) | Failures grouped by cause (VM-specific details are normalised away), each with the likely fix and the right buttons: retry, skip, abandon, roll back. Also stalled VMs, rolled-back VMs, and batches safe to clean up |
+| **Activity & logs** (Monitor) | Every job's full log (searchable, *problems only*), the event log with who did what, the movement log, and downloads: tracker.csv, transitions.csv, ledger.jsonl, report.html |
+| **Change control** (Admin) | Change windows on a week timeline (plan one and see whether the work fits before it closes), and the approvals queue for the two-person rule |
+| **Settings** (Admin) | Guardrails (pacing, safety, governance, applications, verification) with their file values and allowed ranges, notification channels with a *Test* button, and people: personal links for viewers, operators and admins |
+| **Help & guides** (Admin) | The welcome tour, a step-by-step *first import*, this README and the lab guide rendered offline with a table of contents, and a searchable glossary |
 
 **Look and feel.** The Overview opens on the **Migration Stream**: every VM is a
 particle, flowing from vCenter through precheck and import into VCF Automation,

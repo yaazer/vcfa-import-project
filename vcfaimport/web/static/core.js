@@ -677,51 +677,106 @@ function batchDrawer(ns, name) {
 }
 
 // ---------------------------------------------------------------- shell
+// The sidebar: the five stages as a vertical stepper, then two collapsible groups
+// for everything else. A group opens by itself when you land on one of its pages.
 const NAV = [
-  { id: 'overview', label: 'Overview', icon: 'overview' },
-  { group: 'Plan' },
+  { group: 'flow', label: 'Migration' },
   { id: 'discover', label: 'Discover', icon: 'discover', step: 1 },
   { id: 'select', label: 'Select VMs', icon: 'select', step: 2 },
   { id: 'stage', label: 'Map & Stage', icon: 'stage', step: 3 },
   { id: 'waves', label: 'Waves', icon: 'waves', step: 4 },
-  { group: 'Run' },
   { id: 'execute', label: 'Execute', icon: 'execute', step: 5 },
+  { group: 'monitor', label: 'Monitor' },
+  { id: 'overview', label: 'Overview', icon: 'overview' },
   { id: 'queue', label: 'Import queue', icon: 'queue' },
   { id: 'batches', label: 'Batches', icon: 'batches' },
-  { group: 'Investigate' },
   { id: 'triage', label: 'Triage', icon: 'triage' },
   { id: 'activity', label: 'Activity & logs', icon: 'activity' },
-  { group: 'Govern' },
+  { group: 'admin', label: 'Admin' },
   { id: 'schedule', label: 'Change control', icon: 'calendar' },
   { id: 'settings', label: 'Settings', icon: 'gear' },
-  { group: 'Learn' },
   { id: 'help', label: 'Help & guides', icon: 'book' },
 ];
-function navBadge(id, p) {
-  if (!p) return '';
-  const b = (text, cls) => html`<span class="nav-badge ${cls || ''}">${text}</span>`;
+const FLOW = NAV.filter((it) => it.step);
+// [text, tone]; a tone (bad / warn / busy) is an alert and still shows on a closed group.
+function navBadgeData(id, p) {
+  if (!p) return null;
   switch (id) {
-    case 'select': return p.discovered.selected ? b(n(p.discovered.selected)) : '';
-    case 'queue': return p.total ? b(n(p.total)) : '';
-    case 'execute': return p.in_flight ? b(n(p.in_flight), 'busy') : (p.awaiting_commit ? b(n(p.awaiting_commit), 'warn') : '');
-    case 'batches': return p.live_batches ? b(n(p.live_batches), 'busy') : '';
-    case 'triage': return p.failed ? b(n(p.failed), 'bad') : '';
-    case 'activity': return p.job ? b('1', 'busy') : '';
-    case 'schedule': return p.approvals_pending ? b(n(p.approvals_pending), 'warn') : (p.next_window && p.next_window.state === 'running' ? b('live', 'busy') : '');
-    default: return '';
+    case 'queue': return p.total ? [n(p.total), ''] : null;
+    case 'execute': return p.in_flight ? [n(p.in_flight), 'busy'] : (p.awaiting_commit ? [n(p.awaiting_commit), 'warn'] : null);
+    case 'batches': return p.live_batches ? [n(p.live_batches), 'busy'] : null;
+    case 'triage': return p.failed ? [n(p.failed), 'bad'] : null;
+    case 'activity': return p.job ? ['1', 'busy'] : null;
+    case 'schedule': return p.approvals_pending ? [n(p.approvals_pending), 'warn'] : (p.next_window && p.next_window.state === 'running' ? ['live', 'busy'] : null);
+    default: return null;
   }
+}
+function navBadge(id, p) {
+  const b = navBadgeData(id, p);
+  return b ? html`<span class="nav-badge ${b[1]}">${b[0]}</span>` : '';
 }
 function stepDone(id, p) {
   if (!p) return false;
+  const c = p.counts || {};
   return { discover: p.discovered.total > 0, select: p.discovered.selected > 0, stage: p.total > 0,
-    waves: p.total > 0 && (p.counts.pending || 0) < p.total }[id] || false;
+    waves: p.total > 0 && (c.pending || 0) < p.total, execute: p.total > 0 && (c.committed || 0) === p.total }[id] || false;
 }
+// One line under each stage in the stepper: where that stage stands.
+function stepStatus(id, p) {
+  if (!p) return '';
+  const c = p.counts || {}, d = p.discovered;
+  switch (id) {
+    case 'discover': return d.total ? plural(d.total, 'VM') + ' found' : 'Read the vCenter inventory';
+    case 'select': return d.selected ? n(d.selected) + ' selected' : 'Choose what to import';
+    case 'stage': return p.total ? n(p.total) + ' in the queue' : 'Namespaces and subnets';
+    case 'waves': return p.waves ? plural(p.waves, 'wave') : 'Order the queue';
+    case 'execute': return p.in_flight ? n(p.in_flight) + ' in flight' : c.committed ? n(c.committed) + ' of ' + n(p.total) + ' committed' : 'Precheck, import, commit';
+    default: return '';
+  }
+}
+// The stage to do next: the first one not done yet.
+function nextStepId(p) {
+  const s = FLOW.find((it) => !stepDone(it.id, p));
+  return s ? s.id : null;
+}
+const NAVG = (() => { try { return JSON.parse(localStorage.getItem('vcfa-nav') || '{}') || {}; } catch (e) { return {}; } })();
+function navGroupOf(id) {
+  let g = null;
+  for (const it of NAV) { if (it.group) g = it.group; else if (it.id === id) return g; }
+  return null;
+}
+function saveNavGroups() { try { localStorage.setItem('vcfa-nav', JSON.stringify(NAVG)); } catch (e) { /* per-browser nicety only */ } }
 function renderNav() {
   const p = S.pulse;
-  mount($('#nav'), NAV.map((it) => it.group ? html`<div class="nav-group">${it.group}</div>` :
-    html`<a class="nav-item ${S.route === it.id ? 'active' : ''}" href="#/${it.id}">
-      ${it.step ? html`<span class="nav-step ${stepDone(it.id, p) && S.route !== it.id ? 'done' : ''}">${stepDone(it.id, p) && S.route !== it.id ? '✓' : it.step}</span>` : icon(it.icon, 'art')}
-      <span>${it.label}</span>${navBadge(it.id, p)}</a>`));
+  const cur = navGroupOf(S.route);
+  if (S.navRoute !== S.route) {         // landing on a page opens its group
+    S.navRoute = S.route;
+    if (cur && cur !== 'flow' && !NAVG[cur]) { NAVG[cur] = true; saveNavGroups(); }
+  }
+  const sections = [];
+  for (const it of NAV) { if (it.group) sections.push({ g: it, items: [] }); else sections[sections.length - 1].items.push(it); }
+  const nxt = nextStepId(p);
+  const item = (it) => html`<a class="nav-item ${S.route === it.id ? 'active' : ''}" href="#/${it.id}">
+      ${icon(it.icon, 'art')}<span>${it.label}</span>${navBadge(it.id, p)}</a>`;
+  const step = (it) => {
+    const done = stepDone(it.id, p), on = S.route === it.id;
+    return html`<li class="${done ? 'done' : ''} ${it.id === nxt ? 'next' : ''}"><a class="nav-item flow-step ${on ? 'active' : ''}" href="#/${it.id}">
+      <span class="nav-step ${done && !on ? 'done' : ''}">${done && !on ? '✓' : it.step}</span>
+      <span class="fs-t"><span>${it.label}</span><small>${stepStatus(it.id, p)}</small></span>${navBadge(it.id, p)}</a></li>`;
+  };
+  mount($('#nav'), sections.map(({ g, items }) => {
+    if (g.group === 'flow') {
+      const at = FLOW.findIndex((it) => it.id === S.route);
+      return html`<div class="nav-group flow-h">${g.label}${at >= 0 ? html`<span>step ${at + 1} of ${FLOW.length}</span>` : ''}</div>
+        <ol class="flow-nav">${items.map(step)}</ol>`;
+    }
+    const open = !!NAVG[g.group];
+    const alerts = open ? [] : items.map((it) => navBadgeData(it.id, p)).filter((b) => b && b[1]);
+    return html`<div class="nav-grp ${open ? 'open' : ''}" data-g="${g.group}">
+      <button type="button" class="nav-group nav-grp-h" data-act="navGroup" data-g="${g.group}" aria-expanded="${open ? 'true' : 'false'}">${icon('chevron')}<span>${g.label}</span>
+        ${alerts.length ? html`<span class="grp-b">${alerts.map((b) => html`<span class="nav-badge ${b[1]}">${b[0]}</span>`)}</span>` : ''}</button>
+      <div class="nav-grp-b">${items.map(item)}</div></div>`;
+  }));
   if (S.info) {
     mount($('#side-foot'), html`<div class="row"><span>version</span><b>${S.info.version}</b></div>
       <div class="row"><span>context</span><b title="${S.info.context || ''}">${S.info.context || 'current'}</b></div>
@@ -801,6 +856,9 @@ function view(def) {
   };
   v.render = () => {
     if (!v.el || S.view !== v || !v.loaded) return;
+    // A fold opened or closed a moment ago may not have delivered its toggle event yet:
+    // take every fold's state from the page first, so a redraw never undoes it.
+    $$('details[data-toggle]', v.el).forEach((d) => { const fn = v.act && v.act[d.dataset.toggle]; if (fn) fn(d, null, v); });
     mount(v.el, def.paint(v));
     if (def.after) def.after(v);
     if (window.FX) FX.afterRender(v.el, v);
@@ -825,6 +883,7 @@ const GLOBAL_ACT = {
   },
   theme: () => FX.openStudio(),
   palette: () => FX.openPalette(),
+  navGroup: (t) => { const g = t.dataset.g; NAVG[g] = !NAVG[g]; saveNavGroups(); renderNav(); },
   setToken: () => {
     const v = ($('#token-in').value || '').trim().replace(/^.*#t=/, '');
     if (!v) return;

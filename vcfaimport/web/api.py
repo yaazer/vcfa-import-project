@@ -229,6 +229,7 @@ class WebApp:
         with self.lock:
             counts = self.store.counts()
             disc = self.store.discovered_counts()
+            waves = len(self.store.waves())
             live = len(self.store.query_batches(
                 states=[st.B_APPLIED, st.B_RUNNING, st.B_ROLLING_BACK]))
             pending = self.store.conn.execute(
@@ -243,6 +244,7 @@ class WebApp:
             "in_flight": sum(counts.get(s, 0) for s in service.IN_FLIGHT_STATES),
             "awaiting_commit": counts.get(st.S_AWAITING_COMMIT, 0),
             "discovered": disc,
+            "waves": waves,
             "live_batches": live,
             "job": active.summary() if active else None,
             "latest_job": latest[0] if latest else None,
