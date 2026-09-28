@@ -81,6 +81,14 @@ class Engine:
             self.log("! stop requested -- no further batches will be patched; batches already "
                      "given rollbackAction keep reverting on the cluster (refresh to follow up)")
 
+    def request_commit_stop(self) -> None:
+        """Stop for a commit: release no further gates and stop waiting. A gate
+        already released stays released -- the operator commits those VMs anyway."""
+        if not self._stopping:
+            self._stopping = True
+            self.log("! stop requested -- no further batches will be released; batches already "
+                     "released still commit on the cluster (refresh to follow up)")
+
     @property
     def stopping(self) -> bool:
         return self._stopping
@@ -384,17 +392,33 @@ class Engine:
         if not records:
             return []
         rid = run_id or self.current_run_id()
-        batches = plan_batches(
-            records,
-            self.cfg,
-            rid,
-            stage,
-            commit_action=self.cfg.commit_action if stage == STAGE_IMPORT else None,
-            name_salt=name_salt,
-        )
+        # Names derive from (salt, namespace, group, stage, seq), so a retry in the
+        # same run re-plans the very name of the batch it is retrying. Reusing it
+        # would `kubectl apply` over that batch if it is still on the cluster -- a
+        # rolled-back one keeps rollbackAction: Immediate -- and would inherit its
+        # row. A name is reused only while its row is still `planned` (a resumed
+        # run that never applied it); otherwise the next salt is tried.
+        for n in range(100):
+            salt = name_salt or rid
+            if n:
+                salt = "{}.{}".format(salt, n)
+            batches = plan_batches(
+                records,
+                self.cfg,
+                rid,
+                stage,
+                commit_action=self.cfg.commit_action if stage == STAGE_IMPORT else None,
+                name_salt=salt,
+            )
+            if not any(self._name_used(b.name, b.namespace) for b in batches):
+                break
         if write_manifests:
             self.write_manifests(batches)
         return batches
+
+    def _name_used(self, name: str, namespace: str) -> bool:
+        row = self.store.get_batch(name, namespace)
+        return row is not None and row["state"] != st.B_PLANNED
 
     def manifest_dir(self) -> Path:
         d = Path(self.cfg.workdir).expanduser() / "manifests"
@@ -947,11 +971,20 @@ class Engine:
         return counts
 
     # --------------------------------------------------------------- commit
-    def commit(self, morefs: Optional[Sequence[str]] = None, wave: Optional[int] = None) -> Dict[str, Any]:
-        """Release VMs held by commitAction: Wait.
+    # How long `commit` follows the operator after releasing the gate. A lab
+    # commit landed in under a minute; this is the ceiling, not the expectation.
+    COMMIT_WAIT_MINUTES = 15
+
+    def commit(self, morefs: Optional[Sequence[str]] = None, wave: Optional[int] = None,
+               wait: bool = True, timeout_minutes: Optional[int] = None) -> Dict[str, Any]:
+        """Release VMs held by commitAction: Wait, and follow them to committed.
 
         The gate lives on the batch, so we patch the batch's controlAction to
         Auto; the operator then commits every operation still waiting in it.
+        A run stops polling a batch once it reaches the gate, so the batch is
+        read again first: a VM the operator already committed is recorded as
+        committed, not patched again. Then each patched batch is polled until
+        no VM in it is still awaiting commit (or Stop, or the timeout).
         """
         rows = self.store.query_vms(states=[st.S_AWAITING_COMMIT], wave=wave, morefs=morefs)
         targets: Dict[Tuple[str, str], List[str]] = {}
@@ -959,19 +992,90 @@ class Engine:
             if not row["batch_name"]:
                 continue
             targets.setdefault((row["namespace"], row["batch_name"]), []).append(row["moref"])
+        result: Dict[str, Any] = {"batches": 0, "vms": len(rows), "errors": [],
+                                  "already_committed": 0, "committed": 0, "failed": 0, "pending": []}
+        if not targets:
+            return result
 
-        patched, errors = 0, []
+        # 1. What does the cluster say now?
+        if not self.kube.dry_run:
+            before = self._poll_commit_targets(targets, result)
+            result["already_committed"] = before
+            if before:
+                self.log("  {} VM(s) were already committed by the operator; recorded".format(before))
+            targets = {k: v for k, v in targets.items() if self._still_waiting(k, v)}
+
+        # 2. Release the gate.
         patch = {"spec": {"defaultSpec": {"controlAction": {"commitAction": "Auto"}}}}
+        patched: Dict[Tuple[str, str], List[str]] = {}
         for (ns, batch), members in sorted(targets.items()):
+            if self._stopping:
+                result["errors"].append("{}/{}: not committed -- stopped first".format(ns, batch))
+                continue
             try:
                 self.kube.patch(self.cfg.batch_resource, batch, ns, patch)
-                patched += 1
+                patched[(ns, batch)] = members
                 self.store.log_event(
                     "commit gate released for {} VM(s)".format(len(members)), batch=batch)
                 self.log("  committed {}/{} ({} VMs)".format(ns, batch, len(members)))
             except KubectlError as exc:
-                errors.append("{}/{}: {}".format(ns, batch, str(exc)[:300]))
-        return {"batches": patched, "vms": len(rows), "errors": errors}
+                result["errors"].append("{}/{}: {}".format(ns, batch, str(exc)[:300]))
+        result["batches"] = len(patched)
+        if self.kube.dry_run or not patched or not wait:
+            result["pending"] = sorted(b for _, b in patched)
+            return result
+
+        # 3. Follow the operator until it has committed them.
+        timeout_s = (timeout_minutes or self.COMMIT_WAIT_MINUTES) * 60
+        started = time.time()
+        self.log("  waiting up to {}m for the operator to commit...".format(int(timeout_s // 60)))
+        while patched and time.time() - started < timeout_s and not self._stopping:
+            nap_until = time.time() + self.cfg.poll_interval_seconds
+            while time.time() < nap_until and not self._stopping:
+                time.sleep(min(1.0, max(0.0, nap_until - time.time())))
+            if self._stopping:
+                break
+            self._poll_commit_targets(patched, result)
+            patched = {k: v for k, v in patched.items() if self._still_waiting(k, v)}
+        for (ns, batch), members in sorted(patched.items()):
+            left = sum(1 for m in members if (self.store.get_vm(m) or {"state": ""})["state"]
+                       == st.S_AWAITING_COMMIT)
+            msg = ("{} VM(s) not confirmed committed yet -- refresh to record the outcome"
+                   .format(left))
+            self.store.log_event(msg, "warn", batch=batch)
+            self.log("  ~ {}/{}: {}".format(ns, batch, msg))
+            result["pending"].append(batch)
+        return result
+
+    def _still_waiting(self, key: Tuple[str, str], members: Sequence[str]) -> bool:
+        return any((self.store.get_vm(m) or {"state": ""})["state"] == st.S_AWAITING_COMMIT
+                   for m in members)
+
+    def _poll_commit_targets(self, targets: Dict[Tuple[str, str], List[str]],
+                             result: Dict[str, Any]) -> int:
+        """Read each batch once and apply it to its VMs. Returns how many of the
+        targeted VMs left awaiting_commit for committed."""
+        cache: Dict[str, Tuple[Dict[str, Any], List[Dict[str, Any]]]] = {}
+        moved = 0
+        for (ns, batch), members in targets.items():
+            if ns not in cache:
+                try:
+                    cache[ns] = self._fetch_namespace(ns, None)
+                except KubectlError as exc:
+                    self.log("  ! poll error (will retry): {}".format(str(exc)[:200]))
+                    continue
+            objs, children = cache[ns]
+            obj = objs.get(batch)
+            if obj is None:
+                continue    # the patch reports a missing batch; refresh handles vanished ones
+            counts = {"succeeded": 0, "failed": 0, "awaiting_commit": 0}
+            self._apply_status_to_vms(ns, batch, STAGE_IMPORT,
+                                      batch_status(obj, self.cfg, children, stage=STAGE_IMPORT),
+                                      {"ok": 0, "bad": 0}, counts)
+            result["committed"] += counts["succeeded"]
+            result["failed"] += counts["failed"]
+            moved += counts["succeeded"]
+        return moved
 
     # ------------------------------------------------------------- rollback
     # A failed import can leave a VM half-owned by the Supervisor. The recovery

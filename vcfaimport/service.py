@@ -262,6 +262,19 @@ def batch_members(store: st.Store, batch: sqlite3.Row) -> List[sqlite3.Row]:
             if v["namespace"] == batch["namespace"]]
 
 
+def commit_summary(result: Dict[str, Any]) -> str:
+    """One line for Engine.commit's result, the same in the CLI and the console."""
+    parts = ["released {} batch(es) covering {} VM(s)".format(result["batches"], result["vms"]),
+             "{} committed".format(result["committed"])]
+    if result["already_committed"]:
+        parts.append("{} of them already committed by the operator".format(result["already_committed"]))
+    if result["failed"]:
+        parts.append("{} FAILED".format(result["failed"]))
+    if result["pending"]:
+        parts.append("{} batch(es) not confirmed yet -- refresh to follow up".format(len(result["pending"])))
+    return "; ".join(parts)
+
+
 def rollback_preview(engine: Engine, batches: Sequence[sqlite3.Row]) -> List[Dict[str, Any]]:
     out = []
     for b in batches:

@@ -1537,11 +1537,47 @@ def t_e2e_commit_gate():
         vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
         eq({v["state"] for v in vms}, {"awaiting_commit"}, "held at the commit gate")
 
+        # commit follows the operator itself: no refresh needed afterwards.
         out = _run_cli(["-c", cfg, "commit", "-y"], env, tmp).stdout
-        assert "patched" in out, out
-        _run_cli(["-c", cfg, "status", "--refresh"], env, tmp)
+        assert "8 committed" in out, out
         vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
         eq({v["state"] for v in vms}, {"committed"}, "after commit")
+        import sqlite3 as sq
+        conn = sq.connect(str(Path(tmp, "run", "state.db")))
+        eq({r[0] for r in conn.execute("SELECT state FROM batches WHERE stage='import'")},
+           {"succeeded"}, "the batch is done too")
+        conn.close()
+
+
+@test("e2e: commit records VMs the operator already committed, without patching again")
+def t_e2e_commit_already_done():
+    """Observed 2026-09-25: under commitAction Wait the lab operator set Completed
+    28 s after ReadyForCommit, with no commit. The run had stopped polling at the
+    gate, so the batch read "awaiting commit" for days, and `commit` patched,
+    said "refresh later", and changed nothing the user could see."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "wait")
+        _seed_cluster(tmp, ["ns-a", "ns-b"], ["ns-a/sub-ns-a", "ns-b/sub-ns-b"])
+        cfg = _write_config(tmp, commit_action="Wait")
+        inv = _inventory(tmp, 4)
+        _run_cli(["-c", cfg, "load", "-i", inv], env, tmp)
+        _run_cli(["-c", cfg, "precheck", "-y"], env, tmp)
+        _run_cli(["-c", cfg, "run", "-y"], env, tmp)
+        # The operator commits behind the tool's back.
+        path = Path(tmp, "cluster.json")
+        cluster = json.loads(path.read_text())
+        for obj in cluster["batches"].values():
+            control = obj["spec"]["defaultSpec"]["controlAction"]
+            if not control.get("precheckOnly"):
+                control["commitAction"] = "Auto"
+                obj["_committed"] = True
+        path.write_text(json.dumps(cluster))
+
+        out = _run_cli(["-c", cfg, "commit", "-y"], env, tmp).stdout
+        assert "4 of them already committed by the operator" in out, out
+        assert "released 0 batch(es)" in out, out
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({v["state"] for v in vms}, {"committed"})
 
 
 @test("e2e: dry run applies nothing")
@@ -2469,6 +2505,32 @@ def t_web_jobs():
         assert not cut["stoppable"]
         on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
         eq((on_disk["status"], on_disk["interrupted"]), (STOPPED, True))
+
+
+@test("a retry after a rollback plans a new batch name, never the used one")
+def t_plan_fresh_name_after_use():
+    """Seen 2026-09-25: the retry of a rolled-back batch re-planned its exact name.
+    Had the old batch still been on the cluster, `kubectl apply` would have landed
+    on it -- rollbackAction: Immediate and all -- and the row kept its old dates."""
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config()
+        cfg.workdir = tmp
+        store = _store(tmp)
+        _record(store)
+        store.set_vm_state("vm-1", vst.S_PRECHECK_PASSED, message="test")
+        engine = Engine(cfg, store, None, lambda m: None)
+        first = engine.plan("import", run_id="run-1", write_manifests=False)[0]
+        store.create_batch(first.name, first.namespace, "run-1", 1, "import", 1)
+        again = engine.plan("import", run_id="run-1", write_manifests=False)[0]
+        eq(again.name, first.name, "a planned-only batch (a resumed run) keeps its name")
+        store.set_batch_state(first.name, first.namespace, vst.B_ROLLED_BACK, "test")
+        retry = engine.plan("import", run_id="run-1", write_manifests=False)[0]
+        assert retry.name != first.name, retry.name
+        assert retry.manifest["spec"]["operations"][0]["name"] != \
+            first.manifest["spec"]["operations"][0]["name"], "operation names follow the batch"
+        store.close()
 
 
 @test("rollback: Stop patches no further batches and ends the wait, not the revert")
@@ -4859,7 +4921,7 @@ UNIT = [
     t_status_operator_precheck, t_status_child_does_not_mask_pass, t_status_operator_stall,
     t_status_child_completed_spelling, t_status_child_precheck_condition,
     t_status_child_rollback_condition,
-    t_rollback_stop,
+    t_rollback_stop, t_plan_fresh_name_after_use,
     t_status_operator_import,
     t_status_conditions,
     t_filter_and, t_filter_folder, t_folder_map, t_folder_map_precedence, t_folder_tree,
@@ -4887,7 +4949,7 @@ E2E = [
     t_e2e_happy, t_e2e_precheck_gate, t_e2e_preflight_missing, t_e2e_flaky,
     t_e2e_init_maps, t_e2e_preflight_subnet_hint, t_e2e_preflight_vpc_subnet, t_e2e_preflight_operator_pod,
     t_e2e_running_message, t_e2e_vanished_batch, t_e2e_abandon, t_e2e_abandon_refuses_live_import,
-    t_e2e_circuit_breaker, t_e2e_commit_gate, t_e2e_dry_run, t_e2e_resume,
+    t_e2e_circuit_breaker, t_e2e_commit_gate, t_e2e_commit_already_done, t_e2e_dry_run, t_e2e_resume,
     t_e2e_report, t_e2e_server_dry_run,
     t_e2e_discover, t_e2e_folders, t_e2e_folder_execution, t_e2e_discover_auth, t_e2e_rediscover,
     t_e2e_tracker, t_e2e_tracker_retry,

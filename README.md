@@ -666,8 +666,12 @@ vcfa-import commit --vm vm-3082 --vm vm-3083         # named VMs, repeatable
 ```
 
 `commit` lists what it is about to release, warns that it is irreversible, and
-prompts for confirmation (`-y` skips the prompt for scripted runs). It patches
-the batch, it does not wait — the operator finishes asynchronously.
+prompts for confirmation (`-y` skips the prompt for scripted runs). It reads
+each batch first -- a VM the operator already committed is recorded, not
+released again -- then patches the gate and follows the operator until every
+VM is committed (up to 15 minutes; Stop in the console ends the wait, not the
+commit). Anything not confirmed by then is reported, and `status --refresh`
+records it later.
 
 > **The gate lives on the batch, not the VM.** `commit` patches
 > `commitAction: Auto` onto each batch holding a selected VM, and the operator

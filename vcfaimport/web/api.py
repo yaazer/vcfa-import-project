@@ -916,15 +916,17 @@ class WebApp:
 
         def run(job: Job) -> Dict[str, Any]:
             with self._job_workspace(job) as ws:
+                # Stop ends the wait; a gate already released stays released.
+                job.on_stop(ws.engine.request_commit_stop)
                 result = ws.engine.commit(morefs=morefs, wave=wave)
-            job.log("patched {} batch(es) covering {} VM(s)".format(result["batches"], result["vms"]))
+            job.log(service.commit_summary(result))
             for err in result["errors"]:
                 job.log("  ! " + err)
-            job.log("refresh once the operator has processed the commit")
-            return dict(result, status=WARNING if result["errors"] else None)
+            bad = result["errors"] or result["pending"] or result["failed"]
+            return dict(result, status=STOPPED if job.stop_requested else WARNING if bad else None)
 
         return self._start("commit", "Commit held imports", {"morefs": morefs, "wave": wave}, run,
-                               lock=self._lock_for("commit"))
+                           stoppable=True, lock=self._lock_for("commit"))
 
     def _job_rollback(self, body: Dict[str, Any]) -> Job:
         _require_confirm(body)
