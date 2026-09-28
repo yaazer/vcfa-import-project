@@ -76,10 +76,16 @@ def build_exe() -> Path | None:
         return None
 
     work = DIST / "_pyinstaller"
+    work.mkdir(parents=True, exist_ok=True)
+    sys.path.insert(0, str(ROOT / "tools"))
+    import make_icons                        # the app icon, rasterised with the stdlib
+    ico = work / "vcfa-import.ico"
+    ico.write_bytes(make_icons.ico())
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile", "--console", "--clean", "--noconfirm",
         "--name", "vcfa-import",
+        "--icon", str(ico),
         "--distpath", str(DIST),
         "--workpath", str(work),
         "--specpath", str(work),
@@ -131,7 +137,8 @@ def smoke(pyz: Path, exe: Path | None) -> None:
     # The web console's UI ships as package data; a build without it serves a blank page.
     with zipfile.ZipFile(pyz) as zf:
         names = set(zf.namelist())
-    missing = [f for f in ("index.html", "core.js", "skins.js", "fx.js", "views.js", "gov.js", "help.js", "app.css")
+    missing = [f for f in ("index.html", "core.js", "skins.js", "fx.js", "views.js", "gov.js", "help.js", "app.css",
+                           "favicon.svg", "appicon.svg")
                if "vcfaimport/web/static/" + f not in names]
     missing += [f for f in DOC_FILES if "vcfaimport/web/docs/" + f not in names]
     if missing:

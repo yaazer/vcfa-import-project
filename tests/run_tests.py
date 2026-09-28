@@ -4624,6 +4624,40 @@ def t_web_docs():
             c.close()
 
 
+@test("app icon: the served SVGs, the inline copies and the .ico all come from one geometry")
+def t_app_icon():
+    import struct
+    sys.path.insert(0, str(ROOT / "tools"))
+    import make_icons
+    static = ROOT / "vcfaimport" / "web" / "static"
+    eq((static / "appicon.svg").read_text(encoding="utf-8"), make_icons.svg("full"), "run tools/make_icons.py")
+    eq((static / "favicon.svg").read_text(encoding="utf-8"), make_icons.svg("small"), "run tools/make_icons.py")
+    # appIcon() in core.js and the sidebar in index.html draw the full cut inline, recoloured by CSS
+    pts = lambda ps: " ".join("{:g} {:g}".format(x, y) for x, y in ps)
+    full = make_icons.CUTS["full"]
+    for name in ("core.js", "index.html"):
+        text = (static / name).read_text(encoding="utf-8")
+        for d in ("M" + pts(full["hex"][0]), "M" + pts(full["v"][0])):
+            assert d in text, (name, d)
+    assert 'href="/static/favicon.svg"' in (static / "index.html").read_text(encoding="utf-8")
+    data = make_icons.ico(sizes=(16, 32))
+    eq(struct.unpack("<HHH", data[:6]), (0, 1, 2), "an .ico with two images")
+    size, offset = struct.unpack("<II", data[6 + 8:6 + 16])
+    eq(data[offset:offset + 8], b"\x89PNG\r\n\x1a\n", "each image is a PNG")
+    px = make_icons.render(16)
+    eq(px[8 * 16 * 4 + 1 * 4 + 3], 255, "the tile is opaque inside")
+    eq(px[3], 0, "and its rounded corner is transparent")
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            status, body, headers = c.call("GET", "/static/favicon.svg", token=False, raw=True)
+            eq(status, 200)
+            assert headers.get("Content-Type", "").startswith("image/svg+xml"), headers
+            assert body.startswith(b"<svg"), body[:40]
+        finally:
+            c.close()
+
+
 @test("help: every tooltip and tour link names a heading that exists in the guides")
 def t_help_doc_anchors():
     import re
@@ -4842,6 +4876,7 @@ def t_e2e_portgroups_subnets():
 
 
 UNIT = [
+    t_app_icon,
     t_vcenter_portgroups,
     t_stage_ns_conflicts,
     t_serve_open_headless, t_python_version_message,

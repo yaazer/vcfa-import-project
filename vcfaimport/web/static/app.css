@@ -73,13 +73,32 @@ body::after { content: ""; position: fixed; inset: 0; z-index: 90; pointer-event
   background: var(--glass); border: 1px solid var(--line); border-radius: 24px;
   backdrop-filter: blur(26px) saturate(170%); -webkit-backdrop-filter: blur(26px) saturate(170%); box-shadow: var(--shadow); }
 .brand { display: flex; align-items: center; gap: 12px; padding: 20px 18px 12px; }
-.logo { position: relative; width: 36px; height: 36px; flex: none; }
-.logo::before { content: ""; position: absolute; inset: -3px; border-radius: 13px;
+.logo { position: relative; width: 40px; height: 40px; flex: none; }
+.logo::before { content: ""; position: absolute; inset: -3px; border-radius: 12px;
   background: conic-gradient(var(--accent), var(--accent-2), var(--accent-3), var(--accent));
   filter: blur(6px); opacity: .75; animation: spin 7s linear infinite; }
-.logo svg { position: relative; width: 36px; height: 36px; display: block; }
-.logo rect { fill: var(--bg1); }
-.logo path { stroke: var(--accent); stroke-width: 3.2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.logo svg { position: relative; width: 40px; height: 40px; display: block; }
+
+/* The app icon: brand colours from the icon proof, fixed across themes; a theme only
+ * picks the colourway -- navy (default), on dark UI (navy with a light edge),
+ * light (for dark headers), mono (print). */
+.appicon { display: block; width: 100%; height: 100%;
+  --ai-tile: #0E2F4E; --ai-v: #49AFD9; --ai-hex: #FFFFFF; --ai-vm: #49AFD9; --ai-bar: #0E2F4E; --ai-edge: transparent; }
+.appicon .ai-tile { fill: var(--ai-tile); stroke: var(--ai-edge); stroke-width: 1.5; }
+.appicon .ai-hex, .appicon .ai-v, .appicon .ai-bar { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.appicon .ai-hex { stroke: var(--ai-hex); }
+.appicon .ai-v { stroke: var(--ai-v); }
+.appicon .ai-vm { fill: var(--ai-vm); }
+.appicon .ai-bar { stroke: var(--ai-bar); }
+html[data-theme="dark"] .appicon { --ai-edge: rgba(255, 255, 255, .22); }
+.appicon.light, html[data-skin="classic"] .brand .appicon {
+  --ai-tile: #FFFFFF; --ai-v: #0072A3; --ai-hex: #0E2F4E; --ai-vm: #0E2F4E; --ai-bar: #FFFFFF; --ai-edge: #D5DDE4; }
+.appicon.mono { --ai-tile: #26292E; --ai-v: #FFFFFF; --ai-hex: #FFFFFF; --ai-vm: #FFFFFF; --ai-bar: #26292E; --ai-edge: transparent; }
+@media print { .appicon { --ai-tile: #26292E; --ai-v: #FFFFFF; --ai-hex: #FFFFFF; --ai-vm: #FFFFFF; --ai-bar: #26292E; --ai-edge: transparent; } }
+.gate-mark { width: 40px; height: 40px; flex: none; }
+.card-h .gate-mark + h3 { margin-left: 2px; }
+.tour-hero.brand-hero { width: 56px; height: 56px; background: none; box-shadow: none; border-radius: 0; }
+.tour-hero.brand-hero svg { width: 56px; height: 56px; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
 .brand-text b { font-family: var(--display); font-size: 16px; letter-spacing: -.02em;
   background: linear-gradient(90deg, var(--fg), var(--accent)); -webkit-background-clip: text; background-clip: text; color: transparent; }
@@ -945,8 +964,6 @@ html[data-skin="clarity"] .topbar h1 { font-size: 22px; font-weight: 400; letter
 html[data-skin="clarity"] .sidebar { background: #17242b; border: 0; border-right: 1px solid #0f1c22; box-shadow: none; }
 html[data-skin="clarity"] .brand { background: #22343c; border-bottom: 1px solid #0f1c22; padding: 13px 16px; min-height: 60px; }
 html[data-skin="clarity"] .brand-text b { font-weight: 400; font-size: 18px; letter-spacing: 0; color: var(--fg); }
-html[data-skin="clarity"] .logo rect { fill: #0095d3; }
-html[data-skin="clarity"] .logo path { stroke: #fff; }
 html[data-skin="clarity"] .nav-group { letter-spacing: .08em; font-weight: 600; color: var(--faint); }
 html[data-skin="clarity"] .nav-item { border-radius: 0; height: 34px; margin: 0 -12px; padding: 0 22px; font-size: 13.5px; }
 html[data-skin="clarity"] .nav-item:hover { background: #22343c; }
@@ -1016,8 +1033,6 @@ html[data-skin="classic"] .sidebar { background: #f2f6fa; border: 0; border-righ
 html[data-skin="classic"] .brand { background: linear-gradient(180deg, #4b8ed0 0%, #2e6fb2 55%, #2566a8 100%); border-bottom: 1px solid #1a4f85; min-height: 58px; padding: 10px 14px; }
 html[data-skin="classic"] .brand-text b { color: #fff; font-size: 15px; text-shadow: 0 1px 1px rgba(0, 0, 0, .25); }
 html[data-skin="classic"] .brand-text small { color: #d7e7f8; }
-html[data-skin="classic"] .logo rect { fill: #fff; }
-html[data-skin="classic"] .logo path { stroke: #2566a8; }
 html[data-skin="classic"] .nav-group { background: linear-gradient(180deg, #f9fbfd, #e1eaf3); border-top: 1px solid #c3d1de; border-bottom: 1px solid #c3d1de;
   color: #2d5a88; text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 700; margin: 8px -12px 2px; padding: 5px 16px; }
 html[data-skin="classic"] .nav-item { border-radius: 0; height: 28px; margin: 0 -12px; padding: 0 16px; font-size: 12.5px; color: #1f2d3a; }

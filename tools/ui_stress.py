@@ -531,6 +531,11 @@ const SCENARIOS = {
 
   async theme() {
     await open('overview');
+    check('the sidebar carries the app icon', document.querySelector('.brand .logo svg.appicon .ai-vm'));
+    const fav = document.querySelector('link[rel="icon"]');
+    check('the favicon is the app icon', fav && fav.getAttribute('href') === '/static/favicon.svg');
+    const favRes = await fetch('/static/favicon.svg');
+    check('and it is served as SVG', favRes.ok && /svg/.test(favRes.headers.get('content-type') || ''));
     const bg = () => getComputedStyle(document.body).backgroundColor;
     const accent = () => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
     const before = bg();
@@ -573,8 +578,13 @@ const SCENARIOS = {
     check('and its colour icons in the navigation', await waitFor(() => document.querySelector('#nav .nav-item svg.skin-ic')));
     check('but not inside tinted callout boxes', !document.querySelector('#view .callout .ic svg.skin-ic'));
     check('status colours keep their meaning in a skin', /#3a9a3a/i.test(getComputedStyle(root).getPropertyValue('--s-committed')));
+    const tile = () => getComputedStyle(document.querySelector('.brand .logo .ai-tile')).fill;
+    check('the classic header carries the light colourway of the app icon', tile() === 'rgb(255, 255, 255)', tile());
     click('#fx-studio [data-fx="resetFx"]');
     check('reset drops the skin', await waitFor(() => !root.dataset.skin) && !document.querySelector('#nav svg.skin-ic'));
+    check('the app icon is navy again', await waitFor(() => tile() === 'rgb(14, 47, 78)', 3000), tile());
+    check('with a light edge on a dark theme', getComputedStyle(document.querySelector('.brand .logo .ai-tile')).stroke !== 'none'
+      && getComputedStyle(document.querySelector('.brand .logo .ai-tile')).stroke !== 'rgba(0, 0, 0, 0)', getComputedStyle(document.querySelector('.brand .logo .ai-tile')).stroke);
     check('reset restores Aurora', await waitFor(() => bg() === before) && FX.prefs.theme === 'aurora' && FX.prefs.shift === 0);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     check('Escape closes the studio', await waitFor(() => !document.querySelector('#fx-studio')));
@@ -871,6 +881,7 @@ const SCENARIOS = {
     check('a first visit opens the welcome', welcome && /Welcome/.test(welcome.textContent));
     check('the welcome says the tour changes nothing', welcome && /changes nothing/.test(welcome.textContent));
     check('it offers the lab guide straight away', document.querySelector('.tour-card [data-tour="lab"]'));
+    check('the welcome shows the app icon', document.querySelector('.tour-card .brand-hero svg.appicon'));
     click('[data-tour="next"]');
     const n = HELP.TOUR_STEPS.length;
     let seen = 0, spotted = 0;

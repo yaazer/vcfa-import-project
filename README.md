@@ -95,6 +95,18 @@ closed state is remembered per browser.
 | **Settings** (Admin) | Guardrails (pacing, safety, governance, applications, verification) with their file values and allowed ranges, notification channels with a *Test* button, and people: personal links for viewers, operators and admins |
 | **Help & guides** (Admin) | The welcome tour, a step-by-step *first import*, this README and the lab guide rendered offline with a table of contents, and a searchable glossary |
 
+**App icon.** A "V" drops the VM into the automation platform. It appears in
+the sidebar, the browser tab, the sign-in card, the welcome tour and on
+`vcfa-import.exe`. It uses one geometry in two cuts (full from 40 px up, a
+heavier small cut for 32 px and below) and four colourways from the icon proof:
+- navy, the default;
+- navy with a light edge, on dark themes;
+- light, under vCenter Classic's blue header;
+- mono, when printing.
+
+`tools/make_icons.py` writes the SVGs and builds the `.ico` with the standard
+library only.
+
 **Look and feel.** The Overview opens on the **Migration Stream**: every VM is a
 particle, flowing from vCenter through precheck and import into VCF Automation,
 with anything that needs attention pooled underneath. The same stream follows
