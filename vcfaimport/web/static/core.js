@@ -104,6 +104,11 @@ const ICONS = {
   eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   palette: '<path d="M12 3a9 9 0 100 18c1.1 0 1.7-.9 1.4-1.9-.3-.8.3-1.6 1.1-1.6H17a4 4 0 004-4c0-5-4-8.5-9-8.5z"/><circle cx="7.5" cy="11.5" r="1.2"/><circle cx="10.5" cy="7.5" r="1.2"/><circle cx="15.5" cy="8" r="1.2"/>',
 };
+// The app icon (tools/make_icons.py has the same geometry): the full cut from 40 px up,
+// the small cut below. Colours come from CSS, so each theme picks its colourway.
+function appIcon(cls) {
+  return raw('<svg class="appicon' + (cls ? ' ' + cls : '') + '" viewBox="0 0 64 64" aria-hidden="true"><rect class="ai-tile" x=".75" y=".75" width="62.5" height="62.5" rx="13.25"/><path class="ai-hex" stroke-width="3.5" d="M25 22.4 15 27.5 15 45.5 32 55 49 45.5 49 27.5 39 22.4"/><path class="ai-v" stroke-width="4" d="M21 11 32 23 43 11"/><rect class="ai-vm" x="24.5" y="31" width="15" height="14" rx="3"/><path class="ai-bar" stroke-width="1.9" d="M28 35.2H36M28 40.6H36"/></svg>');
+}
 function icon(name, cls) {
   // A design-language skin (skins.js) redraws some icons in its own style. A skin whose
   // icons are full-colour art (not `everywhere`) only draws them where the call site marks
@@ -258,7 +263,7 @@ function initToken() {
 function tokenGate() {
   S.gated = true;
   mount($('#view'), html`<div class="card" style="max-width:520px;margin:8vh auto">
-    <div class="card-h"><h3>Access token needed</h3></div>
+    <div class="card-h"><span class="gate-mark">${appIcon()}</span><h3>Access token needed</h3></div>
     <div class="card-b stack">
       <p class="muted" style="margin:0">Open the link printed by <code>vcfa-import serve</code>, or paste the token from it
       (the part after <code>#t=</code>). A new token is issued each time the console starts unless <code>--token</code> is given.</p>

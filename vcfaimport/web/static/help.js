@@ -313,7 +313,7 @@ function tourDraw() {
   root.innerHTML = fmt(html`<div class="tour-block ${centered ? 'dim' : ''}"></div>
     ${centered ? '' : html`<div class="tour-spot ${tone}"></div>`}
     <div class="tour-card ${tone} ${centered ? 'center' : ''}" role="dialog" aria-modal="true" aria-labelledby="tour-title">
-      ${first ? html`<div class="tour-hero">${icon('book')}</div>` : html`<div class="tour-top"><span class="tour-count">${TOUR.i} / ${n - 1}</span>
+      ${first ? html`<div class="tour-hero brand-hero">${appIcon()}</div>` : html`<div class="tour-top"><span class="tour-count">${TOUR.i} / ${n - 1}</span>
         <span class="tour-dots">${TOUR_STEPS.slice(1).map((x, k) => html`<i class="${k + 1 === TOUR.i ? 'on' : k + 1 < TOUR.i ? 'done' : ''}"></i>`)}</span></div>`}
       <h3 id="tour-title">${s.title}</h3>
       <div class="tour-body">${s.body()}</div>
