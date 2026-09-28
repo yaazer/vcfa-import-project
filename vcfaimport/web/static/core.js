@@ -988,6 +988,7 @@ function jobSummary(j) {
     case 'preflight': return r.ok ? 'All checks passed' : plural((r.problems || []).length, 'problem') + ' found';
     case 'execute': return 'applied ' + n(r.applied) + ' · succeeded ' + n(r.succeeded) + ' · failed ' + n(r.failed) + (r.awaiting_commit ? ' · awaiting commit ' + n(r.awaiting_commit) : '');
     case 'rollback': return n(r.reverted) + ' VM(s) reverted to vCenter';
+    case 'commit': return n(r.committed) + ' VM(s) committed' + (r.failed ? ' · failed ' + n(r.failed) : '') + ((r.pending || []).length ? ' · not confirmed yet, refresh' : '');
     case 'abandon': return (r.deleted || []).length + ' batch(es) deleted, ' + n(r.requeued) + ' VM(s) requeued';
     default: return 'took ' + fmtDur(r.seconds);
   }

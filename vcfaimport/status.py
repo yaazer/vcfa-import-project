@@ -352,7 +352,10 @@ def operator_status(
         return str((cond or {}).get("reason") or "")
 
     def message_of(cond: Optional[Dict[str, Any]]) -> Optional[str]:
-        return _first_str(cond or {}, MESSAGE_KEYS)
+        # A reached condition has no message, and its reason is just "True":
+        # falling back to that put a bare "True" in every VM's message column.
+        text = _first_str(cond or {}, MESSAGE_KEYS)
+        return None if text is not None and text.strip().lower() in ("true", "false") else text
 
     def working(cond: Optional[Dict[str, Any]]) -> bool:
         """False-with-a-transient-reason, or absent: the operator is still busy."""

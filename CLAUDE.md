@@ -149,6 +149,12 @@ learned from a real cluster — the fakes should model what was observed.
   got `PrecheckSucceeded=True`. Tools read `RUNNING` too -- the Ubuntu installer
   runs open-vm-tools -- so Tools status cannot detect an unfinished install.
   Readiness grades `iso_connected` as block for this reason.
+- **Under `commitAction: Wait`, the operator set `Completed: True` with no commit**
+  (2026-09-25): `ReadyForCommit` at 17:15:37, `Completed` at 17:16:05, the gate never
+  patched. Either Wait is not honoured in this build or `Completed` does not mean
+  committed under Wait -- unresolved. The run stops polling at the gate, so the tool
+  read "awaiting commit" for days; `commit` now re-reads the batch before patching
+  and follows it to the end.
 - A batch `status` may also carry `operationPlacements` (seen 2026-09-23; unparsed).
 - Not yet observed: the per-op lists for failed/completed/rolled-back operations, the
   target VM resource name field. `status.py` tries several spellings; confirm when seen.

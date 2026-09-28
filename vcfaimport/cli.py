@@ -769,12 +769,10 @@ def cmd_commit(args) -> int:
         return code
     with service.WorkspaceLock(cfg, "`commit` from the CLI"):
         result = engine.commit(morefs=args.vm or None, wave=args.wave_single)
-    log("patched {} batch(es) covering {} VM(s)".format(result["batches"], result["vms"]))
+    log(service.commit_summary(result))
     for err in result["errors"]:
         log("  ! " + err)
-    log("")
-    log("run `vcfa-import status --refresh` once the operator has processed the commit")
-    return 0 if not result["errors"] else 4
+    return 0 if not (result["errors"] or result["pending"] or result["failed"]) else 4
 
 
 def cmd_rollback(args) -> int:

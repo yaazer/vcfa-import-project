@@ -475,8 +475,7 @@ time and why the config refuses `rollback_action`.
 ```bash
 vcfa-import precheck --wave 1        # the retried VM needs a fresh precheck
 vcfa-import run --wave 1             # all lab VMs -> awaiting_commit
-vcfa-import commit --wave 1          # irreversible from here
-vcfa-import status --refresh
+vcfa-import commit --wave 1          # irreversible from here; waits for the operator
 ```
 
 All VMs should reach `committed`. Confirm in VCF Automation that they appear
