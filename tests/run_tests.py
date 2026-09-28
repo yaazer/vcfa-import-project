@@ -3076,6 +3076,9 @@ def t_web_stage_edges():
             vm = c.app.store.get_vm("vm-1000")
             eq((vm["namespace"], vm["state"]), ("ns-a", "importing"), "in flight: untouched")
             eq(c.app.store.get_vm("vm-1003")["namespace"], "ns-new", "pending: updated")
+            waves = c.ok("GET", "/api/pulse")["waves"]
+            eq(waves, len(c.app.store.waves()), "the stepper's wave count")
+            assert waves >= 2, waves
             eq(c.call("POST", "/api/stage/preview", {"default_wave": 0})[0], 400)
         finally:
             c.close()

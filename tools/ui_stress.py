@@ -280,7 +280,13 @@ const SCENARIOS = {
     await sleep(600);
     check('saving unchanged maps keeps them intact', (await GET('/api/maps')).folder.rows.length === mapsBefore);
 
-    // namespaces from the Supervisor, suggested while mapping
+    // namespaces from the Supervisor, suggested while mapping: a folded reference, counts in its summary
+    const tgt = () => document.querySelector('.nsbar details.tgt');
+    const tgtSum = () => (tgt() ? tgt().querySelector('summary').textContent.replace(/\s+/g, ' ') : '');
+    check('what you can map to starts folded away', tgt() && !tgt().open);
+    check('its summary counts what is there', await waitFor(() => /\d+ namespaces?/.test(tgtSum()) && /\d+ subnets?/.test(tgtSum()) && /\d+ portgroups?/.test(tgtSum()), 10000), tgtSum());
+    tgt().querySelector('summary').click();
+    check('one click unfolds it', await waitFor(() => tgt() && tgt().open, 3000));
     const chip = await waitFor(() => document.querySelector('.nsbar .nschip'), 10000);
     check('the Supervisor\'s namespaces are listed while mapping', chip && /prod-web-ns1/.test(document.querySelector('.nsbar').textContent),
       document.querySelector('.nsbar') && document.querySelector('.nsbar').textContent.slice(0, 160));
@@ -300,6 +306,12 @@ const SCENARIOS = {
     check('a namespace not on the Supervisor is flagged as you type', document.getElementById('f-' + k + '-namespace').classList.contains('unknown'));
     check('with a reason', /Supervisor|kubeconfig/.test(document.getElementById('f-' + k + '-namespace').title));
     check('and listed above the maps', await waitFor(() => { S.view.render(); return /prod-web-nsl/.test((document.querySelector('.nsbar .note.warn') || {}).textContent || ''); }, 4000));
+    tgt().querySelector('summary').click();
+    await waitFor(() => !tgt().open, 3000);
+    const w = document.querySelector('.nsbar .note.warn');
+    check('a misspelt name is still reported with the list folded', w && w.offsetParent && /prod-web-nsl/.test(w.textContent));
+    tgt().querySelector('summary').click();
+    await waitFor(() => tgt().open, 3000);
     click('[data-act="delRow"][data-m="f"][data-i="' + k + '"]');
     await waitFor(() => S.view.fr.length === k, 3000);
 
@@ -328,6 +340,28 @@ const SCENARIOS = {
     check('a subnet click with no subnet field in focus explains what to do', await waitFor(() => [...document.querySelectorAll('.toast')].some((x) => /Subnet field first/.test(x.textContent)), 3000));
     click('[data-act="delRow"][data-m="n"][data-i="' + nBefore + '"]');
     await waitFor(() => S.view.nr.length === nBefore, 3000);
+
+    // hundreds of names: the filter narrows every row, and keeps the field you were in
+    const sub0 = S.view.nr[0].subnet;
+    document.getElementById('n-0-subnet').focus();
+    const tq = document.getElementById('tgt-q');
+    tq.focus();
+    tq.value = 'vlan210';
+    tq.dispatchEvent(new Event('input', { bubbles: true }));
+    const narrowed = await waitFor(() => {
+      const sb = [...document.querySelectorAll('.nsbar .sbchip')];
+      return sb.length && sb.every((x) => /vlan210/.test(x.dataset.name)) && !document.querySelector('.nsbar [data-act="pickNs"]') ? sb : null;
+    }, 3000);
+    check('the filter narrows the lists as you type', narrowed, [...document.querySelectorAll('.nsbar .sbchip')].map((x) => x.dataset.name).join(','));
+    check('a row with no match says so', /no match/.test(document.querySelector('.nsbar').textContent));
+    check('typing in the filter keeps your place', document.activeElement && document.activeElement.id === 'tgt-q', (document.activeElement || {}).id);
+    if (narrowed) narrowed[0].click();
+    check('a filtered name still fills the field you were in', await waitFor(() => S.view.nr[0].subnet === 'subnet-vlan210', 3000), S.view.nr[0].subnet);
+    type('#n-0-subnet', sub0);
+    const tq2 = document.getElementById('tgt-q');
+    tq2.value = '';
+    tq2.dispatchEvent(new Event('input', { bubbles: true }));
+    await waitFor(() => document.querySelector('.nsbar .nschip'), 3000);
 
     // two maps disagree about a VM's namespace
     const ni = S.view.nr.findIndex((r) => r.portgroup === 'DMZ-Uplink');   // the Databases VMs' network in the fake vCenter
@@ -544,6 +578,57 @@ const SCENARIOS = {
     check('reset restores Aurora', await waitFor(() => bg() === before) && FX.prefs.theme === 'aurora' && FX.prefs.shift === 0);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     check('Escape closes the studio', await waitFor(() => !document.querySelector('#fx-studio')));
+  },
+
+  async flow() {
+    // ---- the sidebar: five stages as a stepper, then two collapsible groups
+    await open('discover');
+    Object.keys(NAVG).forEach((k) => { delete NAVG[k]; });   // landing on Overview opened Monitor
+    renderNav();
+    const steps = [...document.querySelectorAll('#nav .flow-nav .flow-step')];
+    check('the sidebar leads with the five stages, in order', steps.map((a) => a.getAttribute('href')).join(' ') === '#/discover #/select #/stage #/waves #/execute',
+      steps.map((a) => a.getAttribute('href')).join(' '));
+    check('each stage says where it stands', /VMs? found/.test(steps[0].textContent) && /selected/.test(steps[1].textContent) && /in the queue/.test(steps[2].textContent)
+      && /waves?/.test(steps[3].querySelector('small').textContent), steps.map((a) => a.textContent.replace(/\s+/g, ' ').trim()).join(' | '));
+    check('stages that are done carry a tick', document.querySelectorAll('#nav .flow-nav li.done').length >= 3);
+    check('the header says which step you are on', /step 1 of 5/.test(document.querySelector('#nav .flow-h').textContent));
+    const grp = (g) => document.querySelector('#nav .nav-grp[data-g="' + g + '"]');
+    const shown = (sel) => { const el = document.querySelector(sel); return !!(el && el.offsetParent); };
+    check('Monitor and Admin start closed', !grp('monitor').classList.contains('open') && !grp('admin').classList.contains('open'));
+    check('their pages are out of the way', !shown('#nav .nav-item[href="#/queue"]') && !shown('#nav .nav-item[href="#/settings"]'));
+    check('a closed group still shows a failure count', /\d/.test((grp('monitor').querySelector('.grp-b .nav-badge.bad') || {}).textContent || ''));
+    click('#nav .nav-grp[data-g="admin"] .nav-grp-h');
+    check('clicking a group opens it', await waitFor(() => grp('admin').classList.contains('open') && shown('#nav .nav-item[href="#/settings"]'), 3000));
+    check('and it is remembered', JSON.parse(store.get('vcfa-nav') || '{}').admin === true);
+    click('#nav .nav-grp[data-g="admin"] .nav-grp-h');
+    check('clicking again closes it', await waitFor(() => !grp('admin').classList.contains('open'), 3000));
+    await open('triage');
+    check('landing on a page opens its group', grp('monitor').classList.contains('open') && shown('#nav .nav-item.active[href="#/triage"]'));
+    check('an open group shows its badges on the items, not the header', !grp('monitor').querySelector('.grp-b'));
+
+    // ---- each stage page is one column of numbered sections, ending in the way on
+    const next = { discover: 'select', select: 'stage', waves: 'execute' };
+    for (const id of ['discover', 'select', 'stage', 'waves', 'execute']) {
+      await open(id);
+      check(id + ': nothing side by side', !document.querySelector('#view .grid.two, #view .grid.side, #view .steps'));
+      if (id !== 'waves') {
+        const secs = [...document.querySelectorAll('#view .flow > .flow-sec')];
+        check(id + ': numbered sections, top to bottom', secs.length >= 2 && secs.every((x, i) => i === 0 || x.getBoundingClientRect().top >= secs[i - 1].getBoundingClientRect().bottom - 1),
+          secs.length + ' sections');
+      }
+      if (next[id]) check(id + ': ends with the way to the next stage', document.querySelector('#view .flow-next [data-act="go"][data-to="' + next[id] + '"]'));
+    }
+    await open('waves');
+    const cols = [...document.querySelectorAll('#view .board .wcol')];
+    check('waves stack top to bottom', cols.length >= 2 && cols[1].getBoundingClientRect().top >= cols[0].getBoundingClientRect().bottom - 1
+      && Math.abs(cols[0].getBoundingClientRect().width - cols[1].getBoundingClientRect().width) < 2);
+    await open('stage');
+    check('Map & Stage marks a fully mapped section done', document.querySelector('#sec-folders.done, #sec-networks.done'));
+    await open('select');
+    check('the optional bulk edits start folded away', document.querySelector('#view details.bulkmore') && !document.querySelector('#view details.bulkmore').open);
+    await open('discover');
+    click('#view .flow-next [data-to="select"]');
+    check('Next goes to the next stage', await waitFor(() => S.route === 'select', 3000));
   },
 
   async palette() {
@@ -821,7 +906,7 @@ const SCENARIOS = {
     // ---- tooltips
     await open('execute');
     const tipBox = () => { const t = document.getElementById('tip'); return t && !t.hidden ? t : null; };
-    const pf = document.querySelector('.steps .tipq[data-tip="preflight"]');
+    const pf = document.querySelector('#view .flow-sec .tipq[data-tip="preflight"]');
     pf.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }));
     const t1 = await waitFor(tipBox, 3000);
     check('hovering a ? explains it', t1 && /Preflight/.test(t1.textContent) && /read-only/.test(t1.textContent), t1 && t1.textContent);
@@ -1103,7 +1188,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme", "palette", "stream", "govern", "help"]
+             "resilience", "token", "theme", "palette", "stream", "govern", "help", "flow"]
 
 
 def main():

@@ -13,6 +13,27 @@ function kpi(lbl, value, sub, to, color) {
     <div class="v" ${typeof value === 'number' ? raw('data-count="' + value + '" data-key="kpi:' + esc(lbl) + '"') : ''}>${typeof value === 'number' ? n(value) : value}</div><div class="l">${lbl}</div>${sub ? html`<div class="s">${sub}</div>` : ''}</div>`;
 }
 
+// The five stages are each one column: numbered sections, worked top to bottom
+// (flowSec), ending in a bar that leads to the next stage (flowNext).
+// state: done / now / warn / todo (not reachable yet) / opt (optional).
+function flowSec(num, body, state, id) {
+  return html`<section class="flow-sec ${state || ''}" ${id ? raw('id="' + esc(id) + '"') : ''}><span class="flow-n">${state === 'done' ? icon('check') : num}</span>
+    <div class="flow-body">${body}</div></section>`;
+}
+function flowNext(ic, title, text, actions, ids) {
+  ids = ids || {};
+  return html`<div class="callout stickybar flow-next" style="background:var(--panel)"><div class="ic">${icon(ic)}</div>
+    <div class="grow"><h3 ${ids.title ? raw('id="' + ids.title + '"') : ''}>${title}</h3><p ${ids.text ? raw('id="' + ids.text + '"') : ''}>${text}</p></div>${actions}</div>`;
+}
+function setSecState(id, state) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  ['done', 'now', 'warn', 'todo', 'opt'].forEach((k) => el.classList.toggle(k, k === state));
+  const nEl = el.querySelector(':scope > .flow-n');
+  if (nEl && state === 'done' && !nEl.querySelector('svg')) { nEl.dataset.n = nEl.textContent; mount(nEl, icon('check')); }
+  if (nEl && state !== 'done' && nEl.dataset.n) { nEl.textContent = nEl.dataset.n; delete nEl.dataset.n; }
+}
+
 // ================================================================= OVERVIEW
 function nextStep(d, p) {
   const c = d.counts;
@@ -116,8 +137,10 @@ VIEWS.discover = view({
     const top = {};
     v.vms.forEach((x) => { const t = (x.folder || '').split('/')[0] || '(datacenter root)'; top[t] = (top[t] || 0) + 1; });
     const noTools = v.vms.filter((x) => x.tools_status && !/running/i.test(x.tools_status)).length;
-    return html`<div class="grid two">
-      <div class="card"><div class="card-h"><h3>Connect to vCenter</h3><span class="sub">read-only</span></div>
+    const found = !!o.discovered.total;
+    const g = v.ready && v.ready.grades;
+    return html`<div class="flow narrow">
+      ${flowSec(1, html`<div class="card"><div class="card-h"><h3>Connect to vCenter</h3><span class="sub">read-only · nothing in vCenter changes</span></div>
         <div class="card-b stack">
           <div class="form-grid">
             <label class="field"><span>vCenter server</span><input class="input" id="f-server" data-input="field" data-k="server" value="${f.server}" placeholder="vcenter.example.local" autocomplete="off"></label>
@@ -127,30 +150,34 @@ VIEWS.discover = view({
               <small>Used for this discovery only; never stored.</small></label>
             <label class="field"><span>Parallel detail reads ${tip('concurrency')}</span><input class="input" type="number" min="1" max="32" id="f-conc" data-input="field" data-k="concurrency" value="${f.concurrency}"></label>
           </div>
-          <div class="row wrap" style="gap:18px">
-            <label class="check"><input type="checkbox" data-change="field" data-k="powered_on" ${attr(f.powered_on, 'checked')}> Powered-on VMs only ${tip('powered_on')}</label>
-            <label class="check"><input type="checkbox" data-change="field" data-k="no_tools" ${attr(f.no_tools, 'checked')}> Skip the VM Tools check ${tip('no_tools')}</label>
-            <label class="check"><input type="checkbox" data-change="field" data-k="insecure" ${attr(f.insecure, 'checked')}> Skip TLS verification ${tip('insecure')}</label>
-            <label class="check"><input type="checkbox" data-change="field" data-k="no_tags" ${attr(f.no_tags, 'checked')}> Skip vCenter tags ${tip('no_tags')}</label>
-          </div>
-          <label class="check small"><input type="checkbox" data-change="field" data-k="remember" ${attr(f.remember, 'checked')}> Keep these credentials in memory for post-import verification ${tip('remember')}
-            <span class="muted">(never written to disk; gone when the console stops)</span></label>
+          <details class="opts" ${attr(v.optsOpen || f.powered_on || f.no_tools || f.insecure || f.no_tags || f.remember, 'open')} data-toggle="optsOpen"><summary>Options</summary>
+            <div class="stack mt-s" style="gap:10px">
+              <label class="check"><input type="checkbox" data-change="field" data-k="powered_on" ${attr(f.powered_on, 'checked')}> Powered-on VMs only ${tip('powered_on')}</label>
+              <label class="check"><input type="checkbox" data-change="field" data-k="no_tools" ${attr(f.no_tools, 'checked')}> Skip the VM Tools check ${tip('no_tools')}</label>
+              <label class="check"><input type="checkbox" data-change="field" data-k="insecure" ${attr(f.insecure, 'checked')}> Skip TLS verification ${tip('insecure')}</label>
+              <label class="check"><input type="checkbox" data-change="field" data-k="no_tags" ${attr(f.no_tags, 'checked')}> Skip vCenter tags ${tip('no_tags')}</label>
+              <label class="check"><input type="checkbox" data-change="field" data-k="remember" ${attr(f.remember, 'checked')}> Keep these credentials in memory for post-import verification ${tip('remember')}
+                <span class="muted small">(never written to disk; gone when the console stops)</span></label>
+            </div></details>
           ${f.insecure ? html`<div class="note warn">TLS verification is off: fine for a lab with a self-signed certificate, not for production.</div>` : ''}
           <div id="disc-progress">${running ? discProgress(S.pulse.job) : ''}</div>
         </div>
-        <div class="card-f"><button class="btn primary" data-act="discover" ${attr(!!(S.pulse && S.pulse.job), 'disabled')}>${icon('discover')} ${o.discovered.total ? 'Re-discover' : 'Discover inventory'}</button>
-          <span class="small muted">Re-discovering refreshes VM facts and keeps your selection.</span></div>
-      </div>
-      <div class="card"><div class="card-h"><h3>Inventory cache</h3>${o.meta.discovered_at ? html`<span class="sub">${o.meta.vcenter} · ${o.meta.discovered_at}</span>` : ''}</div>
-        ${o.discovered.total ? html`<div class="card-b stack">
+        <div class="card-f"><button class="btn primary" data-act="discover" ${attr(!!(S.pulse && S.pulse.job), 'disabled')}>${icon('discover')} ${found ? 'Re-discover' : 'Discover inventory'}</button>
+          <span class="small muted">${found ? 'Re-discovering refreshes VM facts and keeps your selection.' : 'Reads VMs, folders, networks and tags.'}</span></div>
+      </div>`, found ? 'done' : 'now')}
+      ${flowSec(2, html`<div class="card"><div class="card-h"><h3>What was found</h3>${found ? html`<span class="sub">${o.meta.vcenter} · ${o.meta.discovered_at}</span>` : ''}</div>
+        ${found ? html`<div class="card-b stack">
           <div class="kpis">${kpi('VMs', o.discovered.total, '')}${kpi('Selected', o.discovered.selected, '')}${kpi('Clusters', clusters.length, plural(dcs.length, 'datacenter'))}${kpi('Networks', nets.length, '')}</div>
-          ${readinessPanel(v.ready)}
           <div><div class="section-title" style="margin-top:4px">Top-level folders</div>
             <div class="chips">${Object.entries(top).sort((a, b) => b[1] - a[1]).map(([k, c]) => html`<span class="chip" data-act="go" data-to="select" data-q="folder=${encodeURIComponent(k === '(datacenter root)' ? '' : k)}">${icon('folder')} ${k} <span class="n">${n(c)}</span></span>`)}</div></div>
-        </div>
-        <div class="card-f"><button class="btn primary" data-act="go" data-to="select">Select VMs ${icon('arrow')}</button></div>`
-        : emptyState('discover', 'Nothing discovered yet', 'Connect to vCenter to pull the VM list, the folder tree and each VM’s networks.')}
-      </div></div>`;
+        </div>` : html`<div class="card-b small muted">The VMs, folders, clusters and networks appear here once discovery has run.</div>`}</div>`, found ? '' : 'todo')}
+      ${flowSec(3, html`<div class="card"><div class="card-h"><h3>Readiness ${tip('readiness')}</h3><span class="sub">advisory — the operator's precheck is the authority</span></div>
+        <div class="card-b">${found && g ? readinessPanel(v.ready, true) : html`<span class="small muted">Once discovered, each VM is graded ready, check first, or likely to fail.</span>`}</div></div>`,
+        !found ? 'todo' : g && g.block ? 'warn' : '')}
+      ${found ? flowNext('select', plural(o.discovered.total, 'VM') + ' discovered',
+        (o.discovered.selected ? n(o.discovered.selected) + ' selected so far. ' : '') + 'Next, choose what to import.',
+        html`<button class="btn primary" data-act="go" data-to="select">Next: Select VMs ${icon('arrow')}</button>`) : ''}
+    </div>`;
   },
   onPulse(v, p) {
     const el = $('#disc-progress');
@@ -159,6 +186,7 @@ VIEWS.discover = view({
   onJobDone(v, j) { if (j.kind === 'discover') v.refresh(); else v.render(); },
   act: {
     field(t, e, v) { v.form[t.dataset.k] = t.type === 'checkbox' ? t.checked : t.value; if (t.type === 'checkbox') v.render(); },
+    optsOpen(t, e, v) { v.optsOpen = t.open; },
     async discover(t, e, v) {
       const f = v.form;
       if (!f.server || !f.user) { toast('Server and user are required', '', 'warn'); return; }
@@ -168,10 +196,10 @@ VIEWS.discover = view({
     },
   },
 });
-function readinessPanel(r) {
+function readinessPanel(r, bare) {
   if (!r || !(r.grades.ready + r.grades.warn + r.grades.block)) return '';
   const g = r.grades;
-  return html`<div><div class="section-title" style="margin-top:4px">Readiness <span class="tiny faint">advisory — the operator's precheck is the authority</span></div>
+  return html`<div>${bare ? '' : html`<div class="section-title" style="margin-top:4px">Readiness <span class="tiny faint">advisory — the operator's precheck is the authority</span></div>`}
     <div class="chips">
       <span class="chip" data-act="go" data-to="select" data-q="readiness=ready">${gradeTag('ready')} <span class="n">${n(g.ready)}</span></span>
       <span class="chip" data-act="go" data-to="select" data-q="readiness=warn">${gradeTag('warn')} <span class="n">${n(g.warn)}</span></span>
@@ -262,13 +290,14 @@ VIEWS.select = view({
     const tags = uniq(v.vms.flatMap((x) => x.tags || [])).sort();
     const f = v.f;
     const allOnPage = pageRows.length && pageRows.every((x) => x.selected);
-    return html`<div class="grid side">
-      <div class="card"><div class="card-h"><h3>Folders ${tip('selection')}</h3><span class="sub">${plural(v.vms.length, 'VM')}</span></div>
+    const where = f.folder === null ? 'every folder' : (f.folder || '(root)');
+    return html`<div class="flow">
+      ${flowSec(1, html`<div class="card"><div class="card-h"><h3>Folders ${tip('selection')}</h3><span class="sub">tick a folder to select its whole subtree · click a name to list only its VMs</span></div>
         <div class="tree" data-scroll="tree">
           <div class="tnode ${f.folder === null ? 'on' : ''}" data-act="folder" data-path="" data-all="1"><span class="caret"></span><span class="name">All folders</span><span class="cnt"><b>${n(selCount)}</b> / ${n(v.vms.length)}</span></div>
-          ${treeHtml(v)}</div></div>
-      <div class="stack" style="gap:12px">
-        <div class="card">
+          ${treeHtml(v)}</div></div>`, selCount ? 'done' : 'now')}
+      ${flowSec(2, html`<div class="card">
+          <div class="card-h"><h3>VMs</h3><span class="sub">in ${where} · filter, then tick the ones to import</span></div>
           <div class="toolbar">
             <div class="search">${icon('search')}<input class="input" id="sel-q" placeholder="Search name, moref, network, OS…" value="${f.q}" data-input="q"></div>
             <select class="select" data-change="filter" data-k="cluster"><option value="">All clusters</option>${clusters.map((c) => html`<option ${attr(f.cluster === c, 'selected')}>${c}</option>`)}</select>
@@ -285,16 +314,18 @@ VIEWS.select = view({
             <span><b>${n(rows.length)}</b> match · <b>${n(inViewSel)}</b> of them selected</span>
             <button class="btn sm" data-act="selMatching" data-on="1" ${attr(!rows.length, 'disabled')}>Select all ${n(rows.length)}</button>
             <button class="btn sm" data-act="selMatching" data-on="0" ${attr(!inViewSel, 'disabled')}>Deselect</button>
-            <span class="grow"></span>
-            <input class="input sm" id="bulk-ns" list="ns-list" placeholder="namespace" style="width:180px">
-            <button class="btn sm" data-act="bulkNs" ${attr(!inViewSel, 'disabled')}>Set namespace</button>${tip('namespace')}
-            <input class="input sm" id="bulk-wave" type="number" min="0" placeholder="wave" style="width:74px">
-            <button class="btn sm" data-act="bulkWave" ${attr(!inViewSel, 'disabled')}>Set wave</button>${tip('wave')}
-            <input class="input sm" id="bulk-app" list="app-list" placeholder="application" style="width:140px">
-            <button class="btn sm" data-act="bulkApp" ${attr(!inViewSel, 'disabled')}>Set app</button>
-            <datalist id="ns-list">${nsOptions(nss)}</datalist>
-            <datalist id="app-list">${apps.map((x) => html`<option value="${x}">`)}</datalist>
           </div>
+          <details class="bulkmore" ${attr(v.bulkOpen, 'open')} data-toggle="bulkOpen"><summary>Set a namespace, wave or application on the selected VMs <span class="muted">— optional; the maps in the next step usually decide</span></summary>
+            <div class="bulkbar">
+              <input class="input sm" id="bulk-ns" list="ns-list" placeholder="namespace" style="width:180px">
+              <button class="btn sm" data-act="bulkNs" ${attr(!inViewSel, 'disabled')}>Set namespace</button>${tip('namespace')}
+              <input class="input sm" id="bulk-wave" type="number" min="0" placeholder="wave" style="width:74px">
+              <button class="btn sm" data-act="bulkWave" ${attr(!inViewSel, 'disabled')}>Set wave</button>${tip('wave')}
+              <input class="input sm" id="bulk-app" list="app-list" placeholder="application" style="width:140px">
+              <button class="btn sm" data-act="bulkApp" ${attr(!inViewSel, 'disabled')}>Set app</button>
+              <datalist id="ns-list">${nsOptions(nss)}</datalist>
+              <datalist id="app-list">${apps.map((x) => html`<option value="${x}">`)}</datalist>
+            </div></details>
           <div class="table-wrap"><table class="t">
             <thead><tr><th class="chk"><input type="checkbox" data-act="selPage" title="Select this page" ${attr(allOnPage, 'checked')}></th>
               ${th(v, 'name', 'VM')}${th(v, 'folder', 'Folder · cluster')}${th(v, 'networks', 'Networks')}
@@ -313,13 +344,12 @@ VIEWS.select = view({
               <td class="num">${x.wave || html`<span class="faint">—</span>`}</td>
               <td>${x.queue_state ? pill(x.queue_state) : ''}</td></tr>`)}</tbody></table></div>
           ${pager(rows.length, v.page, PAGE)}
-        </div>
-        <div class="callout stickybar" style="background:var(--panel)"><div class="ic">${icon('select')}</div>
-          <div class="grow"><h3>${plural(selCount, 'VM')} selected</h3><p>${noNs ? plural(noNs, 'selected VM') + ' without a namespace — the folder or portgroup map decides in the next step.' : 'Namespace and wave can come from the maps in the next step.'}
-            ${v.meta.discovered_at ? ' · discovered ' + v.meta.discovered_at : ''}</p></div>
-          <button class="btn danger-ghost sm" data-act="clearAll" ${attr(!selCount, 'disabled')}>Clear selection</button>
-          <button class="btn primary" data-act="go" data-to="stage" ${attr(!selCount, 'disabled')}>Map & Stage ${icon('arrow')}</button></div>
-      </div></div>`;
+        </div>`, selCount ? '' : 'now')}
+      ${flowNext('select', plural(selCount, 'VM') + ' selected',
+        html`${noNs ? plural(noNs, 'selected VM') + ' without a namespace — the folder or portgroup map decides in the next step.' : 'Namespace and wave can come from the maps in the next step.'}${v.meta.discovered_at ? ' · discovered ' + v.meta.discovered_at : ''}`,
+        html`<button class="btn danger-ghost sm" data-act="clearAll" ${attr(!selCount, 'disabled')}>Clear selection</button>
+          <button class="btn primary" data-act="go" data-to="stage" ${attr(!selCount, 'disabled')}>Next: Map & Stage ${icon('arrow')}</button>`)}
+    </div>`;
   },
   after(v) {
     $$('[data-tri]', v.el).forEach((cb) => { cb.indeterminate = cb.dataset.tri === 'some'; });
@@ -329,6 +359,7 @@ VIEWS.select = view({
     q: debounce((t, e, v) => { v.f.q = t.value; v.page = 0; v.render(); }, 180),
     filter(t, e, v) { v.f[t.dataset.k] = t.value; v.page = 0; v.render(); },
     show(t, e, v) { v.f.show = t.dataset.k; v.page = 0; v.render(); },
+    bulkOpen(t, e, v) { v.bulkOpen = t.open; },
     sort(t, e, v) { const k = t.dataset.key; v.sort = { key: k, dir: v.sort.key === k ? -v.sort.dir : 1 }; v.render(); },
     page(t, e, v) { v.page = +t.dataset.page; v.render(); window.scrollTo(0, 0); },
     folder(t, e, v) {
@@ -536,7 +567,7 @@ document.addEventListener('focusin', (e) => {
   const kind = t.matches('input[data-col="namespace"], #def-ns, #bulk-ns') ? 'namespace'
     : t.matches('input[data-col="subnet"]') ? 'subnet' : t.matches('input[data-col="portgroup"]') ? 'portgroup' : null;
   if (kind) { PICK.kind = kind; PICK.id = t.id; if (kind === 'namespace') CNS.target = t.id; }
-  else if (t.matches('input, select, textarea')) { PICK.kind = null; PICK.id = null; }
+  else if (t.matches('input, select, textarea') && !t.closest('.nsbar')) { PICK.kind = null; PICK.id = null; }
 });
 function pickTarget(kind) {
   const el = PICK.kind === kind && PICK.id ? document.getElementById(PICK.id) : null;
@@ -547,45 +578,70 @@ function fillField(el, value) {
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.focus();
 }
-function targetsPanel(v) {
-  const c = CNS.data, sn = CSN.data, pg = CPG.data;
+// "What you can map to": a folded reference (a real Supervisor can list hundreds of
+// namespaces and subnets). Its summary carries the counts; problems with names used in
+// the maps show below it even while it is closed. Opened, a filter narrows every row.
+const TGT_SHOW = 60;
+function tgtUsed(v) {
   const trimmed = (rows, col) => rows.map((r) => (r[col] || '').trim()).filter(Boolean);
-  const usedNs = new Set(trimmed([].concat(v.fr, v.nr, v.tr), 'namespace').concat(trimmed([v.defaults], 'ns')));
-  const usedSubnets = new Set(trimmed(v.nr, 'subnet'));
-  const usedPg = new Set(trimmed(v.nr, 'portgroup'));
-  const missingNs = [...usedNs].filter((x) => nsKnown(x) === false).sort();
-  const badSubnets = [...usedSubnets].filter((x) => subnetKnown(x) === false).sort();
-  const badPg = [...usedPg].filter((x) => pgKnown(x) === false).sort();
+  return {
+    ns: new Set(trimmed([].concat(v.fr, v.nr, v.tr), 'namespace').concat(trimmed([v.defaults], 'ns'))),
+    subnets: new Set(trimmed(v.nr, 'subnet')),
+    pg: new Set(trimmed(v.nr, 'portgroup')),
+  };
+}
+function tgtRows(v) {
+  const c = CNS.data, sn = CSN.data, pg = CPG.data, used = tgtUsed(v);
+  const q = (v.tgtQ || '').trim().toLowerCase();
+  const hit = (...xs) => !q || xs.some((x) => (x || '').toLowerCase().includes(q));
   const looking = html`<span class="small muted"><span class="spinner"></span> looking…</span>`;
-  const more = (total, shown, what) => (total > shown ? html`<span class="small muted">+${n(total - shown)} more — type in a ${what} field to search them</span>` : '');
-  const none = (what) => html`<span class="small muted">${what}</span>`;
-  const nsRow = !c ? looking : html`${c.namespaces.slice(0, 40).map((x) => html`<button type="button" class="chip nschip ${usedNs.has(x.name) ? 'on' : ''}" data-act="pickNs" data-ns="${x.name}"
+  const more = (total, shown) => (total > shown ? html`<span class="small muted">+${n(total - shown)} more — ${q ? 'refine the filter' : 'type in the filter above'} to find them</span>` : '');
+  const none = (what) => html`<span class="small muted">${q ? 'no match' : what}</span>`;
+  const nsList = c ? c.namespaces.filter((x) => hit(x.name)) : [];
+  const snList = sn ? sn.subnets.filter((x) => hit(x.name, x.namespace, x.display)) : [];
+  const pgList = pg ? pg.portgroups.filter((x) => hit(x.name)).sort((a, b) => (b.selected - a.selected) || (b.vms - a.vms) || a.name.localeCompare(b.name)) : [];
+  const nsRow = !c ? looking : html`${nsList.slice(0, TGT_SHOW).map((x) => html`<button type="button" class="chip nschip ${used.ns.has(x.name) ? 'on' : ''}" data-act="pickNs" data-ns="${x.name}"
       title="${NS_SEEN[x.source] || ''} · click to put it in the namespace field you last clicked">${x.name}</button>`)}
-    ${more(c.namespaces.length, 40, 'Namespace')}${c.namespaces.length ? '' : none('none found')}`;
-  const snRow = !sn ? looking : html`${sn.subnets.slice(0, 40).map((x) => html`<button type="button" class="chip nschip sbchip ${usedSubnets.has(x.name) ? 'on' : ''}" data-act="pickSubnet"
+    ${more(nsList.length, TGT_SHOW)}${nsList.length ? '' : none('none found')}`;
+  const snRow = !sn ? looking : html`${snList.slice(0, TGT_SHOW).map((x) => html`<button type="button" class="chip nschip sbchip ${used.subnets.has(x.name) ? 'on' : ''}" data-act="pickSubnet"
       data-name="${x.name}" data-kind="${x.kind}" title="${x.kind} in namespace ${x.namespace}${x.display ? ' · shown in VCF Automation as ' + x.display : ''} · click to put it in the subnet field you last clicked">${x.name}<small>${x.namespace}</small></button>`)}
-    ${more(sn.subnets.length, 40, 'Subnet')}${sn.subnets.length ? '' : none('none visible to you')}`;
-  const pgs = pg ? pg.portgroups.slice().sort((a, b) => (b.selected - a.selected) || (b.vms - a.vms) || a.name.localeCompare(b.name)) : [];
-  const pgRow = !pg ? looking : html`${pgs.slice(0, 40).map((x) => html`<button type="button" class="chip nschip pgchip ${usedPg.has(x.name) ? 'on' : ''}" data-act="pickPg" data-name="${x.name}"
+    ${more(snList.length, TGT_SHOW)}${snList.length ? '' : none('none visible to you')}`;
+  const pgRow = !pg ? looking : html`${pgList.slice(0, TGT_SHOW).map((x) => html`<button type="button" class="chip nschip pgchip ${used.pg.has(x.name) ? 'on' : ''}" data-act="pickPg" data-name="${x.name}"
       title="${(x.type || 'network').replace(/_/g, ' ').toLowerCase()} · ${plural(x.vms, 'discovered VM')} (${n(x.selected)} selected) · click to fill the portgroup field you last clicked, or to add it to the portgroup map">${x.name}${x.vms ? html`<small>${n(x.selected || x.vms)}</small>` : ''}</button>`)}
-    ${more(pgs.length, 40, 'Portgroup')}${pgs.length ? '' : none('discover first')}`;
+    ${more(pgList.length, TGT_SHOW)}${pgList.length ? '' : none('discover first')}`;
   const row = (label, key, body) => html`<div class="tgt-row"><span class="small muted nsbar-l">${label} ${tip(key)}</span><div class="tgt-chips">${body}</div></div>`;
   const notes = [].concat(c ? c.notes : [], sn ? sn.notes : [], pg ? pg.notes : []);
-  return html`<div class="card mt nsbar"><div class="card-h"><h3>What you can map to</h3>
-      <span class="sub">from the Supervisor and the last vCenter discovery${sn && sn.checked_at ? ' · checked ' + fmtTime(sn.checked_at) : ''}</span>
-      <div class="tools"><button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again and re-read the discovery">${icon('refresh')} Refresh</button></div></div>
-    <div class="card-b stack" style="gap:10px">
-      ${row(c && !c.complete ? 'Namespaces you can use' : 'Namespaces on the Supervisor', 'cluster_namespaces', nsRow)}
-      ${row('Subnets on the Supervisor', 'cluster_subnets', snRow)}
-      ${row('Portgroups in vCenter', 'vcenter_portgroups', pgRow)}
-      ${notes.map((x) => html`<div class="tiny faint">${x}</div>`)}
+  return html`${row(c && !c.complete ? 'Namespaces you can use' : 'Namespaces on the Supervisor', 'cluster_namespaces', nsRow)}
+    ${row('Subnets on the Supervisor', 'cluster_subnets', snRow)}
+    ${row('Portgroups in vCenter', 'vcenter_portgroups', pgRow)}
+    ${notes.map((x) => html`<div class="tiny faint">${x}</div>`)}`;
+}
+function targetsPanel(v) {
+  const c = CNS.data, sn = CSN.data, pg = CPG.data, used = tgtUsed(v);
+  const missingNs = [...used.ns].filter((x) => nsKnown(x) === false).sort();
+  const badSubnets = [...used.subnets].filter((x) => subnetKnown(x) === false).sort();
+  const badPg = [...used.pg].filter((x) => pgKnown(x) === false).sort();
+  const cnt = (d, len, what) => (d ? plural(len, what) : '… ' + what + 's');
+  const warn = missingNs.length || badSubnets.length || badPg.length;
+  return html`<div class="card nsbar">
+    <details class="tgt" ${attr(v.tgtOpen, 'open')} data-toggle="tgtOpen">
+      <summary class="card-h"><h3>${icon('chevron', 'tgt-caret')} What you can map to</h3>
+        <span class="sub">${cnt(c, c ? c.namespaces.length : 0, 'namespace')} · ${cnt(sn, sn ? sn.subnets.length : 0, 'subnet')} · ${cnt(pg, pg ? pg.portgroups.length : 0, 'portgroup')}
+          ${sn && sn.checked_at ? ' · checked ' + fmtTime(sn.checked_at) : ''} · <span class="when-open">click a name to fill the field you are in</span><span class="when-closed">expand for the list</span></span>
+        <div class="tools"><button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again and re-read the discovery">${icon('refresh')} Refresh</button></div></summary>
+      <div class="card-b stack" style="gap:10px">
+        <div class="search tgt-q">${icon('search')}<input class="input sm" id="tgt-q" data-input="tgtQ" value="${v.tgtQ || ''}" placeholder="Filter namespaces, subnets and portgroups…" autocomplete="off"></div>
+        <div id="tgt-rows" class="stack" style="gap:10px">${tgtRows(v)}</div>
+      </div>
+    </details>
+    ${warn ? html`<div class="card-b stack tgt-warn" style="gap:8px">
       ${missingNs.length ? html`<div class="note warn"><b>${plural(missingNs.length, 'namespace')} in these maps ${c.complete ? 'not found on the Supervisor' : 'not among your kubeconfig namespaces'}:</b>
         <span class="mono">${missingNs.join(', ')}</span>. Check the spelling; VMs mapped there would fail preflight.</div>` : ''}
       ${badSubnets.length ? html`<div class="note warn"><b>${plural(badSubnets.length, 'subnet')} in the portgroup map not found on the Supervisor:</b>
         <span class="mono">${badSubnets.join(', ')}</span>. Check the spelling; in a VPC namespace use the name from the VPC’s own namespace.</div>` : ''}
       ${badPg.length ? html`<div class="note warn"><b>${plural(badPg.length, 'portgroup entry', 'portgroup entries')} match no portgroup in vCenter:</b>
         <span class="mono">${badPg.join(', ')}</span>. Check the spelling (as of the last discovery).</div>` : ''}
-    </div></div>`;
+    </div>` : ''}</div>`;
 }
 function nsConflicts(p) {
   const list = p.ns_conflicts || [];
@@ -619,41 +675,42 @@ VIEWS.stage = view({
     if (!p.selected) return emptyState('select', 'No VMs selected', 'Select the VMs to import first; this step decides where each one goes.', html`<button class="btn primary" data-act="go" data-to="select">Select VMs</button>`);
     const dirty = mapsSig(v) !== v.saved;
     const inMaps = uniq([].concat(v.fr.map((r) => r.namespace), v.nr.map((r) => r.namespace), v.tr.map((r) => r.namespace), p.records.map((r) => r.namespace))).sort();
+    const st = stageStates(v);
     return html`
-      <div class="note info">A VM's <b>namespace</b> comes from, in order: the namespace set on it in Select, the tag map, the folder map (most specific folder wins), the portgroup map, then the default below.
-        <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.
-        Name a VM's namespace in one place — usually the folder map — and use the portgroup map for subnets.</div>
-      ${targetsPanel(v)}
+      <details class="note info how" ${attr(v.howOpen, 'open')} data-toggle="howOpen"><summary><b>How each VM's namespace, wave and subnet are decided</b></summary>
+        <p>A VM's <b>namespace</b> comes from, in order: the namespace set on it in Select, the tag map, the folder map (most specific folder wins), the portgroup map, then the default in step 4.
+        <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.</p>
+        <p>Name a VM's namespace in one place — usually the folder map — and use the portgroup map for subnets.</p></details>
       <datalist id="ns-options">${nsOptions(inMaps)}</datalist>
       <datalist id="pg-options">${pgOptions(uniq(v.nr.map((r) => r.portgroup)).sort())}</datalist>
       <datalist id="subnet-options">${subnetOptions(uniq(v.nr.map((r) => r.subnet)).sort())}</datalist>
-      <div class="grid two mt">
-        <div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
+      <div class="mt">${targetsPanel(v)}</div>
+      <div class="flow mt">
+      ${flowSec(1, html`<div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
           <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage)}</div></div>
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'f')}</div>
-          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="f">${icon('plus')} Add entry</button><span class="small muted">Globs allowed, e.g. <code>Legacy/*</code>. A folder covers its whole subtree.</span>${tip('batch_group')}</div></div>
-        <div class="card"><div class="card-h"><h3>Networks → subnet ${tip('portgroup_map')}</h3><span class="sub mono tiny" title="${v.maps.network.path}">${v.maps.network.path.split(/[\\/]/).pop()}</span>
+          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="f">${icon('plus')} Add entry</button><span class="small muted">Globs allowed, e.g. <code>Legacy/*</code>. A folder covers its whole subtree.</span>${tip('batch_group')}</div></div>`, st.folders, 'sec-folders')}
+      ${flowSec(2, html`<div class="card"><div class="card-h"><h3>Networks → subnet ${tip('portgroup_map')}</h3><span class="sub mono tiny" title="${v.maps.network.path}">${v.maps.network.path.split(/[\\/]/).pop()}</span>
           <div class="tools"><label class="check small"><input type="checkbox" data-change="adv" ${attr(v.adv, 'checked')}> Advanced columns</label>${tip('device_key')}</div></div>
           <div class="card-b"><div class="small muted mb">Portgroups of the selected VMs</div><div id="cov-networks" class="cov">${covNetworks(p.coverage)}</div></div>
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'n')}</div>
-          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="n">${icon('plus')} Add entry</button><span class="small muted">In a VPC namespace, name the Subnet as it appears in the VPC's own namespace.</span>${tip('subnet')}</div></div>
-      </div>
-      <details class="card mt tagmap" ${attr(v.tr.length || (p.coverage.tags || []).length && v.tagOpen !== false, 'open')} data-toggle="tagOpen">
+          <div class="card-f"><button class="btn sm" data-act="addRow" data-m="n">${icon('plus')} Add entry</button><span class="small muted">In a VPC namespace, name the Subnet as it appears in the VPC's own namespace.</span>${tip('subnet')}</div></div>`, st.networks, 'sec-networks')}
+      ${flowSec(3, html`<details class="card tagmap" ${attr(v.tr.length || (p.coverage.tags || []).length && v.tagOpen !== false, 'open')} data-toggle="tagOpen">
         <summary class="card-h"><h3>${icon('tag')} vCenter tags → namespace &amp; wave ${tip('tag_map')}</h3><span class="sub">optional · beats the folder map · <span class="mono tiny">${v.maps.tag.path.split(/[\\/]/).pop()}</span></span></summary>
         <div class="card-b"><div class="small muted mb">Tags on the selected VMs</div><div id="cov-tags" class="cov">${covTags(p.coverage)}</div></div>
         <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 't')}</div>
-        <div class="card-f"><button class="btn sm" data-act="addRow" data-m="t">${icon('plus')} Add entry</button><span class="small muted">Tags are <code>Category:Tag</code>; globs allowed, e.g. <code>Application:*</code>. An exact tag beats a glob.</span></div></details>
-      <div class="card mt"><div class="card-h"><h3>Result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
+        <div class="card-f"><button class="btn sm" data-act="addRow" data-m="t">${icon('plus')} Add entry</button><span class="small muted">Tags are <code>Category:Tag</code>; globs allowed, e.g. <code>Application:*</code>. An exact tag beats a glob.</span></div></details>`, 'opt')}
+      ${flowSec(4, html`<div class="card"><div class="card-h"><h3>Review the result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
         <div class="tools"><label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default namespace ${tip('default_namespace')}</span>
           <input class="input sm ${nsInputClass(v.defaults.ns)}" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none — report instead" style="width:200px"${nsInputAttrs(v.defaults.ns)}></label>
           <label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default wave ${tip('default_wave')}</span>
           <input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px"></label></div></div>
-        <div id="stage-preview">${stagePreview(v)}</div></div>
-      <div class="callout stickybar" style="background:var(--panel)"><div class="ic">${icon('stage')}</div>
-        <div class="grow"><h3 id="stage-count">${plural(p.records.length, 'VM')} ready to stage</h3>
-          <p id="stage-dirty">${dirty ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span>` : 'Maps saved.'} Staging again later is safe: VMs already in flight are never changed.</p></div>
-        <button class="btn" data-act="saveMaps">Save maps</button>
-        <button class="btn primary" data-act="stage" ${attr(!p.records.length, 'disabled')}>Stage ${icon('arrow')}</button></div>`;
+        <div id="stage-preview">${stagePreview(v)}</div></div>`, st.result, 'sec-result')}
+      ${flowNext('stage', plural(p.records.length, 'VM') + ' ready to stage',
+        html`${dirty ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span>` : 'Maps saved.'} Staging again later is safe: VMs already in flight are never changed.`,
+        html`<button class="btn" data-act="saveMaps">Save maps</button>
+        <button class="btn primary" data-act="stage" ${attr(!p.records.length, 'disabled')}>Stage ${icon('arrow')}</button>`, { title: 'stage-count', text: 'stage-dirty' })}
+      </div>`;
   },
   act: {
     cell(t, e, v) {
@@ -691,7 +748,9 @@ VIEWS.stage = view({
       if (f) f.focus();
       if (at >= 0) toast(name + ' is already in the portgroup map', 'Its subnet field is selected.', 'info', 3500);
     },
-    async nsRefresh(t, e, v) { await Promise.all([loadClusterNs(true), loadSubnets(true), loadPortgroups()]); v.render(); },
+    tgtOpen(t, e, v) { v.tgtOpen = t.open; },
+    tgtQ: debounce((t, e, v) => { v.tgtQ = t.value; mount($('#tgt-rows'), tgtRows(v)); }, 150),
+    async nsRefresh(t, e, v) { e.preventDefault(); await Promise.all([loadClusterNs(true), loadSubnets(true), loadPortgroups()]); v.render(); },
     addRow(t, e, v) {
       const m = t.dataset.m;
       const rows = rowsOf(v, m);
@@ -708,6 +767,7 @@ VIEWS.stage = view({
     },
     delRow(t, e, v) { rowsOf(v, t.dataset.m).splice(+t.dataset.i, 1); v.render(); schedulePreview(v); },
     tagOpen(t, e, v) { v.tagOpen = t.open; },
+    howOpen(t, e, v) { v.howOpen = t.open; },
     adv(t, e, v) { v.adv = t.checked; v.render(); },
     defNs(t, e, v) { v.defaults.ns = t.value; markNs(t); schedulePreview(v); },
     defWave(t, e, v) { v.defaults.wave = t.value; schedulePreview(v); },
@@ -742,6 +802,14 @@ VIEWS.stage = view({
     },
   },
 });
+// Section states on Map & Stage: done when every folder / network of the selection is covered.
+function stageStates(v) {
+  const p = v.preview, cov = p.coverage;
+  const missF = cov.folders.filter((f) => f.pattern === null && f.explicit_namespace < f.vms).length;
+  const missN = cov.networks.filter((x) => !x.mapped).length;
+  return { folders: missF ? 'warn' : 'done', networks: missN ? 'warn' : 'done',
+    result: v.previewErr || p.problems.length ? 'warn' : p.records.length ? 'now' : '' };
+}
 function markField(input, kind) {
   const bad = fieldBad(kind, input.value);
   input.classList.toggle('unknown', bad);
@@ -774,6 +842,10 @@ async function runPreview(v) {
   mount($('#cov-tags'), covTags(v.preview.coverage));
   const c = $('#stage-count');
   if (c) c.textContent = plural(v.preview.records.length, 'VM') + ' ready to stage';
+  const st = stageStates(v);
+  setSecState('sec-folders', st.folders);
+  setSecState('sec-networks', st.networks);
+  setSecState('sec-result', st.result);
   const d = $('#stage-dirty');
   if (d) mount(d, mapsSig(v) !== v.saved ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span> Staging again later is safe.` : 'Maps saved. Staging again later is safe: VMs already in flight are never changed.');
 }
@@ -868,7 +940,10 @@ VIEWS.waves = view({
         <div class="wcol new" data-dropwave="${(waves[waves.length - 1] || 0) + 1}">
           <div>${icon('plus')}<div><b>New wave ${(waves[waves.length - 1] || 0) + 1}</b></div><div class="small">Drop VMs or folders here</div>
           ${selVms.length ? html`<button class="btn sm mt" data-act="moveNew">Move ${n(selVms.length)} selected here</button>` : ''}</div></div>
-      </div>`;
+      </div>
+      ${flowNext('execute', plural(waves.length, 'wave') + ' · ' + plural(v.vms.length, 'VM'),
+        'Wave ' + (waves[0] || 1) + ' runs first. Next, check the cluster with preflight, then precheck.',
+        html`<button class="btn primary" data-act="go" data-to="execute">Next: Execute ${icon('arrow')}</button>`)}`;
   },
   onJobDone(v) { v.refresh(); },
   act: {
@@ -1031,22 +1106,28 @@ VIEWS.execute = view({
     const pfState = !pf ? '' : pf.result.ok ? 'done' : 'warn';
     const pre = (c.precheck_passed || 0) + (c.importing || 0) + (c.awaiting_commit || 0) + (c.committed || 0);
     const steps = [
-      [pfState, 'Preflight', !pf ? 'Not run in this workspace yet' : (pf.result.ok ? 'Passed ' + fmtAgo(pf.finished_at) : plural(pf.result.problems.length, 'problem') + ' · ' + fmtAgo(pf.finished_at))],
+      [pfState || 'now', 'Preflight', !pf ? 'Not run in this workspace yet' : (pf.result.ok ? 'Passed ' + fmtAgo(pf.finished_at) : plural(pf.result.problems.length, 'problem') + ' · ' + fmtAgo(pf.finished_at))],
       [c.precheck_failed ? 'warn' : (c.pending ? (pre ? 'now' : '') : (o.total ? 'done' : '')), 'Precheck', n(c.precheck_passed || 0) + ' passed · ' + n(c.precheck_failed || 0) + ' failed · ' + n(c.pending || 0) + ' pending'],
       [c.failed ? 'bad' : (o.total && c.committed === o.total ? 'done' : (c.precheck_passed ? 'now' : '')), 'Import', n(c.committed || 0) + ' committed · ' + n(c.precheck_passed || 0) + ' ready · ' + n(c.failed || 0) + ' failed'],
       [c.awaiting_commit ? 'warn' : '', 'Commit', s.commit_action === 'Auto' ? 'Automatic (commitAction Auto)' : n(c.awaiting_commit || 0) + ' held for approval'],
     ];
+    let k = 0;
+    const num = () => ++k;
+    const stat = ([st2, t, d], key) => html`<span class="runstat ${st2}"><b>${t}</b> ${tip(key)} <span class="muted">${d}</span></span>`;
     return html`
-      <div class="steps">${steps.map(([st, t, d], i) => html`<div class="step ${st}"><span class="n">${st === 'done' ? icon('check') : i + 1}</span><div><h4>${t} ${tip(['preflight', 'precheck', 'import', 'commit'][i])}</h4><p>${d}</p></div></div>`)}</div>
-      <div class="mt">${FX.streamHtml(o, { compact: true })}</div>
-      ${job && ['execute', 'rollback', 'watch', 'commit'].includes(job.kind) ? html`<div class="callout mt"><div class="ic"><span class="spinner"></span></div>
-        <div class="grow"><h3>${job.title}</h3><p>${job.stop_requested ? 'Stopping: in-flight batches are being polled to completion.' : 'Running for ' + fmtDur(elapsed(job)) + '. Waves update live below; the full log is in the panel at the bottom.'}</p></div>
+      ${job && ['execute', 'rollback', 'watch', 'commit'].includes(job.kind) ? html`<div class="callout mb"><div class="ic"><span class="spinner"></span></div>
+        <div class="grow"><h3>${job.title}</h3><p>${job.stop_requested ? 'Stopping: in-flight batches are being polled to completion.' : 'Running for ' + fmtDur(elapsed(job)) + '. Progress updates live below; the full log is in the panel at the bottom.'}</p></div>
         <button class="btn" data-act="showJob" data-id="${job.id}">Log</button>
         ${job.stoppable ? html`<button class="btn danger-ghost" data-act="stopJob" data-id="${job.id}" ${attr(job.stop_requested, 'disabled')}>${icon('stop')} Stop</button>` : ''}</div>` : ''}
-      <div class="grid mt" style="grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);align-items:start">
-        <div class="card"><div class="card-h"><h3>Run</h3>
+      <div class="flow">
+      ${flowSec(num(), html`<div class="card"><div class="card-h"><h3>Preflight ${tip('preflight')}</h3><span class="sub">${steps[0][2]} · checks context, CRDs, operator, namespaces, RBAC, subnets</span></div>
+        <div class="card-b">${pf ? preflightResult(pf) : html`<p class="muted small" style="margin:0">Checks the cluster before anything is applied. Read-only; run it first.</p>`}</div>
+        <div class="card-f"><button class="btn ${pf && pf.result.ok ? '' : 'primary'}" data-act="preflight" ${attr(!!job, 'disabled')}>${icon('shield')} Run preflight</button>
+          <label class="check small"><input type="checkbox" data-change="skipTargets" ${attr(v.skipTargets, 'checked')}> skip namespace/subnet checks</label>${tip('skip_targets')}</div></div>`, pfState || 'now')}
+      ${flowSec(num(), html`<div class="card"><div class="card-h"><h3>Precheck, then import</h3>
           <div class="tools"><div class="seg"><button class="${!imp ? 'on' : ''}" data-act="stage" data-k="precheck">Precheck</button><button class="${imp ? 'on' : ''}" data-act="stage" data-k="import">Import</button></div></div></div>
           <div class="card-b stack">
+            <div class="runstats">${stat(steps[1], 'precheck')}${stat(steps[2], 'import')}</div>
             <div class="note ${imp ? 'warn' : 'info'}">${imp
               ? html`<b>Import</b> migrates VMs that passed precheck${opt.no_precheck ? html` <b>-- and, with the gate off, pending VMs too</b>` : ''}. ${s.commit_action === 'Auto' ? html`With <b>commitAction Auto</b> a successful import commits at once and <b>cannot be handed back to vCenter</b>.` : html`With <b>commitAction Wait</b> each batch holds at the commit gate for your approval.`}`
               : html`<b>Precheck</b> applies <code>precheckOnly</code> batches: the operator validates each VM against the target without migrating anything. Safe to repeat.`}</div>
@@ -1073,35 +1154,31 @@ VIEWS.execute = view({
               </div></details>
             <div id="ex-plan">${planTable(v)}</div>
           </div>
-          <div class="card-f" id="ex-go">${goButton(v)}</div></div>
-        <div class="stack">
-          <div class="card"><div class="card-h"><h3>Preflight ${tip('preflight')}</h3><span class="sub">context, CRDs, operator, namespaces, RBAC, subnets</span></div>
-            <div class="card-b">${pf ? preflightResult(pf) : html`<p class="muted small" style="margin:0">Checks the cluster before anything is applied. Read-only.</p>`}</div>
-            <div class="card-f"><button class="btn ${pf && pf.result.ok ? '' : 'primary'}" data-act="preflight" ${attr(!!job, 'disabled')}>${icon('shield')} Run preflight</button>
-              <label class="check small"><input type="checkbox" data-change="skipTargets" ${attr(v.skipTargets, 'checked')}> skip namespace/subnet checks</label>${tip('skip_targets')}</div></div>
-          ${c.awaiting_commit || s.commit_action === 'Wait' ? html`<div class="card"><div class="card-h"><h3>Commit gate ${tip('commit')}</h3><span class="sub">commitAction ${s.commit_action}</span></div>
+          <div class="card-f" id="ex-go">${goButton(v)}</div></div>`, c.failed || c.precheck_failed ? 'warn' : (o.total && c.committed === o.total ? 'done' : 'now'))}
+      ${c.awaiting_commit || s.commit_action === 'Wait' ? flowSec(num(), html`<div class="card"><div class="card-h"><h3>Commit gate ${tip('commit')}</h3><span class="sub">commitAction ${s.commit_action}</span></div>
             <div class="card-b">${c.awaiting_commit ? html`<p style="margin:0"><b>${plural(c.awaiting_commit, 'VM')}</b> imported and held. Commit to finish, or roll back to hand them to vCenter.</p>`
               : html`<p class="muted small" style="margin:0">Nothing is waiting for approval.</p>`}</div>
             <div class="card-f"><button class="btn primary" data-act="commit" ${attr(!c.awaiting_commit || !!job, 'disabled')}>${icon('commit')} Commit ${n(c.awaiting_commit || 0)}</button>
-              <button class="btn danger-ghost" data-act="rollbackHeld" ${attr(!c.awaiting_commit || !!job, 'disabled')}>${icon('rollback')} Roll back instead</button></div></div>` : ''}
-          ${c.committed ? html`<div class="card"><div class="card-h"><h3>Post-import verification ${tip('verification')}</h3><span class="sub">power, Tools, IP kept, ping${(o.verify_ports || []).length ? ', ports' : ''}</span></div>
+              <button class="btn danger-ghost" data-act="rollbackHeld" ${attr(!c.awaiting_commit || !!job, 'disabled')}>${icon('rollback')} Roll back instead</button></div></div>`, c.awaiting_commit ? 'warn' : '') : ''}
+      ${flowSec(num(), html`${FX.streamHtml(o, { compact: true })}
+        <div class="card"><div class="card-h"><h3>Waves</h3><span class="sub">live</span></div>
+        ${o.waves.length ? html`<div class="table-wrap"><table class="t"><tbody>${o.waves.map((w) => html`<tr><td style="width:90px"><b>Wave ${w.wave}</b></td><td>${segbar(w.counts, w.total)}</td>
+          <td class="small muted nowrap" style="width:40%">${STATE_ORDER.filter((x) => w.counts[x]).map((x) => html`<span style="margin-right:10px">${dot(x)} ${n(w.counts[x])} ${label(x)}</span>`)}</td></tr>`)}</tbody></table></div>`
+          : html`<div class="card-b muted">The queue is empty.</div>`}</div>
+        <div class="card"><div class="card-h"><h3>On the cluster</h3><span class="sub">${plural(o.live_batches.length, 'live batch', 'live batches')}</span></div>
+            ${o.live_batches.length ? html`<div class="table-wrap"><table class="t compact"><tbody>${o.live_batches.slice(0, 8).map((b) => html`<tr class="click" data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">
+              <td class="mono small">${b.name}</td><td>${batchTag(b.state)}</td><td class="msg"><div>${b.message || ''}</div></td></tr>`)}</tbody></table></div>`
+              : html`<div class="card-b small muted">Nothing in flight.</div>`}
+            <div class="card-f"><button class="btn sm" data-act="watch" ${attr(!!job || !o.live_batches.length, 'disabled')}>${icon('refresh')} Watch until done</button>${tip('watch')}
+              <button class="btn sm ghost" data-act="refreshCluster" ${attr(!!job, 'disabled')}>Refresh once</button>${tip('refresh')}</div></div>`, o.in_flight ? 'now' : '')}
+      ${c.committed ? flowSec(num(), html`<div class="card"><div class="card-h"><h3>Post-import verification ${tip('verification')}</h3><span class="sub">power, Tools, IP kept, ping${(o.verify_ports || []).length ? ', ports' : ''}</span></div>
             <div class="card-b">${o.verify ? html`<div class="row wrap" style="gap:14px"><span>${verifyTag('ok')} <b>${n(o.verify.ok || 0)}</b></span><span>${verifyTag('fail')} <b>${n(o.verify.fail || 0)}</b></span>
               <span>${verifyTag('warn')} <b>${n(o.verify.warn || 0)}</b></span><span class="muted">not checked <b>${n(o.verify.none || 0)}</b></span></div>` : ''}
               <p class="small muted mb-0">${S.info.features.verify_after_import ? 'Runs automatically after each import.' : 'Turn on "Verify after import" in Settings to run it after every import.'}
               ${S.info.features.vcenter_remembered || S.info.vcenter.password_from_env ? '' : ' Without a vCenter session only ping and port checks run: tick "keep credentials" on Discover.'}</p></div>
             <div class="card-f"><button class="btn" data-act="verify" data-unverified="1" ${attr(!!job || !(o.verify && o.verify.none), 'disabled')}>${icon('check')} Verify ${n((o.verify && o.verify.none) || 0)} unchecked</button>
-              <button class="btn ghost" data-act="verify" ${attr(!!job, 'disabled')}>Re-verify all</button></div></div>` : ''}
-          <div class="card"><div class="card-h"><h3>On the cluster</h3><span class="sub">${plural(o.live_batches.length, 'live batch', 'live batches')}</span></div>
-            ${o.live_batches.length ? html`<div class="table-wrap"><table class="t compact"><tbody>${o.live_batches.slice(0, 8).map((b) => html`<tr class="click" data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">
-              <td class="mono small">${b.name}</td><td>${batchTag(b.state)}</td><td class="msg"><div>${b.message || ''}</div></td></tr>`)}</tbody></table></div>`
-              : html`<div class="card-b small muted">Nothing in flight.</div>`}
-            <div class="card-f"><button class="btn sm" data-act="watch" ${attr(!!job || !o.live_batches.length, 'disabled')}>${icon('refresh')} Watch until done</button>${tip('watch')}
-              <button class="btn sm ghost" data-act="refreshCluster" ${attr(!!job, 'disabled')}>Refresh once</button>${tip('refresh')}</div></div>
-        </div></div>
-      <div class="card mt"><div class="card-h"><h3>Waves</h3><span class="sub">live</span></div>
-        ${o.waves.length ? html`<div class="table-wrap"><table class="t"><tbody>${o.waves.map((w) => html`<tr><td style="width:90px"><b>Wave ${w.wave}</b></td><td>${segbar(w.counts, w.total)}</td>
-          <td class="small muted nowrap" style="width:40%">${STATE_ORDER.filter((x) => w.counts[x]).map((x) => html`<span style="margin-right:10px">${dot(x)} ${n(w.counts[x])} ${label(x)}</span>`)}</td></tr>`)}</tbody></table></div>`
-          : html`<div class="card-b muted">The queue is empty.</div>`}</div>`;
+              <button class="btn ghost" data-act="verify" ${attr(!!job, 'disabled')}>Re-verify all</button></div></div>`, o.verify && o.verify.fail ? 'warn' : '') : ''}
+      </div>`;
   },
   onJobDone(v) { v.refresh(); },
   act: {

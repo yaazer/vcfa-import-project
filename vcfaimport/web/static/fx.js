@@ -723,9 +723,11 @@ const FX = (() => {
     const nav = document.getElementById('nav');
     const a = nav && nav.querySelector('.nav-item.active');
     if (!g) return;
-    if (!a) { g.classList.remove('on'); return; }
-    const gy = (a.offsetTop - nav.scrollTop) + 'px';
+    if (!a || !a.offsetParent) { g.classList.remove('on'); return; }     // none, or inside a closed group
+    const r = a.getBoundingClientRect(), rn = nav.getBoundingClientRect();
+    const gy = (r.top - rn.top) + 'px', gh = r.height + 'px';
     if (g.style.getPropertyValue('--gy') !== gy) g.style.setProperty('--gy', gy);
+    if (g.style.getPropertyValue('--gh') !== gh) g.style.setProperty('--gh', gh);
     if (!g.classList.contains('on')) g.classList.add('on');
   }
   let pointer = null;

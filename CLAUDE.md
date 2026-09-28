@@ -41,6 +41,10 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   colours in `vars`, their structure in the `app.css` skin block and icons in `skins.js`.
   Colour-art icon sets (not `everywhere`) only render where `icon(name, 'art')` marks
   the slot (nav, palette, empty states, folder rows). Skins are flat: no aurora or glass.
+- **The five stages flow top to bottom.** Their pages are one column: numbered `flowSec`
+  sections ending in a `flowNext` bar to the next stage (views.js); no side-by-side grids
+  there. The sidebar is the `FLOW` stepper plus collapsible groups (`NAV` group markers,
+  open state in `NAVG` / localStorage `vcfa-nav`); a closed group still shows alert badges.
 - Animation is time-based, never per-frame, and every effect must degrade to a
   complete static render under Motion: Off (the OS reduce-motion default). `fx.js`
   hooks fail soft: the console must work if the look breaks.
