@@ -203,7 +203,7 @@ open the Theme Studio (palette icon) and choose **Rendering: Lite**.
 | 4 stage | **Map & Stage**: map `Migration/Wave1` → `migration-testing-ns-kcvm5` in the folder map, and the VM's portgroup → subnet `migration-testing` with its namespace left blank. The *What you can map to* card above the maps lists the namespaces, the subnets (`migration-testing` shows under its VPC namespace, `testing-vpc-k826r`) and the vCenter portgroups: click one to fill the field you are in, or type to get suggestions; a name that is not there is flagged. Check the preview -- it also warns if two maps name different namespaces for a VM -- then **Stage** |
 | 5 preflight / plan | **Execute → Run preflight**; the batch plan is shown before every run |
 | 6 precheck | **Execute → Precheck → wave 1**; follow the log panel. A DNS stall on the Supervisor shows up in **Triage** as *DNS lookup from the Supervisor timed out* |
-| 7 import, held | **Execute → Import** (dry run first if you like); VMs stop at *awaiting commit* |
+| 7 import, held | **Execute → Import** (dry run first if you like); VMs stop at *awaiting commit*. When every VM of the precheck passed, Execute has already switched to Import for the same waves: review the plan and start it |
 | 8 roll back | **Execute → Commit gate → Roll back instead**, or the VM's drawer → **Roll back** |
 | 9 commit | **Execute → Commit** (type `COMMIT`) |
 | 9 verify | **Execute → Post-import verification → Verify**. The vCenter checks need a session: tick *Keep these credentials in memory* on Discover, or set `VCFA_VC_PASSWORD` before starting the console; without it only ping runs. Ping goes out from the jump box (`sudo apt install iputils-ping` if `ping` is missing; without it that check is skipped) |

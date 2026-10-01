@@ -1128,6 +1128,7 @@ VIEWS.execute = view({
           <div class="tools"><div class="seg"><button class="${!imp ? 'on' : ''}" data-act="stage" data-k="precheck">Precheck</button><button class="${imp ? 'on' : ''}" data-act="stage" data-k="import">Import</button></div></div></div>
           <div class="card-b stack">
             <div class="runstats">${stat(steps[1], 'precheck')}${stat(steps[2], 'import')}</div>
+            ${imp && v.flipped ? html`<div class="note ok" id="ex-flipped"><b>Precheck passed for ${plural(v.flipped.vms, 'VM')}${v.flipped.waves.length ? ' in wave ' + v.flipped.waves.join(', ') : ''}</b>, so this switched to Import with the same selection. Nothing has started: review the plan below, then click Import.</div>` : ''}
             <div class="note ${imp ? 'warn' : 'info'}">${imp
               ? html`<b>Import</b> migrates VMs that passed precheck${opt.no_precheck ? html` <b>-- and, with the gate off, pending VMs too</b>` : ''}. ${s.commit_action === 'Auto' ? html`With <b>commitAction Auto</b> a successful import commits at once and <b>cannot be handed back to vCenter</b>.` : html`With <b>commitAction Wait</b> each batch holds at the commit gate for your approval.`}`
               : html`<b>Precheck</b> applies <code>precheckOnly</code> batches: the operator validates each VM against the target without migrating anything. Safe to repeat.`}</div>
@@ -1180,9 +1181,24 @@ VIEWS.execute = view({
               <button class="btn ghost" data-act="verify" ${attr(!!job, 'disabled')}>Re-verify all</button></div></div>`, o.verify && o.verify.fail ? 'warn' : '') : ''}
       </div>`;
   },
-  onJobDone(v) { v.refresh(); },
+  // A precheck that every VM it ran passed flips the page to Import for the same waves and folder:
+  // the next step, ready to review. It is never started for you. Partial passes, dry runs and
+  // stopped, halted or deadline-cut runs stay on Precheck so the failures get looked at first.
+  onJobDone(v, j) {
+    if (v.opt.stage === 'precheck' && precheckPassed(j)) {
+      const p = j.params || {};
+      v.opt.stage = 'import';
+      v.opt.waves = new Set(p.waves || []);
+      v.opt.folder = (p.folders && p.folders[0]) || '';
+      v.opt.include_failed = false;     // in Import it would mean "retry failed imports"
+      v.touched = true;                 // keep this selection, even "all waves"
+      v.flipped = { vms: j.result.succeeded, waves: (p.waves || []).slice() };
+      toast('Precheck passed: switched to Import', plural(j.result.succeeded, 'VM') + ' ready to import. Review the plan, then start the import yourself.', 'ok', 9000);
+    }
+    v.refresh();
+  },
   act: {
-    stage(t, e, v) { v.opt.stage = t.dataset.k; v.opt.waves.clear(); v.touched = false; v.refresh(); },
+    stage(t, e, v) { v.opt.stage = t.dataset.k; v.opt.waves.clear(); v.touched = false; v.flipped = null; v.refresh(); },
     wave(t, e, v) {
       v.touched = true;
       const w = t.dataset.w;
@@ -1222,6 +1238,13 @@ VIEWS.execute = view({
     },
   },
 });
+// Every VM the precheck run applied reached "passed": nothing failed, nothing left without a
+// verdict (an unknown operator phase keeps a VM running, not passed), and the run went the whole way.
+function precheckPassed(j) {
+  const p = j.params || {}, r = j.result || {};
+  return j.kind === 'execute' && j.status === 'succeeded' && p.stage === 'precheck' && !p.dry_run &&
+    r.applied > 0 && !r.failed && r.succeeded === r.applied && !r.halted && !r.hit_deadline;
+}
 function execBody(v) {
   const o = v.opt;
   return {
