@@ -121,7 +121,7 @@ VIEWS.discover = view({
   title: 'Discover', sub: 'Step 1 · read the VM inventory from vCenter',
   init(v) {
     const vc = S.info.vcenter;
-    v.form = v.form || { server: vc.server || '', user: vc.user || '', password: '', insecure: false, powered_on: false, no_tools: false, concurrency: 12, remember: false, no_tags: false };
+    v.form = v.form || { server: vc.server || '', user: vc.user || '', password: '', insecure: false, powered_on: false, no_tools: false, concurrency: 12, remember: false, no_tags: false, allow_mass_removal: false };
   },
   async load(v) {
     const [o, d, r] = await Promise.all([GET('/api/overview'), GET('/api/discovered'), GET('/api/readiness')]);
@@ -150,7 +150,7 @@ VIEWS.discover = view({
               <small>Used for this discovery only; never stored.</small></label>
             <label class="field"><span>Parallel detail reads ${tip('concurrency')}</span><input class="input" type="number" min="1" max="32" id="f-conc" data-input="field" data-k="concurrency" value="${f.concurrency}"></label>
           </div>
-          <details class="opts" ${attr(v.optsOpen || f.powered_on || f.no_tools || f.insecure || f.no_tags || f.remember, 'open')} data-toggle="optsOpen"><summary>Options</summary>
+          <details class="opts" ${attr(v.optsOpen || f.powered_on || f.no_tools || f.insecure || f.no_tags || f.remember || f.allow_mass_removal, 'open')} data-toggle="optsOpen"><summary>Options</summary>
             <div class="stack mt-s" style="gap:10px">
               <label class="check"><input type="checkbox" data-change="field" data-k="powered_on" ${attr(f.powered_on, 'checked')}> Powered-on VMs only ${tip('powered_on')}</label>
               <label class="check"><input type="checkbox" data-change="field" data-k="no_tools" ${attr(f.no_tools, 'checked')}> Skip the VM Tools check ${tip('no_tools')}</label>
@@ -158,15 +158,18 @@ VIEWS.discover = view({
               <label class="check"><input type="checkbox" data-change="field" data-k="no_tags" ${attr(f.no_tags, 'checked')}> Skip vCenter tags ${tip('no_tags')}</label>
               <label class="check"><input type="checkbox" data-change="field" data-k="remember" ${attr(f.remember, 'checked')}> Keep these credentials in memory for post-import verification ${tip('remember')}
                 <span class="muted small">(never written to disk; gone when the console stops)</span></label>
+              <label class="check"><input type="checkbox" data-change="field" data-k="allow_mass_removal" ${attr(f.allow_mass_removal, 'checked')}> Allow mass removal ${tip('mass_removal')}
+                <span class="muted small">(remove VMs gone from vCenter even when that is more than half the inventory)</span></label>
             </div></details>
           ${f.insecure ? html`<div class="note warn">TLS verification is off: fine for a lab with a self-signed certificate, not for production.</div>` : ''}
           <div id="disc-progress">${running ? discProgress(S.pulse.job) : ''}</div>
         </div>
         <div class="card-f"><button class="btn primary" data-act="discover" ${attr(!!(S.pulse && S.pulse.job), 'disabled')}>${icon('discover')} ${found ? 'Re-discover' : 'Discover inventory'}</button>
-          <span class="small muted">${found ? 'Re-discovering refreshes VM facts and keeps your selection.' : 'Reads VMs, folders, networks and tags.'}</span></div>
+          <span class="small muted">${found ? html`Re-discovering refreshes VM facts, keeps your selection, and removes VMs no longer in vCenter. ${tip('rediscovery')}` : 'Reads VMs, folders, networks and tags.'}</span></div>
       </div>`, found ? 'done' : 'now')}
       ${flowSec(2, html`<div class="card"><div class="card-h"><h3>What was found</h3>${found ? html`<span class="sub">${o.meta.vcenter} · ${o.meta.discovered_at}</span>` : ''}</div>
         ${found ? html`<div class="card-b stack">
+          ${rediscoveryNote(v.lastPass)}
           <div class="kpis">${kpi('VMs', o.discovered.total, '')}${kpi('Selected', o.discovered.selected, '')}${kpi('Clusters', clusters.length, plural(dcs.length, 'datacenter'))}${kpi('Networks', nets.length, '')}</div>
           <div><div class="section-title" style="margin-top:4px">Top-level folders</div>
             <div class="chips">${Object.entries(top).sort((a, b) => b[1] - a[1]).map(([k, c]) => html`<span class="chip" data-act="go" data-to="select" data-q="folder=${encodeURIComponent(k === '(datacenter root)' ? '' : k)}">${icon('folder')} ${k} <span class="n">${n(c)}</span></span>`)}</div></div>
@@ -183,7 +186,12 @@ VIEWS.discover = view({
     const el = $('#disc-progress');
     if (el) mount(el, p.job && p.job.kind === 'discover' ? discProgress(p.job) : '');
   },
-  onJobDone(v, j) { if (j.kind === 'discover') v.refresh(); else v.render(); },
+  onJobDone(v, j) {
+    if (j.kind !== 'discover') { v.render(); return; }
+    if (j.result) v.lastPass = j.result;
+    v.form.allow_mass_removal = false;     // a one-off override, never sticky
+    v.refresh();
+  },
   act: {
     field(t, e, v) { v.form[t.dataset.k] = t.type === 'checkbox' ? t.checked : t.value; if (t.type === 'checkbox') v.render(); },
     optsOpen(t, e, v) { v.optsOpen = t.open; },
@@ -196,6 +204,21 @@ VIEWS.discover = view({
     },
   },
 });
+// What the last discovery pass changed besides adding and refreshing: renames, moves,
+// VMs gone from vCenter. The full list is in the job log.
+function rediscoveryNote(r) {
+  if (!r) return '';
+  if (r.held) return html`<div class="note warn"><b>Nothing was removed.</b> vCenter reports ${plural(r.held, 'VM')} of the inventory gone, more than half:
+    usually the account lost sight of part of it. Check its permissions, or tick <i>Allow mass removal</i> under Options and discover again. ${tip('mass_removal')}</div>`;
+  const parts = [];
+  if (r.removed) parts.push(html`<b>${plural(r.removed, 'VM')}</b> no longer in vCenter, removed${r.queue_skipped ? html` (${n(r.queue_skipped)} were queued and are now skipped)` : ''}`);
+  if (r.renamed) parts.push(html`<b>${n(r.renamed)}</b> renamed`);
+  if (r.moved) parts.push(html`<b>${n(r.moved)}</b> moved to another folder`);
+  if (r.untouched) parts.push(html`<b>${n(r.untouched)}</b> gone from vCenter but in flight or committed: left as is`);
+  if (r.unconfirmed) parts.push(html`<b>${n(r.unconfirmed)}</b> could not be confirmed and were kept`);
+  if (!parts.length) return '';
+  return html`<div class="note ${r.untouched || r.unconfirmed ? 'warn' : 'info'}" id="disc-changes">Last pass: ${parts.map((p, i) => html`${i ? ' · ' : ''}${p}`)}. The job log lists each one. ${tip('rediscovery')}</div>`;
+}
 function readinessPanel(r, bare) {
   if (!r || !(r.grades.ready + r.grades.warn + r.grades.block)) return '';
   const g = r.grades;

@@ -256,11 +256,12 @@ def cmd_discover(args) -> int:
     client = VCenterClient(server, user, password, insecure=args.insecure,
                            timeout=args.timeout, log=log)
     extras: Dict[str, Any] = {}
+    power_state = "POWERED_ON" if args.powered_on else None
     try:
         client.connect()
         vms = discover(
             client,
-            power_state="POWERED_ON" if args.powered_on else None,
+            power_state=power_state,
             with_tools=not args.no_tools,
             with_placement=not args.no_placement,
             with_tags=not args.no_tags,
@@ -269,10 +270,14 @@ def cmd_discover(args) -> int:
             log=log,
             extras=extras,
         )
+        summary = store.upsert_discovered(vms)
+        # before meta "vcenter" moves to this server: it tells which vCenter the cache came from
+        rec = service.reconcile_discovery(store, client, vms, server, power_state=power_state,
+                                          concurrency=args.concurrency,
+                                          allow_mass_removal=args.allow_mass_removal, log=log)
     finally:
         client.close()
 
-    summary = store.upsert_discovered(vms)
     service.record_discovery(store, server, extras)
     store.set_meta("vcenter", server)
     store.set_meta("discovered_at", time.strftime("%Y-%m-%d %H:%M:%S"))
@@ -280,6 +285,8 @@ def cmd_discover(args) -> int:
     log("")
     log("discovered {} VM(s) from {} (added {}, refreshed {})".format(
         len(vms), server, summary["added"], summary["updated"]))
+    for line in service.discovery_report(summary, rec):
+        log(line)
     log("  inventory cache now holds {} VM(s), {} selected".format(
         counts["total"], counts["selected"]))
     no_nics = sum(1 for v in vms if not v.nics)
@@ -1379,6 +1386,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-placement", action="store_true",
                     help="skip folder and cluster attribution")
     sp.add_argument("--no-tags", action="store_true", help="skip reading vCenter tags")
+    sp.add_argument("--allow-mass-removal", action="store_true",
+                    help="remove VMs gone from vCenter even when that is more than half the inventory")
 
     sp = add("browse", cmd_browse, "list the discovered vCenter inventory")
     add_filters(sp)

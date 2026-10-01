@@ -989,7 +989,10 @@ async function jobFinished(id) {
 function jobSummary(j) {
   const r = j.result || {};
   switch (j.kind) {
-    case 'discover': return plural(r.discovered || 0, 'VM') + ' discovered (' + n(r.added) + ' new)';
+    case 'discover': return r.held
+      ? plural(r.discovered || 0, 'VM') + ' discovered; vCenter reports more than half the inventory gone, so nothing was removed'
+      : plural(r.discovered || 0, 'VM') + ' discovered (' + n(r.added) + ' new' + (r.removed ? ', ' + n(r.removed) + ' removed: no longer in vCenter' : '')
+        + (r.renamed || r.moved ? ', ' + n((r.renamed || 0) + (r.moved || 0)) + ' renamed or moved' : '') + ')';
     case 'preflight': return r.ok ? 'All checks passed' : plural((r.problems || []).length, 'problem') + ' found';
     case 'execute': return 'applied ' + n(r.applied) + ' · succeeded ' + n(r.succeeded) + ' · failed ' + n(r.failed) + (r.awaiting_commit ? ' · awaiting commit ' + n(r.awaiting_commit) : '');
     case 'rollback': return n(r.reverted) + ' VM(s) reverted to vCenter';

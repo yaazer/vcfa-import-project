@@ -293,6 +293,28 @@ Credentials come from `--vcenter/--user/--password`, then `VCFA_VC_SERVER` /
 is never written to disk**, and the session is deleted when the command ends.
 Re-running `discover` refreshes the cache and keeps whatever you had selected.
 
+### Re-discovery: renamed, moved and removed VMs
+
+Every pass compares itself with the cache:
+
+- **Renamed or moved to another folder.** A VM keeps its moref through both, so it is updated
+  in place and the pass lists it (`web-01 -> web-01-old`, `Production/Web -> Legacy`). A queued
+  VM not yet handed to the importer takes the new name, unless the queue carries a name of its
+  own from an inventory file.
+- **No longer in vCenter** (deleted, unregistered, or moved to another vCenter). Each VM the
+  pass did not return is looked up by moref; **only a 404 counts as gone**. A timeout or a
+  refusal keeps the VM and is reported as *could not be confirmed*. A gone VM leaves the cache
+  (and the selection). If it was queued and is still with vCenter (pending, prechecked, failed
+  or rolled back), it becomes **skipped**, with the reason in its history. A VM in flight or
+  committed is never touched, only reported.
+
+Not checked: VMs a `--powered-on` pass leaves out (a full pass checks them), and anything when
+the pass reads a different vCenter than the one the cache came from (a moref is only unique
+within one vCenter). If vCenter reports more than half of the cache gone (20 VMs or more),
+nothing is removed: that is far more often an account that lost sight of part of the inventory
+than an estate halved overnight. Check the account's permissions, or pass
+`--allow-mass-removal` (console: *Options → Allow mass removal*) if they really are gone.
+
 ### Collect by folder
 
 VM folders are the unit of collection. Discovery walks the folder tree, so
