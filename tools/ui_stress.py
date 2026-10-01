@@ -450,6 +450,19 @@ const SCENARIOS = {
     const after = await counts();
     check('VMs moved out of pending', (after.pending || 0) < (before.pending || 0), JSON.stringify(after));
     check('the dock shows the finished job', await waitFor(() => /finished|warnings/.test(document.querySelector('#dock').textContent), 8000));
+    // A precheck every VM passed flips the page to Import for the same waves; anything less stays put.
+    const r = (job && job.result) || {};
+    const allPassed = job && job.status === 'succeeded' && r.applied > 0 && !r.failed && r.succeeded === r.applied;
+    const flipped = await waitFor(() => document.querySelector('#ex-flipped'), allPassed ? 8000 : 3000);
+    const stageOn = () => (document.querySelector('[data-act="stage"].on') || {}).dataset;
+    if (allPassed) {
+      check('a precheck every VM passed flips the page to Import', flipped && stageOn().k === 'import', JSON.stringify(r));
+      check('the flip keeps the precheck\'s waves', [...document.querySelectorAll('[data-act="wave"].on')].map((c) => c.dataset.w).join() === '2');
+      check('the flip starts nothing', !(await GET('/api/pulse')).job);
+      check('the import plan lists the prechecked VMs', await waitFor(() => document.querySelector('#ex-plan table'), 8000));
+    } else {
+      check('a precheck with failures stays on Precheck', !flipped && stageOn().k === 'precheck', JSON.stringify(r));
+    }
 
     await open('execute', 'stage=import&waves=2');
     await waitFor(() => document.querySelector('[data-act="start"]:not([disabled])'), 8000);
