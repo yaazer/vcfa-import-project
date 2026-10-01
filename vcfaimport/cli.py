@@ -635,10 +635,12 @@ def _execute(args, stage: str) -> int:
 
     total = sum(r[1] for r in rows)
     per_ns: Dict[str, int] = {}
+    in_run: List[str] = []
     for wave, _n in rows:
         for vm in engine.eligible(stage, wave, morefs=only, include_failed=args.include_failed,
                                   folders=scope, folder_exact=exact):
             per_ns[vm["namespace"]] = per_ns.get(vm["namespace"], 0) + 1
+            in_run.append(vm["moref"])
     from .estimate import estimate, human
     eta = estimate(store, cfg, stage, per_ns)
     log("about to {} {} VM(s){}:".format(
@@ -658,6 +660,8 @@ def _execute(args, stage: str) -> int:
         human(eta["seconds"]), eta["batches"], eta["basis"], human(eta["batch_seconds"])))
     for note in held:
         log("  held back    : " + note)
+    for line in service.left_over_lines(service.run_members(store, in_run)["left_over"]):
+        log(line)
     if args.dry_run:
         log("  DRY RUN      : manifests are rendered and validated, nothing is applied")
     log("")
@@ -887,13 +891,13 @@ def cmd_cleanup(args) -> int:
         candidates = [b for b in candidates if b["name"] in wanted]
         missing = wanted - {b["name"] for b in candidates}
         for name in sorted(missing):
-            log("  ! {}: not in a confirmed rolled-back state; refusing to delete".format(name))
+            log("  ! {}: not a confirmed rollback or a finished precheck; refusing to delete".format(name))
     if not candidates:
-        log("no batches with a confirmed rollback to delete")
+        log("no batches to clean up (no confirmed rollbacks or finished prechecks on the cluster)")
         return 0
-    log("batches whose rollback the operator has confirmed:")
-    log(report.table(["batch", "namespace", "vms", "note"],
-                     [[b["name"], b["namespace"], b["vm_count"], (b["message"] or "")[:50]]
+    log("confirmed rollbacks and finished prechecks still on the cluster:")
+    log(report.table(["batch", "namespace", "stage", "vms", "note"],
+                     [[b["name"], b["namespace"], b["stage"], b["vm_count"], (b["message"] or "")[:50]]
                       for b in candidates], indent="  "))
     if not _confirm("Delete {} batch object(s) from the cluster?".format(len(candidates)),
                     args.yes):
@@ -1512,7 +1516,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-y", "--yes", action="store_true")
 
     sp = add("cleanup", cmd_cleanup,
-             "delete batch objects whose rollback the operator has confirmed")
+             "delete batch objects the cluster no longer needs: confirmed rollbacks and finished prechecks")
     sp.add_argument("--batch", action="append", metavar="NAME", help="restrict to these; repeatable")
     sp.add_argument("-y", "--yes", action="store_true")
 

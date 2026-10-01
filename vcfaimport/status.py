@@ -202,6 +202,25 @@ def _inline_operations(batch_obj: Dict[str, Any], cfg: Config) -> List[OpStatus]
     return []
 
 
+def _blocking_condition(child: Dict[str, Any]) -> Optional[str]:
+    """Why a running child is waiting, from its own lifecycle conditions.
+
+    Seen in the lab (2026-10-01): a batch stuck on ObjectNotReady for minutes
+    while its children said `VirtualMachineReadyForImport: False
+    (VirtualMachineRelocateFailure) waiting for placement results from
+    importoperationbatch` -- the namespace was out of storage quota. Without
+    this the VM rows showed nothing at all.
+    """
+    status = child.get("status") if isinstance(child.get("status"), dict) else {}
+    for cond in status.get("conditions") or []:
+        if not isinstance(cond, dict) or _is_true(cond) or cond.get("type") in OPERATOR_CONDITIONS:
+            continue
+        text = _first_str(cond, ("message",))
+        if text:
+            return "{}: {}".format(cond.get("type"), text)
+    return None
+
+
 def _child_operations(children: List[Dict[str, Any]], batch_name: str, cfg: Config,
                       stage: Optional[str] = None) -> List[OpStatus]:
     """Per-VM status from the batch's ImportOperation children.
@@ -232,6 +251,8 @@ def _child_operations(children: List[Dict[str, Any]], batch_name: str, cfg: Conf
         else:
             phase, message = extract_phase(obj, cfg)
             bucket = classify(phase, cfg)
+        if bucket == BUCKET_RUNNING and not message:
+            message = _blocking_condition(obj)
         out.append(
             OpStatus(
                 key=key,

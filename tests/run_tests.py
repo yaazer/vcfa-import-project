@@ -5118,9 +5118,151 @@ def t_e2e_web_rediscover():
         server.shutdown()
 
 
+@test("a running child says what it waits for (storage quota stall, 2026-10-01)")
+def t_status_child_blocking_condition():
+    batch = {"metadata": {"name": "imp-x"}, "spec": {"operations": [{"name": "op1", "spec": {"virtualMachineID": "vm-1"}}]},
+             "status": {"conditions": [
+                 {"type": t, "status": "False", "reason": "ObjectNotReady",
+                  "message": "Operations are not ready. Operation Names: op1"}
+                 for t in ("Complete", "ReadyForCommit", "ReadyForImport")]}}
+    child = {"metadata": {"name": "op1", "ownerReferences": [{"kind": "ImportOperationBatch", "name": "imp-x"}]},
+             "spec": {"virtualMachineID": "vm-1"},
+             "status": {"conditions": [
+                 {"type": "NetworkBackingReady", "status": "True", "reason": "True"},
+                 {"type": "PrecheckSucceeded", "status": "True", "reason": "True"},
+                 {"type": "VirtualMachineReadyForImport", "status": "False",
+                  "reason": "VirtualMachineRelocateFailure",
+                  "message": "waiting for placement results from importoperationbatch"},
+                 {"type": "VirtualMachineSetManagedBySucceeded", "status": "True", "reason": "True"}]}}
+    b = batch_status(batch, Config(), [child], stage="import")
+    op = b.by_moref()["vm-1"]
+    eq(op.bucket, "running", "still waiting, never a verdict")
+    eq(op.message, "VirtualMachineReadyForImport: waiting for placement results from importoperationbatch")
+
+
+@test("discovery clears a precheck the VM no longer matches; renames reach the queue")
+def t_discovery_drift():
+    from vcfaimport import state as st
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        seen = {"moref": "vm-3093", "name": "ubuntu-22", "power_state": "POWERED_ON",
+                "folder": "migration-wave3", "tools_status": "RUNNING", "nics": []}
+        store.upsert_discovered([seen])
+        _record(store, moref="vm-3093", name="ubuntu-22", wave=3)
+        _record(store, moref="vm-3094", name="ubuntu-23")
+        store.upsert_discovered([dict(seen, moref="vm-3094", name="ubuntu-23")])
+        store.set_vm_state("vm-3093", st.S_PRECHECK_PASSED, precheck_batch="pre-w3-x", stage="precheck")
+        _record(store, moref="vm-7", name="from-csv")          # never discovered: nothing to drift from
+        store.set_vm_state("vm-7", st.S_PRECHECK_PASSED, stage="precheck")
+
+        # Days later: repurposed as a golden image, and the other one renamed.
+        summary = store.upsert_discovered([
+            dict(seen, name="ubuntu-template", power_state="POWERED_OFF", tools_status="NOT_RUNNING"),
+            dict(seen, moref="vm-3094", name="ubuntu-23-renamed"),
+            {"moref": "vm-7", "name": "something-else", "power_state": "POWERED_ON", "nics": []}])
+        eq((summary["drifted"], summary["precheck_cleared"]), (2, 1))
+        vm = store.get_vm("vm-3093")
+        eq((vm["state"], vm["vm_name"], vm["precheck_batch"]), ("pending", "ubuntu-template", None))
+        for bit in ("precheck cleared", "renamed ubuntu-22 -> ubuntu-template", "power POWERED_ON -> POWERED_OFF",
+                    "Tools RUNNING -> NOT_RUNNING"):
+            assert bit in vm["message"], vm["message"]
+        eq(store.get_vm("vm-3094")["vm_name"], "ubuntu-23-renamed")
+        eq(store.get_vm("vm-3094")["state"], "pending", "a pending VM only takes the new name")
+        eq((store.get_vm("vm-7")["state"], store.get_vm("vm-7")["vm_name"]), ("precheck_passed", "from-csv"),
+           "a CSV row had no recorded facts, so it has not drifted")
+        events = [e["message"] for e in store.recent_events(moref="vm-3093")]
+        assert any("changed in vCenter" in m for m in events), events
+        store.close()
+
+
+@test("precheck_max_age_hours holds back stale passes at import (off by default)")
+def t_precheck_max_age():
+    from vcfaimport import state as st
+    from vcfaimport.engine import Engine, STAGE_IMPORT
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _record(store, moref="vm-1", name="old-pass")
+        _record(store, moref="vm-2", name="fresh-pass")
+        for m in ("vm-1", "vm-2"):
+            store.set_vm_state(m, st.S_PRECHECK_PASSED, stage="precheck")
+        store.conn.execute("UPDATE vms SET precheck_finished_at='2026-09-28T17:41:49Z' WHERE moref='vm-1'")
+        store.conn.commit()
+        cfg = Config()
+        engine = Engine(cfg, store, None, lambda m: None)
+        eq(len(engine.eligible(STAGE_IMPORT, 1)), 2, "0 means no limit")
+        cfg.precheck_max_age_hours = 24
+        eq([r["moref"] for r in engine.eligible(STAGE_IMPORT, 1)], ["vm-2"])
+        assert "older than 24h" in engine.holdbacks[0] and "old-pass" in engine.holdbacks[0], engine.holdbacks
+        store.close()
+
+
+@test("a plan names every VM and flags ones queued earlier and since deselected")
+def t_run_members_left_over():
+    from vcfaimport import service
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        store.upsert_discovered([{"moref": m, "name": n, "power_state": "POWERED_ON", "nics": []}
+                                 for m, n in (("vm-1", "lab-01"), ("vm-2", "old-22"))])
+        store.set_selected(["vm-1"], True)
+        for m, n in (("vm-1", "lab-01"), ("vm-2", "old-22"), ("vm-3", "from-csv")):
+            _record(store, moref=m, name=n)
+        who = service.run_members(store, ["vm-1", "vm-2", "vm-3"])
+        eq([m["vm_name"] for m in who["members"]], ["lab-01", "old-22", "from-csv"])
+        eq([m["vm_name"] for m in who["left_over"]], ["old-22"], "CSV rows have no selection to compare")
+        lines = service.left_over_lines(who["left_over"])
+        assert "not in your current selection" in lines[0] and "old-22" in lines[1], lines
+        store.close()
+
+
+@test("e2e: finished prechecks release their storage; a quota stall says why and cleanup frees it")
+def t_e2e_precheck_storage_release():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "wait", settle="1")
+        _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-ns-a"])
+        cluster = json.loads(Path(tmp, "cluster.json").read_text())
+        cluster["quota_gib"] = {"ns-a": 100}      # four 25 GiB VMs
+        Path(tmp, "cluster.json").write_text(json.dumps(cluster))
+        cfg = _write_config(tmp, commit_action="Wait", batch_timeout_minutes=0.1)
+        inv = _inventory(tmp, 3, namespaces=("ns-a",), waves=(1,))
+        _run_cli(["-c", cfg, "load", "-i", inv], env, tmp)
+
+        # The lab's sequence: a precheck whose batch stays on the cluster (here the
+        # delete fails), then an import that no longer fits the namespace's quota.
+        stuck_env = dict(env, FAKE_KUBECTL_DELETE_FAILS="1")
+        out = _run_cli(["-c", cfg, "precheck", "-y"], stuck_env, tmp).stdout
+        assert "not deleted" in out and "cleanup" in out, out
+        out = _run_cli(["-c", cfg, "run", "-y"], env, tmp, expect=None).stdout
+        assert "timed out" in out, out
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({v["state"] for v in vms}, {"importing"})
+        assert all("waiting for placement results" in (v["message"] or "") for v in vms), \
+            [v["message"] for v in vms]
+
+        # cleanup lists the finished precheck and deletes it ...
+        out = _run_cli(["-c", cfg, "cleanup", "-y"], env, tmp).stdout
+        assert "pre-w1" in out and "precheck" in out and "deleted 1 batch" in out, out
+        names = list(json.loads(Path(tmp, "cluster.json").read_text())["batches"])
+        assert not any(k.split("/", 1)[1].startswith("pre-") for k in names), names
+        # ... and the stalled import proceeds by itself, as on the real cluster.
+        _run_cli(["-c", cfg, "status", "--refresh"], env, tmp)
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({v["state"] for v in vms}, {"awaiting_commit"})
+
+        # From now on a precheck deletes its own batch once the verdict is in.
+        _run_cli(["-c", cfg, "rollback", "--failed", "-y"], env, tmp, expect=None)
+        _run_cli(["-c", cfg, "retry", "--force"], env, tmp)
+        out = _run_cli(["-c", cfg, "precheck", "-y"], env, tmp).stdout
+        assert "deleted precheck batch" in out, out
+        batches = {k.split("/", 1)[1] for k in json.loads(Path(tmp, "cluster.json").read_text())["batches"]}
+        assert not any(b.startswith("pre-") for b in batches), batches
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({v["state"] for v in vms}, {"precheck_passed"}, "the verdict outlives the batch")
+
+
 UNIT = [
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
-    t_app_icon,
+    t_app_icon, t_status_child_blocking_condition, t_discovery_drift, t_precheck_max_age,
+    t_run_members_left_over,
     t_vcenter_portgroups,
     t_stage_ns_conflicts,
     t_serve_open_headless, t_python_version_message,
@@ -5159,6 +5301,7 @@ UNIT = [
 ]
 
 E2E = [
+    t_e2e_precheck_storage_release,
     t_e2e_portgroups_subnets,
     t_e2e_cluster_namespaces,
     t_e2e_web_governance, t_e2e_cli_governance,

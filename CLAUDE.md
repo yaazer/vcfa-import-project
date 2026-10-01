@@ -64,6 +64,11 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   decide their own request, an approval is consumed once for its stage, dry runs are exempt.
 - A change window never *starts* a batch that could not finish by its end
   (`Engine.deadline`); in-flight batches are still polled to completion.
+- **A precheck vouches for the VM as it was.** Discovery (`Store.upsert_discovered`) sends a
+  `precheck_passed` VM back to `pending` when it was renamed, moved, powered off/on or its Tools
+  changed since its facts were recorded; `precheck_max_age_hours` (0 = off) holds stale passes
+  back at import. Deselecting never unqueues: plans name every VM and flag left-over entries
+  (`service.run_members`). A golden image was imported on a three-day-old pass (2026-10-01).
 - Verification never changes a VM's state (a committed import stays committed); it
   writes `verifications` rows and `vms.verify_*` only.
 - Secrets never hit disk: SMTP passwords via `password_env`, user tokens stored as
@@ -164,6 +169,16 @@ learned from a real cluster — the fakes should model what was observed.
   read "awaiting commit" for days; `commit` now re-reads the batch before patching
   and follows it to the end.
 - A batch `status` may also carry `operationPlacements` (seen 2026-09-23; unparsed).
+- **Every ImportOperation holds a `StoragePolicyReservation`** (cns.vmware.com) the size of
+  its VM's disks, owned by the child -- precheck-only children included -- until its batch is
+  deleted (2026-10-01). Committed and rolled-back imports release theirs. Old precheck batches
+  held 426 GiB of a 250 GiB namespace limit; the quota webhook then denied the next import's
+  reservation and its children sat at `VirtualMachineReadyForImport: False
+  (VirtualMachineRelocateFailure) waiting for placement results from importoperationbatch` with the
+  batch at `ObjectNotReady` -- the quota error is only in the operator's log. Deleting the precheck
+  batches let the import proceed within seconds. So finished precheck batches are deleted
+  (`Engine._release_precheck`), and a running child's blocking condition is surfaced
+  (`status._blocking_condition`).
 - Not yet observed: the per-op lists for failed/completed/rolled-back operations, the
   target VM resource name field. `status.py` tries several spellings; confirm when seen.
 - A wedged `systemd-resolved` on a Supervisor CP node showed up as

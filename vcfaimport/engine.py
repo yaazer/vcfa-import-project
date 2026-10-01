@@ -46,6 +46,13 @@ class PreflightResult:
     checks: List[Tuple[str, bool, str]] = field(default_factory=list)
 
 
+
+def cleanup_candidates(store: st.Store) -> List[sqlite3.Row]:
+    """Batch objects the cluster no longer needs: confirmed rollbacks, and finished
+    prechecks (deleted automatically since 2026-10; older workspaces still hold some)."""
+    return (store.query_batches(states=[st.B_ROLLED_BACK])
+            + store.query_batches(states=list(st.PRECHECK_DONE_STATES), stage=STAGE_PRECHECK))
+
 class Engine:
     def __init__(self, cfg: Config, store: st.Store, kube: Kubectl, log: Callable[[str], None]):
         self.cfg = cfg
@@ -341,9 +348,25 @@ class Engine:
             if blocked:
                 self.holdbacks.append("{} VM(s) held back: readiness marks them blocked".format(len(blocked)))
                 rows = [r for r in rows if r["moref"] not in blocked]
+        max_age = getattr(self.cfg, "precheck_max_age_hours", 0) or 0
+        if stage == STAGE_IMPORT and max_age > 0 and rows:
+            rows = self._fresh_prechecks(rows, max_age)
         if stage == STAGE_IMPORT and getattr(self.cfg, "app_together", False) and rows:
             rows = self._whole_apps(rows)
         return rows
+
+    def _fresh_prechecks(self, rows: List[sqlite3.Row], max_age_hours: int) -> List[sqlite3.Row]:
+        """Hold back VMs whose precheck pass is older than precheck_max_age_hours."""
+        cutoff = datetime.now(timezone.utc).timestamp() - max_age_hours * 3600
+        keep, stale = [], []
+        for r in rows:
+            when = st._parse_ts(r["precheck_finished_at"] or "") if r["state"] == st.S_PRECHECK_PASSED else None
+            (stale if when is not None and when.timestamp() < cutoff else keep).append(r)
+        if stale:
+            self.holdbacks.append("{} VM(s) held back: precheck older than {}h, precheck again ({})".format(
+                len(stale), max_age_hours, ", ".join(r["vm_name"] for r in stale[:3])
+                + (" ..." if len(stale) > 3 else "")))
+        return keep
 
     def _whole_apps(self, rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
         """Import an application only when every one of its VMs can go now.
@@ -821,8 +844,31 @@ class Engine:
         else:
             batch_state = st.B_PARTIAL
         self.store.set_batch_state(batch_name, namespace, batch_state, bstatus.message)
-        self.log("  <- {} {} ({} of {} ok)".format(
-            batch_name, batch_state, len(final_rows) - bad, len(final_rows)))
+        verdict = "{} ({} of {} ok)".format(batch_state, len(final_rows) - bad, len(final_rows))
+        self.log("  <- {} {}".format(batch_name, verdict))
+        if stage == STAGE_PRECHECK:
+            self._release_precheck(namespace, batch_name, "precheck " + verdict)
+        return True
+
+    def _release_precheck(self, ns: str, name: str, verdict: str) -> bool:
+        """Delete a finished precheck batch from the cluster.
+
+        Its verdict is on every VM row and in the ledger, and while it exists
+        each child ImportOperation holds a StoragePolicyReservation for its
+        VM's disks. Left in place, they used up the namespace's storage quota
+        and the next import waited forever for placement (lab, 2026-10-01).
+        """
+        try:
+            self.kube.delete(self.cfg.batch_resource, name, ns)
+        except KubectlError as exc:
+            msg = "finished precheck batch not deleted ({}); `cleanup` deletes it".format(str(exc)[:200])
+            self.store.log_event(msg, "warn", batch=name)
+            self.log("  ! {}/{}: {}".format(ns, name, msg))
+            return False
+        self.store.set_batch_state(name, ns, st.B_DELETED,
+                                   "{}; deleted to release its storage reservations".format(verdict))
+        self.store.log_event("precheck batch deleted once its verdict was recorded", batch=name)
+        self.log("  x  deleted precheck batch {} (its storage reservations go with it)".format(name))
         return True
 
     def _batch_vanished(self, ns: str, name: str, stage: str, when: str) -> None:
@@ -854,7 +900,11 @@ class Engine:
         """
         notes: List[str] = []
         by_key: Dict[Tuple[str, str], sqlite3.Row] = {}
-        all_batches = [b for b in self.store.query_batches() if b["state"] != st.B_DELETED]
+        # A finished precheck batch is deleted to release its storage, but it is
+        # still the batch its VMs' verdict came from: abandoning it is how they
+        # go back to pending (the delete itself is then a no-op).
+        all_batches = [b for b in self.store.query_batches()
+                       if b["state"] != st.B_DELETED or b["stage"] == STAGE_PRECHECK]
 
         wanted: List[sqlite3.Row] = []
         for name in batch_names or []:
@@ -1370,12 +1420,24 @@ class Engine:
             result["deleted"].append(name)
 
     def cleanup_candidates(self) -> List[sqlite3.Row]:
-        """Batches whose rollback the operator has confirmed, and so are safe to delete."""
-        return self.store.query_batches(states=[st.B_ROLLED_BACK])
+        """Batches safe to delete: confirmed rollbacks, and finished prechecks still on the cluster."""
+        return cleanup_candidates(self.store)
 
     def delete_batches(self, batches: Sequence[sqlite3.Row]) -> Dict[str, Any]:
         result: Dict[str, Any] = {"deleted": [], "errors": []}
-        self._delete_rolled_back(batches, result)
+        prechecks = [b for b in batches if b["stage"] == STAGE_PRECHECK]
+        self._delete_rolled_back([b for b in batches if b["stage"] != STAGE_PRECHECK], result)
+        for row in prechecks:
+            ns, name = row["namespace"], row["name"]
+            current = self.store.get_batch(name, ns)
+            if current is None or current["state"] not in st.PRECHECK_DONE_STATES:
+                result["errors"].append("{}/{}: not deleted -- the precheck has not finished ({})".format(
+                    ns, name, current["state"] if current else "unknown"))
+                continue
+            if self._release_precheck(ns, name, "precheck {}".format(current["state"])):
+                result["deleted"].append(name)
+            else:
+                result["errors"].append("{}/{}: delete failed".format(ns, name))
         return result
 
     # ---------------------------------------------------------------- retry

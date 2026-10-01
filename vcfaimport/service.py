@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import Config
 from .discovery import match_folder_map, _match_mapping  # noqa: F401  (re-exported for web)
-from .engine import STAGE_IMPORT, AbortRun, Engine
+from .engine import STAGE_IMPORT, AbortRun, Engine, cleanup_candidates
 from .kube import Kubectl, KubectlError
 from .folders import folder_matches, norm_folder
 from . import state as st
@@ -193,6 +193,42 @@ def holdbacks(engine: Engine, stage: str, waves: Optional[Sequence[int]] = None,
                         folders=folders, folder_exact=folder_exact)
         notes.extend("wave {}: {}".format(wave, h) for h in engine.holdbacks)
     return notes
+
+
+def run_members(store: st.Store, morefs: Sequence[str]) -> Dict[str, Any]:
+    """Who a precheck or import is about to touch, and which of them are left over.
+
+    "Left over" means discovered but no longer selected: staged in an earlier
+    session, then deselected. Deselecting never takes a VM out of the queue, so
+    without this a three-day-old entry for a since-repurposed VM rode along
+    unnoticed (2026-10-01). VMs loaded from a CSV have no selection to compare.
+    """
+    vms = {r["moref"]: r for r in store.query_vms(morefs=list(morefs))} if morefs else {}
+    disc = {r["moref"]: r for r in store.query_discovered(morefs=list(morefs))} if morefs else {}
+    members, left_over = [], []
+    for moref in morefs:
+        vm = vms.get(moref)
+        if vm is None:
+            continue
+        d = disc.get(moref)
+        item = {"moref": moref, "vm_name": vm["vm_name"], "wave": vm["wave"],
+                "queued_at": vm["created_at"], "selected": bool(d["selected"]) if d else None}
+        members.append(item)
+        if d is not None and not d["selected"]:
+            left_over.append(item)
+    return {"members": members, "left_over": left_over}
+
+
+def left_over_lines(left_over: Sequence[Dict[str, Any]], limit: int = 10) -> List[str]:
+    if not left_over:
+        return []
+    lines = ["  {} VM(s) here are not in your current selection -- queued earlier:".format(len(left_over))]
+    lines += ["    {}  {}  wave {}  queued {}".format(m["vm_name"], m["moref"], m["wave"], m["queued_at"][:10])
+              for m in left_over[:limit]]
+    if len(left_over) > limit:
+        lines.append("    ... and {} more".format(len(left_over) - limit))
+    lines.append("  deselecting does not unqueue a VM: `skip --vm MOREF` keeps one out")
+    return lines
 
 
 def run_stage(engine: Engine, stage: str, *, waves: Optional[Sequence[int]] = None,
@@ -447,7 +483,7 @@ def failure_groups(store: st.Store) -> Dict[str, Any]:
         "groups": ordered,
         "stalled": stalled,
         "rolled_back": rolled_back,
-        "cleanup": [dict(b) for b in store.query_batches(states=[st.B_ROLLED_BACK])],
+        "cleanup": [dict(b) for b in cleanup_candidates(store)],
         "awaiting_commit": [vm_summary(v) for v in store.query_vms(states=[st.S_AWAITING_COMMIT])],
     }
 
@@ -808,6 +844,12 @@ def discovery_report(summary: Dict[str, Any], rec: Dict[str, Any], limit: int = 
                      "them".format(rec["outside_filter"]))
     if rec.get("note"):
         lines.append("  " + rec["note"])
+    if summary.get("drifted"):
+        lines.append("  {} queued VM(s) changed in vCenter since their facts were recorded "
+                     "(renamed, moved, power or Tools); see `events`".format(summary["drifted"]))
+    if summary.get("precheck_cleared"):
+        lines.append("  {} of them had passed precheck: back to pending, precheck them again"
+                     .format(summary["precheck_cleared"]))
     return lines
 
 
