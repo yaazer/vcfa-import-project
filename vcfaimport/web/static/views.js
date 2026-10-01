@@ -1298,7 +1298,12 @@ function planTable(v) {
       <td class="small mono">${p.namespaces.join(', ')}</td><td class="right small nowrap">${eta(p.seconds)}</td></tr>`)}
     <tr><td><b>Total</b></td><td class="right num"><b>${n(pl.total)}</b></td><td class="right num"><b>${n(pl.plan.reduce((a, p) => a + p.batches, 0))}</b></td><td></td><td class="right nowrap"><b>${eta(pl.seconds)}</b></td></tr></tbody></table>
     <div class="tiny faint mt-s">Times use ${basis}; waves run one after another.</div>
-    ${(pl.holdbacks || []).length ? html`<div class="note warn mt-s"><b>Held back:</b><ul class="plain">${pl.holdbacks.map((h) => html`<li>${h}</li>`)}</ul></div>` : ''}`;
+    ${(pl.holdbacks || []).length ? html`<div class="note warn mt-s"><b>Held back:</b><ul class="plain">${pl.holdbacks.map((h) => html`<li>${h}</li>`)}</ul></div>` : ''}
+    ${(pl.left_over || []).length ? html`<div class="note warn mt-s"><b>${plural(pl.left_over.length, 'VM')} not in your current selection ${tip('leftover')}</b>
+      <ul class="plain small">${pl.left_over.slice(0, 10).map((m) => html`<li><b>${m.vm_name}</b> <span class="mono tiny">${m.moref}</span> · wave ${m.wave} · queued ${fmtTime(m.queued_at, true)}</li>`)}</ul>
+      ${pl.left_over.length > 10 ? html`<div class="tiny">and ${n(pl.left_over.length - 10)} more</div>` : ''}
+      <div class="tiny">Staged in an earlier session. Deselecting does not take a VM out of the queue; skip it in the Import queue to keep it out.</div></div>` : ''}
+    ${(pl.members || []).length ? html`<div class="small mt-s"><b>VMs in this run:</b> ${pl.members.slice(0, 40).map((m) => m.vm_name).join(', ')}${pl.members.length > 40 ? html` <span class="faint">and ${n(pl.members.length - 40)} more</span>` : ''}</div>` : ''}`;
 }
 function goButton(v) {
   const pl = v.plan, imp = v.opt.stage === 'import', busy = !!(S.pulse && S.pulse.job);
@@ -1419,7 +1424,7 @@ VIEWS.triage = view({
           <div class="card-b"><p class="muted small" style="margin-top:0">Ownership is back with vCenter. Once the cause is fixed, requeue them and precheck again.</p>${vmChips(d.rolled_back, 30)}</div>
           <div class="card-f"><button class="btn primary" data-act="retryList" data-list="rolled_back">${icon('refresh')} Retry ${n(d.rolled_back.length)}</button></div></div>` : ''}
         ${d.cleanup.length ? html`<div class="card issue info"><div class="card-h"><h3>Batch objects left on the cluster ${tip('cleanup')}</h3><span class="tag">${plural(d.cleanup.length, 'batch', 'batches')}</span></div>
-          <div class="card-b"><p class="muted small" style="margin-top:0">Their rollback is confirmed, so they are safe to delete. Deleting also frees the child ImportOperation names for a retry.</p>
+          <div class="card-b"><p class="muted small" style="margin-top:0">Confirmed rollbacks and finished prechecks, safe to delete. A precheck batch holds a storage reservation for each of its VMs until it is deleted, and can use up the namespace's quota.</p>
             <div class="vmlist">${d.cleanup.map((b) => html`<a data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">${b.name}</a>`)}</div></div>
           <div class="card-f"><button class="btn" data-act="cleanup">${icon('trash')} Delete ${n(d.cleanup.length)}</button></div></div>` : ''}
       </div>`;

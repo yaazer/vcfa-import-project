@@ -307,6 +307,11 @@ Every pass compares itself with the cache:
   (and the selection). If it was queued and is still with vCenter (pending, prechecked, failed
   or rolled back), it becomes **skipped**, with the reason in its history. A VM in flight or
   committed is never touched, only reported.
+- **Changed since it passed precheck.** A queued VM that was renamed, moved, powered on or
+  off, or whose Tools state changed since its facts were recorded is logged as an event. If it
+  had **passed precheck**, the pass no longer vouches for it: it goes back to `pending` with
+  the reason (*"precheck cleared: renamed ubuntu-22 -> ubuntu-template; power POWERED_ON ->
+  POWERED_OFF since it passed"*) and must be prechecked again before it can import.
 
 Not checked: VMs a `--powered-on` pass leaves out (a full pass checks them), and anything when
 the pass reads a different vCenter than the one the cache came from (a moref is only unique
@@ -621,7 +626,7 @@ it never touches batches it did not create.
 | `commit` | release VMs held by `commitAction: Wait`; scopes by `--wave` or `--vm` (**no `--folder`**), or commits everything waiting |
 | `retry` | return failed VMs to the queue |
 | `rollback` | hand failed imports back to vCenter: set `rollbackAction`, wait for the revert, optionally delete |
-| `cleanup` | delete batch objects whose rollback the operator has confirmed |
+| `cleanup` | delete batch objects the cluster no longer needs: confirmed rollbacks and finished prechecks |
 | `abandon` | discard a batch without rollback (precheck-only, or nothing in flight); VMs return to `pending` |
 | `vms` | list VMs and their states (`--json` for scripting) |
 | `skip` | exclude or re-include VMs |
@@ -652,9 +657,16 @@ again after any change to the config or the maps.
 `ImportOperationBatch` with `precheckOnly: true`. The operator connects to
 vCenter, locates each VM and runs its compatibility checks, then stops with
 `ReadyForImport: True` instead of migrating. Each VM lands in
-`precheck_passed` or `precheck_failed` with the operator's message. It costs a
-batch object on the cluster but moves nothing, and `run` refuses a VM that has
-not passed one (`require_precheck = true`).
+`precheck_passed` or `precheck_failed` with the operator's message. It moves
+nothing, and `run` refuses a VM that has not passed one (`require_precheck = true`).
+
+It does cost storage quota while it exists: each child `ImportOperation`, precheck
+ones included, holds a `StoragePolicyReservation` the size of its VM's disks. So
+once a precheck's verdict is recorded on every VM, the tool **deletes the precheck
+batch** and its reservations go with it. The verdict stays on the VM rows, the
+ledger and the Batches page (state `deleted`, with the verdict in its message).
+A workspace from before this change may still have finished precheck batches on
+the cluster; `cleanup` lists and deletes them.
 
 Preflight finds the mistakes that would fail every batch the same way;
 precheck finds the per-VM problems only the operator can see. Note that
@@ -781,7 +793,8 @@ What happens, in order:
 4. **Delete** — only with `--delete`, and **only after step 3 confirms**.
    Deleting a batch whose rollback has not completed is refused. Batches you
    rolled back without `--delete` stay on the cluster for inspection; remove
-   them later with `cleanup`, which likewise deletes only confirmed rollbacks.
+   them later with `cleanup`, which likewise deletes only confirmed rollbacks
+   (and finished precheck batches, see *Preflight vs precheck*).
 
 ```
 importing ──> failed ──rollback──> rolling_back ──> rolled_back ──retry──> pending
@@ -918,6 +931,14 @@ back to vCenter management. The tool is built around that fact:
 
 - **Precheck first.** `run` refuses to import a VM that has not passed a
   precheck (`require_precheck = true`). Override per-run with `--no-precheck`.
+- **A precheck is only as good as the VM it checked.** Discovery sends a
+  prechecked VM back to `pending` when it was renamed, moved, powered off or
+  lost Tools since. `precheck_max_age_hours` (default 0, off) also holds back
+  any VM whose pass is older than that, with the reason in the plan.
+- **Left-over queue entries are named.** Deselecting never removes a VM from the
+  queue. The plan, in the console and the CLI, lists every VM in the run and
+  warns about any that are queued but no longer selected, with the date they
+  were queued; `skip` keeps one out.
 - **Waves.** Nothing crosses a wave boundary. Pilot with `--wave 1 --limit 10`.
 - **Circuit breaker.** If `failure_rate_abort` (default 25%) of a wave's results
   fail, the run halts and applies nothing further. Exit code 3.
@@ -993,9 +1014,9 @@ Every operation name carries a five-character digest of its batch's name, so
 `ubuntu-3` in moref `vm-3079` becomes `ubuntu-3-3079-be78d` under a precheck
 batch and `ubuntu-3-3079-008cf` under the import that follows. The digest is
 derived from the batch name, so it is stable across re-planning (a resumed run
-still recognises its children) and differs for every distinct batch. A precheck
-batch can therefore be left on the cluster as a record; it no longer blocks the
-import. Two VMs that slug to the same name inside *one* batch get a counter
+still recognises its children) and differs for every distinct batch, so a
+precheck batch still on the cluster never blocks the import. (Finished precheck
+batches are deleted anyway, to release their storage reservations.) Two VMs that slug to the same name inside *one* batch get a counter
 appended to the digest.
 
 Anything outside that vocabulary falls back to the heuristics below.

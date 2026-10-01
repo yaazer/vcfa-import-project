@@ -579,8 +579,8 @@ async function doCommit(sel, count) {
 }
 async function doCleanup(batches) {
   const ok = await modal({
-    title: 'Delete ' + plural(batches.length, 'rolled-back batch', 'rolled-back batches') + '?', ic: 'trash', confirm: 'Delete', danger: true,
-    body: html`<p>Only batches whose rollback the operator has confirmed are deleted. Their VMs stay rolled back and can be retried.</p>
+    title: 'Delete ' + plural(batches.length, 'finished batch', 'finished batches') + '?', ic: 'trash', confirm: 'Delete', danger: true,
+    body: html`<p>Only confirmed rollbacks and finished prechecks are deleted. VMs keep their state: rolled-back VMs can be retried, prechecked VMs stay prechecked. Deleting a precheck batch releases the storage it reserves in the namespace.</p>
       <ul class="plain small mono">${batches.slice(0, 12).map((b) => html`<li>${b.namespace}/${b.name}</li>`)}</ul>`,
   });
   if (!ok) return;

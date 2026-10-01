@@ -86,6 +86,7 @@ class Config:
     max_vms_per_run: int = 0           # 0 = unlimited
     require_precheck: bool = True      # refuse to import VMs with no passing precheck
     readiness_exclude_blocked: bool = False  # keep VMs readiness marks "blocked" out of precheck
+    precheck_max_age_hours: int = 0    # import refuses a precheck older than this; 0 = no limit
 
     # ---- governance --------------------------------------------------------
     # Stages that need a second person: any of "import", "commit", "rollback".
@@ -271,6 +272,7 @@ failure_rate_min_sample = 8
 max_vms_per_run         = 0      # 0 = unlimited
 require_precheck        = true
 # readiness_exclude_blocked = false   # keep VMs readiness marks "blocked" out of precheck
+# precheck_max_age_hours = 24         # import holds back VMs whose precheck is older; 0 = no limit
 
 [governance]
 # require_approval = ["import", "commit"]   # a second person approves these (console and CLI)

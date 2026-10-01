@@ -599,6 +599,7 @@ class WebApp:
                                             include_failed=include_failed, folders=folders,
                                             folder_exact=bool(body.get("folder_exact")))
             plan = []
+            planned: List[str] = []
             holdbacks = service.holdbacks(engine, stage_name, waves, morefs=morefs,
                                           include_failed=include_failed, folders=folders,
                                           folder_exact=bool(body.get("folder_exact")))
@@ -609,6 +610,7 @@ class WebApp:
                 per_ns: Dict[str, int] = {}
                 for b in batches:
                     per_ns[b.namespace] = per_ns.get(b.namespace, 0) + b.size
+                    planned.extend(r.moref for r in b.records)
                 eta = est.estimate(self.store, cfg, stage_name, per_ns)
                 plan.append({"wave": wave, "vms": sum(b.size for b in batches),
                              "eligible": count, "batches": len(batches),
@@ -617,11 +619,13 @@ class WebApp:
             all_waves = self.store.waves()
             per_wave_all = {w: len(engine.eligible(stage_name, w, include_failed=include_failed))
                             for w in all_waves}
+            who = service.run_members(self.store, planned)
         return {
             "stage": stage_name, "plan": plan,
             "total": sum(p["vms"] for p in plan),
             "seconds": sum(p["seconds"] for p in plan),
             "holdbacks": holdbacks,
+            "members": who["members"], "left_over": who["left_over"],
             "needs_approval": access.needs_approval(cfg, stage_name, body),
             "eligible_by_wave": per_wave_all,
             "settings": {"context": cfg.context, "batch_size": cfg.batch_size,
@@ -793,6 +797,7 @@ class WebApp:
                     "updated": summary["updated"], "total": counts["total"],
                     "selected": counts["selected"], "no_nics": no_nics, "tools_not_running": stale,
                     "renamed": len(summary["renamed"]), "moved": len(summary["moved"]),
+                    "drifted": summary["drifted"], "precheck_cleared": summary["precheck_cleared"],
                     "removed": len(rec["removed"]), "queue_skipped": len(rec["skipped"]),
                     "untouched": len(rec["untouched"]), "unconfirmed": rec["unconfirmed"],
                     "held": rec["held"], "status": WARNING if rec["held"] else None}
@@ -1011,10 +1016,10 @@ class WebApp:
                 if wanted:
                     candidates = [b for b in candidates if b["name"] in wanted]
                     for name in sorted(wanted - {b["name"] for b in candidates}):
-                        job.log("  ! {}: not in a confirmed rolled-back state; refusing to delete"
+                        job.log("  ! {}: not a confirmed rollback or a finished precheck; refusing to delete"
                                 .format(name))
                 if not candidates:
-                    job.log("no batches with a confirmed rollback to delete")
+                    job.log("no batches to clean up (no confirmed rollbacks or finished prechecks on the cluster)")
                     return {"deleted": []}
                 result = ws.engine.delete_batches(candidates)
             job.log("deleted {} batch(es)".format(len(result["deleted"])))
@@ -1022,7 +1027,7 @@ class WebApp:
                 job.log("  ! " + err)
             return dict(result, status=WARNING if result["errors"] else None)
 
-        return self._start("cleanup", "Delete rolled-back batches",
+        return self._start("cleanup", "Delete finished batches",
                                {"batches": sorted(wanted)}, run, lock=self._lock_for("cleanup"))
 
     # ================================================================ identity

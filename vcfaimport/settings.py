@@ -34,6 +34,7 @@ FIELDS: Dict[str, tuple] = {
     "max_retries": ("Safety", "Automatic retries", "int", 0, 10, "Retry ceiling per VM (retry --force overrides)."),
     "require_precheck": ("Safety", "Require a passed precheck", "bool", None, None, "Import refuses VMs that did not pass precheck."),
     "readiness_exclude_blocked": ("Safety", "Skip VMs readiness blocks", "bool", None, None, "Keep VMs graded 'blocked' out of precheck."),
+    "precheck_max_age_hours": ("Safety", "Precheck valid for (h)", "int", 0, 720, "Import holds back VMs whose precheck is older. 0 means no limit."),
     "commit_action": ("Safety", "Commit action", "choice:Auto,Wait", None, None, "Auto commits on success; Wait holds imports for approval."),
     "require_approval": ("Governance", "Needs a second person", "stages", None, None, "Stages that a different operator must approve."),
     "app_category": ("Applications", "App tag category", "str", 0, 80, "vCenter tag category that names each VM's application."),

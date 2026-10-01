@@ -52,6 +52,9 @@ B_TIMEDOUT = "timedout"
 B_ROLLING_BACK = "rolling_back"
 B_ROLLED_BACK = "rolled_back"
 B_DELETED = "deleted"
+# A precheck batch in one of these has its verdict on every VM row; the object
+# on the cluster only holds storage reservations from here on.
+PRECHECK_DONE_STATES = (B_SUCCEEDED, B_PARTIAL, B_FAILED)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -419,12 +422,26 @@ class Store:
         )
         self._append_ledger(entry)
 
-    def _provenance_from_discovery(self, moref: str) -> None:
-        """Copy the vCenter facts onto the VM row so the record stands alone."""
+    def _provenance_from_discovery(self, moref: str) -> List[str]:
+        """Copy the vCenter facts onto the VM row so the record stands alone.
+
+        Returns what changed since the facts were last recorded (moved, powered
+        on or off, Tools state). Only facts that were known before count: a row
+        loaded from a CSV has nothing to drift from yet. Renames are detected by
+        upsert_discovered, which also decides whether the queued name follows.
+        """
         row = self.conn.execute(
             "SELECT * FROM discovered WHERE moref=?", (moref,)).fetchone()
-        if row is None:
-            return
+        vm = self.get_vm(moref)
+        if row is None or vm is None:
+            return []
+        changes: List[str] = []
+        if vm["src_power"] or vm["src_folder"]:      # facts came from an earlier discovery
+            for label, old, new in (("folder", vm["src_folder"], row["folder"]),
+                                    ("power", vm["src_power"], row["power_state"]),
+                                    ("Tools", vm["src_tools"], row["tools_status"])):
+                if old and new and old != new:
+                    changes.append("{} {} -> {}".format(label, old, new))
         self.conn.execute(
             "UPDATE vms SET src_vcenter=?, src_cluster=?, src_folder=?, src_host=?,"
             " src_networks=?, src_power=?, src_cpu=?, src_memory_mb=?, src_tools=?,"
@@ -433,6 +450,7 @@ class Store:
              row["networks"], row["power_state"], row["cpu_count"], row["memory_mb"],
              row["tools_status"], row["datacenter"], row["ip"] or "", moref),
         )
+        return changes
 
     def get_vm(self, moref: str) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM vms WHERE moref=?", (moref,)).fetchone()
@@ -883,8 +901,13 @@ class Store:
         updated in place; "renamed" and "moved" list them so the pass can say so.
         A move is only reported when both placements are known (a pass without
         placement, or a failed folder read, leaves the folder empty).
+
+        A queued VM that changed since its facts were recorded is "drifted"; one
+        that had passed precheck goes back to pending ("precheck_cleared").
         """
-        summary: Dict[str, Any] = {"added": 0, "updated": 0, "renamed": [], "moved": []}
+        summary: Dict[str, Any] = {"added": 0, "updated": 0, "renamed": [], "moved": [],
+                                   "drifted": 0, "precheck_cleared": 0}
+        cleared: List[Tuple[str, str]] = []
         for vm in vms:
             d = vm.to_dict() if hasattr(vm, "to_dict") else dict(vm)
             nics = d.get("nics", [])
@@ -937,13 +960,28 @@ class Store:
             vm_row = self.conn.execute(
                 "SELECT state, vm_name FROM vms WHERE moref=?", (d["moref"],)).fetchone()
             if vm_row is not None and vm_row["state"] in PROVENANCE_REFRESH_STATES:
-                self._provenance_from_discovery(d["moref"])
+                changes = self._provenance_from_discovery(d["moref"])
                 # Renamed in vCenter: the queue follows, unless it carries a name of
                 # its own (an inventory file may name VMs differently). The importer
                 # targets the moref, and operation names carry a per-batch digest.
                 if renamed_from is not None and vm_row["vm_name"] == renamed_from:
                     self.conn.execute("UPDATE vms SET vm_name=? WHERE moref=?", (d["name"], d["moref"]))
+                if renamed_from is not None:
+                    changes.insert(0, "renamed {} -> {}".format(renamed_from, d["name"]))
+                if changes:
+                    summary["drifted"] += 1
+                    self.log_event("changed in vCenter since it was queued: " + "; ".join(changes),
+                                   "warn", moref=d["moref"])
+                    if vm_row["state"] == S_PRECHECK_PASSED:
+                        cleared.append((d["moref"], "; ".join(changes)))
         self.conn.commit()
+        # A precheck vouches for the VM as it was. One that has since been renamed,
+        # moved, powered off or lost Tools gets checked again before it may import
+        # (a golden image was imported on a three-day-old pass, 2026-10-01).
+        for moref, why in cleared:
+            self.set_vm_state(moref, S_PENDING, stage="discover", precheck_batch="",
+                              message="precheck cleared: {} since it passed".format(why))
+            summary["precheck_cleared"] += 1
         return summary
 
     def remove_discovered(self, morefs: Sequence[str]) -> int:

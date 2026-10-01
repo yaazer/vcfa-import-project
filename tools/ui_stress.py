@@ -439,6 +439,7 @@ const SCENARIOS = {
     await open('execute', 'stage=precheck&waves=2');
     const before = await counts();
     check('the plan shows batches for wave 2', await waitFor(() => document.querySelector('#ex-plan table'), 8000));
+    check('the plan names the VMs in the run', /VMs in this run:/.test(document.querySelector('#ex-plan').textContent));
     click('[data-act="start"]');
     const yes = await waitFor(() => document.querySelector('.modal [data-m="yes"]'));
     check('precheck asks for confirmation', yes);
@@ -469,6 +470,7 @@ const SCENARIOS = {
     click('[data-act="start"]');
     const typed = await waitFor(() => document.querySelector('#modal-type'));
     check('import demands a typed confirmation', typed);
+    check('the confirmation names every VM it will import', /VMs in this run:/.test(document.querySelector('.modal').textContent));
     const go = document.querySelector('.modal [data-m="yes"]');
     check('confirm starts disabled', go.disabled);
     type(typed, 'import');

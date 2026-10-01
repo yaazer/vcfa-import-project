@@ -319,5 +319,7 @@ class Kubectl:
         args = ["delete", resource, name, "-n", namespace]
         if ignore_missing:
             args.append("--ignore-not-found")
-        proc = self.run(args, check=False, timeout=180)
+        # --ignore-not-found already makes "gone" a success; anything else that
+        # fails must raise, or callers record a batch as deleted that is not.
+        proc = self.run(args, timeout=180)
         return proc.stdout.strip()

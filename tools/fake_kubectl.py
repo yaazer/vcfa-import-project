@@ -98,6 +98,46 @@ def blocked_operations(obj: dict, key: str, data: dict) -> list:
             if owners.get((ns, e.get("name")), key) != key]
 
 
+# Every ImportOperation holds a StoragePolicyReservation the size of its VM's
+# disks -- precheck-only ones included -- until its batch is deleted (observed
+# 2026-10-01; the lab VMs were 25 GiB each). A namespace's storage quota is
+# optional state: {"quota_gib": {"ns-a": 100}}; absent means unlimited.
+RESERVATION_GIB = 25
+
+
+def reserved_before(data: dict, key: str) -> int:
+    """GiB the namespace already holds for batches applied before this one.
+
+    Precheck batches hold their reservations for as long as they exist; an
+    import holds them (as reservations, then as the imported VM's volumes)
+    unless it was rolled back. Dict order is apply order.
+    """
+    ns = key.split("/", 1)[0]
+    total = 0
+    for other, obj in data.get("batches", {}).items():
+        if other == key:
+            break
+        if not other.startswith(ns + "/") or obj.get("_rollback_poll") is not None:
+            continue
+        total += RESERVATION_GIB * len((obj.get("spec") or {}).get("operations") or [])
+    return total
+
+
+def over_quota(obj: dict, key: str, data: dict) -> bool:
+    """An import whose reservations do not fit what the namespace has left.
+
+    Observed: the quota webhook denies the reservation, the operator retries it
+    every second, and every child waits for placement -- nothing ever fails.
+    Whether a precheck can be denied the same way is not known; the fake only
+    holds imports back.
+    """
+    quota = (data.get("quota_gib") or {}).get(key.split("/", 1)[0])
+    if quota is None:
+        return False
+    want = RESERVATION_GIB * len((obj.get("spec") or {}).get("operations") or [])
+    return reserved_before(data, key) + want > quota
+
+
 def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = None) -> dict:
     """Synthesise the status the operator would report after `polls` reads."""
     spec = obj.get("spec", {})
@@ -123,6 +163,18 @@ def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = No
             {"type": "ReadyForImport", "status": "False", "reason": "ObjectNotReady",
              "message": msg}],
             "readyCount": 0, "readyOps": [], "_blocked_on": blocked}
+
+    if not precheck and data is not None and key and over_quota(obj, key, data):
+        names = [e.get("name", "") for e in spec.get("operations", [])]
+        busy = "Operations are not ready. Operation Names: " + "; ".join(names)
+        return {"conditions": [
+            {"type": t, "status": "False", "reason": "ObjectNotReady", "message": busy}
+            for t in ("Complete", "ReadyForCommit", "ReadyForImport")],
+            "activeCount": len(names), "activeOps": names,
+            "_ops": [{"name": e.get("name"), "phase": "Placing", "message": "",
+                      "virtualMachineID": (e.get("spec") or {}).get("virtualMachineID", "")}
+                     for e in spec.get("operations", [])],
+            "_precheck": False}
 
     if polls < settle():
         # Still working: every gate False / ObjectNotReady, exactly as observed.
@@ -323,6 +375,12 @@ def child_conditions(phase: str, message: str, precheck: bool = False) -> dict:
                 + [cond(k, reverted) for k in ("RollbackCompleted", "RollbackCustomResourceCompleted",
                                                "RollbackVirtualMachineLocationCompleted",
                                                "RollbackVirtualMachinePropertyCompleted")]}
+    if phase == "Placing":
+        # Observed 2026-10-01 while the namespace was out of storage quota.
+        stuck = cond("VirtualMachineReadyForImport", False, "VirtualMachineRelocateFailure")
+        stuck["message"] = "waiting for placement results from importoperationbatch"
+        return {"conditions": [cond("PrecheckSucceeded", True), cond("NetworkBackingReady", True),
+                               stuck, cond("VirtualMachineSetManagedBySucceeded", True)]}
     return {"conditions": [cond("ReadyForCommit", False), cond("Completed", False)]}
 
 
@@ -563,6 +621,9 @@ def main(argv: list) -> int:
 
     if verb == "delete":
         name = argv[2]
+        if os.environ.get("FAKE_KUBECTL_DELETE_FAILS"):
+            sys.stderr.write('Error from server (InternalError): etcdserver: request timed out\n')
+            return 1
         data["batches"].pop("{}/{}".format(ns, name), None)
         save_state(data)
         print('importoperationbatch.{}/{} deleted'.format(GROUP, name))
