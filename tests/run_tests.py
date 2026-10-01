@@ -4937,7 +4937,189 @@ def t_e2e_portgroups_subnets():
         server.shutdown()
 
 
+# ------------------------------------------------------------------ re-discovery
+class _StubVc:
+    """vm_exists answers per moref: True (there), False (vCenter said 404), None (no answer)."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.asked = []
+
+    def vm_exists(self, moref):
+        self.asked.append(moref)
+        return self.answers.get(moref, True)
+
+
+def _dvms(count, **kw):
+    from vcfaimport.vcenter import DiscoveredVm
+    return [DiscoveredVm(moref="vm-{}".format(i), name="vm{}".format(i), folder="Prod",
+                         datacenter="DC1", **kw) for i in range(1, count + 1)]
+
+
+@test("re-discovery removes VMs vCenter no longer has, and touches nothing in flight or committed")
+def t_rediscovery_removed():
+    from vcfaimport import service
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = _dvms(7, power_state="POWERED_ON")
+        store.upsert_discovered(first)
+        store.set_meta("vcenter", "vc.lab")
+        store.set_selected(["vm-1", "vm-2"], True)
+        _record(store, "vm-2", "vm2")                                       # queued, still with vCenter
+        _record(store, "vm-3", "vm3")
+        store.set_vm_state("vm-3", vst.S_COMMITTED)
+        _record(store, "vm-4", "vm4")
+        store.set_vm_state("vm-4", vst.S_IMPORTING)
+        second = first[5:]                                                  # vm-1..vm-5 not returned
+        vc = _StubVc({"vm-1": False, "vm-2": False, "vm-3": False, "vm-4": False, "vm-5": None})
+        summary = store.upsert_discovered(second)
+        rec = service.reconcile_discovery(store, vc, second, "https://VC.lab/")   # same vCenter, other spelling
+        eq(sorted(vc.asked), ["vm-1", "vm-2", "vm-3", "vm-4", "vm-5"])
+        eq(sorted(e["moref"] for e in rec["removed"]), ["vm-1", "vm-2"])
+        eq([e["moref"] for e in rec["skipped"]], ["vm-2"])
+        eq(store.get_vm("vm-2")["state"], vst.S_SKIPPED)
+        assert "no longer in vCenter" in store.get_vm("vm-2")["message"]
+        last = store.conn.execute("SELECT to_state FROM transitions WHERE moref='vm-2' ORDER BY id DESC").fetchone()
+        eq(last["to_state"], vst.S_SKIPPED, "the skip is a recorded transition")
+        eq(store.get_vm("vm-3")["state"], vst.S_COMMITTED, "a committed import is never touched")
+        eq(store.get_vm("vm-4")["state"], vst.S_IMPORTING, "an import in flight is never touched")
+        eq(sorted(e["moref"] for e in rec["untouched"]), ["vm-3", "vm-4"])
+        eq(rec["unconfirmed"], 1, "no answer is not 'gone'")
+        eq({r["moref"] for r in store.query_discovered()}, {"vm-3", "vm-4", "vm-5", "vm-6", "vm-7"})
+        eq(store.discovered_counts()["selected"], 0, "removed VMs leave the selection")
+        lines = service.discovery_report(summary, rec)
+        assert any("removed from discovery" in x for x in lines), lines
+        assert any("could not be confirmed" in x for x in lines), lines
+        store.close()
+
+
+@test("re-discovery checks nothing it cannot judge: another vCenter, filtered-out VMs, a mass disappearance")
+def t_rediscovery_guards():
+    from vcfaimport import service
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        first = _dvms(30)
+        for i, vm in enumerate(first):
+            vm.power_state = "POWERED_ON" if i % 3 else "POWERED_OFF"
+        store.upsert_discovered(first)
+        store.set_meta("vcenter", "vc-a.lab")
+        vc = _StubVc({})
+        rec = service.reconcile_discovery(store, vc, [], "vc-b.lab")
+        eq(vc.asked, [], "a pass against another vCenter checks nothing")
+        assert "not checked" in rec["note"], rec["note"]
+        on = [v for v in first if v.power_state == "POWERED_ON"]
+        vc = _StubVc({})
+        rec = service.reconcile_discovery(store, vc, on, "vc-a.lab", power_state="POWERED_ON")
+        eq(vc.asked, [], "VMs a powered-on pass left out are not looked up")
+        eq(rec["outside_filter"], len(first) - len(on))
+        vc = _StubVc({v.moref: False for v in first[:25]})
+        rec = service.reconcile_discovery(store, vc, first[25:], "vc-a.lab")
+        eq(rec["held"], 25)
+        eq(rec["removed"], [])
+        eq(len(store.query_discovered()), 30, "more than half gone: nothing removed")
+        rec = service.reconcile_discovery(store, vc, first[25:], "vc-a.lab", allow_mass_removal=True)
+        eq(len(rec["removed"]), 25)
+        eq(len(store.query_discovered()), 5)
+        store.close()
+
+
+@test("re-discovery reports renamed and moved VMs, and the queue follows a rename")
+def t_rediscovery_renamed_moved():
+    from vcfaimport.vcenter import DiscoveredVm as D
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        store.upsert_discovered([D(moref="vm-1", name="web-01", folder="Prod/Web", datacenter="DC1"),
+                                 D(moref="vm-2", name="db-01", folder="Prod/DB", datacenter="DC1"),
+                                 D(moref="vm-3", name="app-01", folder="", datacenter="DC1")])
+        _record(store, "vm-1", "web-01")                     # the queue uses the vCenter name
+        _record(store, "vm-2", "orders-db")                  # the queue has a name of its own
+        s = store.upsert_discovered([D(moref="vm-1", name="web-01-old", folder="Legacy", datacenter="DC1"),
+                                     D(moref="vm-2", name="db-02", folder="Prod/DB", datacenter="DC1"),
+                                     D(moref="vm-3", name="app-01", folder="Prod/App", datacenter="DC1")])
+        eq([(r["from"], r["to"]) for r in s["renamed"]], [("web-01", "web-01-old"), ("db-01", "db-02")])
+        eq([(m["from"], m["to"]) for m in s["moved"]], [("DC1/Prod/Web", "DC1/Legacy")],
+           "a move out of an unknown placement is not reported")
+        eq(store.get_vm("vm-1")["vm_name"], "web-01-old")
+        eq(store.get_vm("vm-2")["vm_name"], "orders-db", "a name from the inventory file is kept")
+        store.close()
+
+
+@test("e2e: re-discovery removes VMs deleted from vCenter and reports renames and moves")
+def t_e2e_rediscover_changes():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+
+    server, port = fake_vcenter.serve(count=20)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy")
+            env.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                       VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            _seed_cluster(tmp, [], [])
+            cfg = _write_config(tmp)
+            _run_cli(["-c", cfg, "discover"], env, tmp)
+            inv = fake_vcenter.Handler.inventory
+            ids = sorted(inv["vms"])
+            gone, renamed = ids[0], ids[1]
+            del inv["vms"][gone]
+            for members in list(inv["folders"].values()) + list(inv["clusters"].values()):
+                if gone in members:
+                    members.remove(gone)
+            old = inv["vms"][renamed]["name"]
+            inv["vms"][renamed]["name"] = old + "-renamed"
+            moved = next(m for m in ids[2:] if m not in inv["folders"]["group-v1"])
+            src = next(f for f, members in inv["folders"].items() if moved in members)
+            dst = "group-v20" if src != "group-v20" else "group-v30"
+            inv["folders"][src].remove(moved)
+            inv["folders"][dst].append(moved)
+
+            out = _run_cli(["-c", cfg, "discover"], env, tmp).stdout
+            assert "1 VM(s) no longer in vCenter, removed from discovery" in out, out
+            assert "{} -> {}-renamed".format(old, old) in out, out
+            assert "1 VM(s) moved to another folder" in out, out
+            rows = json.loads(_run_cli(["-c", cfg, "browse", "--json"], env, tmp).stdout)
+            eq(len(rows), 19)
+            assert gone not in {r["moref"] for r in rows}
+    finally:
+        server.shutdown()
+
+
+@test("e2e web: re-discovery removes a VM deleted from vCenter and says so")
+def t_e2e_web_rediscover():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    server, port = fake_vcenter.serve(count=12)
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ.update(_e2e_env(tmp, "happy"))
+            os.environ.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                              VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            _seed_cluster(tmp, [], [])
+            c = _Console(tmp, Config.load(_write_config(tmp)))
+            try:
+                _run_job(c, "discover", {}, "succeeded")
+                inv = fake_vcenter.Handler.inventory
+                gone = sorted(inv["vms"])[0]
+                del inv["vms"][gone]
+                snap = _run_job(c, "discover", {}, "succeeded")
+                eq(snap["result"]["discovered"], 11)
+                eq(snap["result"]["removed"], 1)
+                assert any("no longer in vCenter" in line[2] for line in snap["log"]), snap["log"]
+                vms = c.ok("GET", "/api/discovered")["vms"]
+                eq(len(vms), 11)
+                assert gone not in {v["moref"] for v in vms}
+            finally:
+                c.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+
+
 UNIT = [
+    t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
     t_app_icon,
     t_vcenter_portgroups,
     t_stage_ns_conflicts,
@@ -4987,6 +5169,7 @@ E2E = [
     t_e2e_circuit_breaker, t_e2e_commit_gate, t_e2e_commit_already_done, t_e2e_dry_run, t_e2e_resume,
     t_e2e_report, t_e2e_server_dry_run,
     t_e2e_discover, t_e2e_folders, t_e2e_folder_execution, t_e2e_discover_auth, t_e2e_rediscover,
+    t_e2e_rediscover_changes, t_e2e_web_rediscover,
     t_e2e_tracker, t_e2e_tracker_retry,
     t_e2e_rollback, t_e2e_run_rollback_failed, t_e2e_rollback_nowait, t_e2e_rollback_held,
     t_e2e_web_campaign, t_e2e_web_stop,

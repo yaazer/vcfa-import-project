@@ -876,9 +876,15 @@ class Store:
         return list(self.conn.execute(sql, params).fetchall())
 
     # ------------------------------------------------------ discovered
-    def upsert_discovered(self, vms: Sequence[Any]) -> Dict[str, int]:
-        """Merge a vCenter discovery pass, preserving any existing selection."""
-        summary = {"added": 0, "updated": 0}
+    def upsert_discovered(self, vms: Sequence[Any]) -> Dict[str, Any]:
+        """Merge a vCenter discovery pass, preserving any existing selection.
+
+        A moref survives a rename and a move between folders, so those VMs are
+        updated in place; "renamed" and "moved" list them so the pass can say so.
+        A move is only reported when both placements are known (a pass without
+        placement, or a failed folder read, leaves the folder empty).
+        """
+        summary: Dict[str, Any] = {"added": 0, "updated": 0, "renamed": [], "moved": []}
         for vm in vms:
             d = vm.to_dict() if hasattr(vm, "to_dict") else dict(vm)
             nics = d.get("nics", [])
@@ -887,8 +893,19 @@ class Store:
             extra = (json.dumps(d.get("tags") or []), json.dumps(d.get("facts") or {}),
                      d.get("ip") or "")
             existing = self.conn.execute(
-                "SELECT moref FROM discovered WHERE moref=?", (d["moref"],)).fetchone()
+                "SELECT moref, name, folder, datacenter FROM discovered WHERE moref=?",
+                (d["moref"],)).fetchone()
+            renamed_from = None
             if existing:
+                new_name = d.get("name", "")
+                if existing["name"] and new_name and existing["name"] != new_name:
+                    renamed_from = existing["name"]
+                    summary["renamed"].append({"moref": d["moref"], "from": existing["name"], "to": new_name})
+                old_place = "/".join(x for x in (existing["datacenter"], existing["folder"]) if x)
+                new_place = "/".join(x for x in (d.get("datacenter", ""), d.get("folder", "")) if x)
+                if existing["folder"] and d.get("folder") and old_place != new_place:
+                    summary["moved"].append({"moref": d["moref"], "name": new_name or existing["name"],
+                                             "from": old_place, "to": new_place})
                 self.conn.execute(
                     "UPDATE discovered SET name=?, power_state=?, cpu_count=?, memory_mb=?,"
                     " folder=?, datacenter=?, cluster=?, host=?, guest_os=?, tools_status=?,"
@@ -918,11 +935,24 @@ class Store:
             # can change IP between discovery passes); once it has moved, its
             # record keeps the facts from when it moved.
             vm_row = self.conn.execute(
-                "SELECT state FROM vms WHERE moref=?", (d["moref"],)).fetchone()
+                "SELECT state, vm_name FROM vms WHERE moref=?", (d["moref"],)).fetchone()
             if vm_row is not None and vm_row["state"] in PROVENANCE_REFRESH_STATES:
                 self._provenance_from_discovery(d["moref"])
+                # Renamed in vCenter: the queue follows, unless it carries a name of
+                # its own (an inventory file may name VMs differently). The importer
+                # targets the moref, and operation names carry a per-batch digest.
+                if renamed_from is not None and vm_row["vm_name"] == renamed_from:
+                    self.conn.execute("UPDATE vms SET vm_name=? WHERE moref=?", (d["name"], d["moref"]))
         self.conn.commit()
         return summary
+
+    def remove_discovered(self, morefs: Sequence[str]) -> int:
+        """Drop VMs from the inventory cache (and so from any selection)."""
+        n = 0
+        for moref in morefs:
+            n += self.conn.execute("DELETE FROM discovered WHERE moref=?", (moref,)).rowcount
+        self.conn.commit()
+        return n
 
     def query_discovered(
         self,

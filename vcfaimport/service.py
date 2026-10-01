@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -693,6 +694,121 @@ def record_discovery(store: st.Store, server: str, extras: Optional[Dict[str, An
     """What a discovery pass learned besides the VMs: vCenter's network list."""
     if extras and extras.get("networks") is not None:
         store.set_meta("vc_networks", {"server": server, "networks": extras["networks"]})
+
+
+# ------------------------------------------------------------ rediscovery
+# A pass that would remove more than half of what was discovered (and at least this many
+# VMs) is held: an account that lost sight of part of the inventory is far more likely
+# than an estate halved overnight. allow_mass_removal applies it anyway.
+MASS_REMOVAL_MIN = 20
+
+
+def _server_key(server: str) -> str:
+    s = (server or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    return s.rstrip("/")
+
+
+def reconcile_discovery(store: st.Store, client: Any, vms: Sequence[Any], server: str, *,
+                        power_state: Optional[str] = None, concurrency: int = 12,
+                        allow_mass_removal: bool = False, log: Optional[Log] = None) -> Dict[str, Any]:
+    """After a discovery pass: the VMs discovered before that this pass did not return.
+
+    Each is looked up in vCenter by moref; only a 404 counts as gone, and no answer
+    keeps the VM. A gone VM leaves the inventory cache. If it was queued and is still
+    with vCenter (not yet handed to the importer, or back), it becomes skipped, with a
+    transition saying why. VMs in flight or committed are never touched, only reported.
+
+    Not checked: a pass against a different vCenter than the last one (a moref is only
+    unique within one vCenter), and VMs a powered-on-only pass filtered out. Call it
+    before meta "vcenter" is set to this server.
+    """
+    say = log or (lambda msg: None)
+    out: Dict[str, Any] = {"checked": 0, "removed": [], "skipped": [], "untouched": [],
+                           "unconfirmed": 0, "outside_filter": 0, "held": 0, "note": ""}
+    previous = str(store.get_meta("vcenter") or "")
+    if previous and _server_key(previous) != _server_key(server):
+        out["note"] = ("this pass read {} but the inventory came from {}: previously discovered "
+                       "VMs were not checked for removal".format(server, previous))
+        return out
+    seen = {(v.moref if hasattr(v, "moref") else v["moref"]) for v in vms}
+    known = store.query_discovered()
+    missing = [r for r in known if r["moref"] not in seen]
+    if power_state:
+        kept_out = {r["moref"] for r in missing if (r["power_state"] or "").upper() != power_state.upper()}
+        out["outside_filter"] = len(kept_out)
+        missing = [r for r in missing if r["moref"] not in kept_out]
+    if not missing:
+        return out
+    say("checking {} previously discovered VM(s) this pass did not return...".format(len(missing)))
+    workers = max(1, min(int(concurrency or 1), 32))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        answers = list(pool.map(lambda r: client.vm_exists(r["moref"]), missing))
+    out["checked"] = len(missing)
+    out["unconfirmed"] = sum(1 for a in answers if a is None)
+    gone = [r for r, a in zip(missing, answers) if a is False]
+    if gone and not allow_mass_removal and len(gone) >= MASS_REMOVAL_MIN and len(gone) * 2 > len(known):
+        out["held"] = len(gone)
+        out["note"] = ("vCenter reports {} of the {} discovered VMs gone, so nothing was removed: that usually "
+                       "means the account no longer sees part of the inventory. Check its permissions, or "
+                       "discover again allowing mass removal if they really are gone.".format(len(gone), len(known)))
+        store.log_event(out["note"], "warn")
+        return out
+    why = "no longer in vCenter {} (deleted, unregistered or moved to another vCenter)".format(server)
+    for r in gone:
+        entry = {"moref": r["moref"], "name": r["name"], "folder": r["folder"]}
+        vm = store.get_vm(r["moref"])
+        if vm is not None and vm["state"] not in st.PROVENANCE_REFRESH_STATES:
+            # In flight or committed: what the importer did is not undone by an inventory pass.
+            entry["state"] = vm["state"]
+            out["untouched"].append(entry)
+            store.log_event("{} ({}) is {} but is {}: left as is".format(r["name"], r["moref"], why, vm["state"]),
+                            "warn", moref=r["moref"])
+            continue
+        if vm is not None and vm["state"] != st.S_SKIPPED:
+            entry["was"] = vm["state"]
+            store.set_vm_state(r["moref"], st.S_SKIPPED, message=why)
+            out["skipped"].append(entry)
+        store.remove_discovered([r["moref"]])
+        store.log_event("{} ({}) is {}: removed from discovery{}".format(
+            r["name"], r["moref"], why, "; its queued record is now skipped" if "was" in entry else ""),
+            "warn", moref=r["moref"])
+        out["removed"].append(entry)
+    return out
+
+
+def discovery_report(summary: Dict[str, Any], rec: Dict[str, Any], limit: int = 20) -> List[str]:
+    """The lines a discovery pass ends with, the same for the CLI and the console log."""
+    lines: List[str] = []
+
+    def listing(title: str, entries: List[Dict[str, Any]], fmt: Callable[[Dict[str, Any]], str]) -> None:
+        if not entries:
+            return
+        lines.append("  " + title)
+        lines.extend("    - " + fmt(e) for e in entries[:limit])
+        if len(entries) > limit:
+            lines.append("    ... and {} more".format(len(entries) - limit))
+
+    listing("{} VM(s) renamed in vCenter:".format(len(summary.get("renamed") or [])), summary.get("renamed") or [],
+            lambda e: "{} -> {} ({})".format(e["from"], e["to"], e["moref"]))
+    listing("{} VM(s) moved to another folder:".format(len(summary.get("moved") or [])), summary.get("moved") or [],
+            lambda e: "{}: {} -> {}".format(e["name"], e["from"] or "(root)", e["to"] or "(root)"))
+    listing("{} VM(s) no longer in vCenter, removed from discovery:".format(len(rec.get("removed") or [])),
+            rec.get("removed") or [],
+            lambda e: "{} ({}){}".format(e["name"], e["moref"], " - was queued ({}), now skipped".format(e["was"]) if e.get("was") else ""))
+    listing("{} VM(s) no longer in vCenter but in flight or committed, left as is:".format(len(rec.get("untouched") or [])),
+            rec.get("untouched") or [], lambda e: "{} ({}) - {}".format(e["name"], e["moref"], e["state"]))
+    if rec.get("unconfirmed"):
+        lines.append("  {} VM(s) not returned by this pass could not be confirmed (vCenter did not answer for them): "
+                     "kept".format(rec["unconfirmed"]))
+    if rec.get("outside_filter"):
+        lines.append("  {} VM(s) outside this pass's power filter were not checked; a full discovery checks "
+                     "them".format(rec["outside_filter"]))
+    if rec.get("note"):
+        lines.append("  " + rec["note"])
+    return lines
 
 
 def vcenter_portgroups(store: st.Store) -> Dict[str, Any]:

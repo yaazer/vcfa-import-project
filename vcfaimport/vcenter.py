@@ -30,7 +30,9 @@ ENV_PASSWORD = "VCFA_VC_PASSWORD"
 
 
 class VCenterError(Exception):
-    pass
+    def __init__(self, message: str = "", status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status    # the HTTP status vCenter answered with; None if it never answered
 
 
 class VCenterAuthError(VCenterError):
@@ -231,8 +233,8 @@ class VCenterClient:
                 pass
             if exc.code in (401, 403):
                 raise VCenterAuthError(
-                    "vCenter rejected the credentials ({}): {}".format(exc.code, detail)) from exc
-            raise VCenterError("{} {} -> HTTP {}: {}".format(method, path, exc.code, detail)) from exc
+                    "vCenter rejected the credentials ({}): {}".format(exc.code, detail), status=exc.code) from exc
+            raise VCenterError("{} {} -> HTTP {}: {}".format(method, path, exc.code, detail), status=exc.code) from exc
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
             hint = ""
@@ -398,6 +400,16 @@ class VCenterClient:
             return self.get("/vcenter/vm/{}".format(urllib.parse.quote(moref)))
         except VCenterError:
             return None
+
+    def vm_exists(self, moref: str) -> Optional[bool]:
+        """True if vCenter knows this VM, False only when it answers 404 for it,
+        None when it could not say (unreachable, timed out, refused): no answer
+        is never read as "gone"."""
+        try:
+            self.get("/vcenter/vm/{}".format(urllib.parse.quote(moref)))
+            return True
+        except VCenterError as exc:
+            return False if exc.status == 404 else None
 
     def guest_ip(self, moref: str) -> str:
         """The guest's primary IP, as VMware Tools reports it ("" if none)."""

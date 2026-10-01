@@ -750,9 +750,10 @@ class WebApp:
             "concurrency": _int(body.get("concurrency"), default=12, minimum=1),
         }
         timeout = _int(body.get("timeout"), default=60, minimum=5)
+        allow_mass_removal = bool(body.get("allow_mass_removal"))
         params = {"server": server, "user": user, "insecure": insecure,
                   "powered_on": bool(body.get("powered_on")), "no_tools": bool(body.get("no_tools")),
-                  "concurrency": opts["concurrency"]}
+                  "concurrency": opts["concurrency"], "allow_mass_removal": allow_mass_removal}
 
         def run(job: Job) -> Dict[str, Any]:
             if insecure:
@@ -764,17 +765,23 @@ class WebApp:
                 extras: Dict[str, Any] = {}
                 vms = discover(client, progress=lambda d, t: job.set_progress(
                     d, t, "VM details read"), log=job.log, extras=extras, **opts)
+                with self._job_workspace(job) as ws:
+                    summary = ws.store.upsert_discovered(vms)
+                    # before meta "vcenter" moves to this server: it tells which vCenter the cache came from
+                    rec = service.reconcile_discovery(
+                        ws.store, client, vms, server, power_state=opts["power_state"],
+                        concurrency=opts["concurrency"], allow_mass_removal=allow_mass_removal, log=job.log)
+                    service.record_discovery(ws.store, server, extras)
+                    ws.store.set_meta("vcenter", server)
+                    ws.store.set_meta("discovered_at", _local_now())
+                    counts = ws.store.discovered_counts()
             finally:
                 client.close()
-            with self._job_workspace(job) as ws:
-                summary = ws.store.upsert_discovered(vms)
-                service.record_discovery(ws.store, server, extras)
-                ws.store.set_meta("vcenter", server)
-                ws.store.set_meta("discovered_at", _local_now())
-                counts = ws.store.discovered_counts()
             job.log("")
             job.log("discovered {} VM(s) from {} (added {}, refreshed {})".format(
                 len(vms), server, summary["added"], summary["updated"]))
+            for line in service.discovery_report(summary, rec):
+                job.log(line)
             no_nics = sum(1 for v in vms if not v.nics)
             stale = sum(1 for v in vms if opts["with_tools"]
                         and "running" not in (v.tools_status or "").lower())
@@ -784,7 +791,11 @@ class WebApp:
                 job.log("  {} VM(s) are not running VM Tools (likely precheck failures)".format(stale))
             return {"discovered": len(vms), "added": summary["added"],
                     "updated": summary["updated"], "total": counts["total"],
-                    "selected": counts["selected"], "no_nics": no_nics, "tools_not_running": stale}
+                    "selected": counts["selected"], "no_nics": no_nics, "tools_not_running": stale,
+                    "renamed": len(summary["renamed"]), "moved": len(summary["moved"]),
+                    "removed": len(rec["removed"]), "queue_skipped": len(rec["skipped"]),
+                    "untouched": len(rec["untouched"]), "unconfirmed": rec["unconfirmed"],
+                    "held": rec["held"], "status": WARNING if rec["held"] else None}
 
         return self._start("discover", "Discover {}".format(server), params, run)
 

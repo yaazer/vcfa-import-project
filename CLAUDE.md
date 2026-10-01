@@ -32,6 +32,10 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   busy; console: 409). Two runs on one state.db were seen applying duplicate batches.
 - kubectl probes (`exists`, `can_i`, `api_resources`) return `None` / raise when the API
   server never answered. Never turn a timeout into "missing" or "denied".
+- **Re-discovery removes a VM only when vCenter answers 404 for its moref** (`VCenterClient.vm_exists`);
+  no answer keeps it. A queued VM still with vCenter becomes skipped (a transition); in-flight and
+  committed VMs are never touched. Nothing is checked across vCenters or outside a pass's power filter,
+  and a pass that would remove over half the cache is held (`service.reconcile_discovery`).
 - Map rows reach the parsers from files *and* from the browser: validate shape, never
   assume a list of dicts. Report bad input as `SelectionError` (400), never a 500.
 - UI colours are tokens (`app.css` defaults = Aurora; `fx.js` regenerates them per
