@@ -24,6 +24,7 @@
         select: '<rect x="3" y="3.5" width="18" height="13.5" rx="1"/><path d="M8 21h8M12 17v4"/><path d="M6.8 8.2l1.7 4 1.7-4M12.6 12.2V8.2l1.9 2.4 1.9-2.4v4"/>',
         stage: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.8 3 2.8 15 0 18M12 3c-2.8 3-2.8 15 0 18"/>',
         waves: '<rect x="3.5" y="4" width="4.5" height="16" rx=".6"/><rect x="9.75" y="4" width="4.5" height="11" rx=".6"/><rect x="16" y="4" width="4.5" height="7" rx=".6"/>',
+        edit: '<path d="M4 20h4.2L19.4 8.8a2 2 0 000-2.8l-1.4-1.4a2 2 0 00-2.8 0L4 15.8z"/><path d="M13.6 6.2l4.2 4.2"/>',
         execute: '<circle cx="12" cy="12" r="9"/><path d="M10 8.3v7.4l6-3.7z"/>',
         queue: '<path d="M9.5 6h11M9.5 12h11M9.5 18h11"/><path d="M3.5 6l1.3 1.3L7.2 5M3.5 12l1.3 1.3L7.2 11M3.5 18l1.3 1.3L7.2 17"/>',
         batches: '<ellipse cx="12" cy="5.5" rx="7.5" ry="2.5"/><path d="M4.5 5.5v13c0 1.4 3.4 2.5 7.5 2.5s7.5-1.1 7.5-2.5v-13"/><path d="M4.5 12c0 1.4 3.4 2.5 7.5 2.5s7.5-1.1 7.5-2.5"/>',

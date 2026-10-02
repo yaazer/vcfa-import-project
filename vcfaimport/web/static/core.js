@@ -59,6 +59,7 @@ function mount(el, content) {
 // ----------------------------------------------------------------- icons
 const ICONS = {
   overview: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  edit: '<path d="M4 20h4L19 9a2.1 2.1 0 00-3-3L5 17z"/><path d="M14 7l3 3"/>',
   discover: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="M12 12l6-6"/>',
   select: '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 12l3 3 5-6"/>',
   stage: '<path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2-6-2z"/><path d="M9 4v14M15 6v14"/>',
@@ -514,6 +515,26 @@ async function doSkip(morefs, unskip) {
     const r = await POST('/api/vms/skip', { morefs, unskip: !!unskip });
     toast((unskip ? 'Unskipped ' : 'Skipped ') + plural(r.changed, 'VM'), r.notes.slice(0, 3).join('; '), r.notes.length ? 'warn' : 'ok');
   } catch (e) { fail(e); }
+}
+// Wave names ride along with every pulse, so any page labels a wave the way the team named it.
+function waveName(w) { return ((S.pulse && S.pulse.wave_names) || {})[w] || ''; }
+function waveLabel(w) { const nm = waveName(w); return 'Wave ' + w + (nm ? ' · ' + nm : ''); }
+async function doEditWave(w, cur, suggested) {
+  const vals = await modal({
+    title: 'Describe wave ' + w, ic: 'waves', confirm: 'Save',
+    body: html`<label class="field"><span>Name ${tip('wave_name')}</span>
+        <input class="input" data-field="name" maxlength="60" value="${cur.name || ''}" placeholder="${suggested ? 'e.g. ' + suggested : 'e.g. the tenant this wave moves'}"></label>
+      ${suggested && !cur.name ? html`<div class="tiny muted mt-s">Every VM in this wave comes from the top-level folder <b>${suggested}</b>.</div>` : ''}
+      <label class="field mt"><span>Notes</span>
+        <textarea class="input" data-field="notes" rows="6" maxlength="2000" placeholder="Contacts, change ticket, what to watch for…">${cur.notes || ''}</textarea></label>`,
+  });
+  if (!vals || vals === true) return false;
+  try {
+    const r = await POST('/api/waves/info', { wave: w, name: vals.name, notes: vals.notes });
+    if (S.pulse) { S.pulse.wave_names = Object.assign({}, S.pulse.wave_names); if (r.name) S.pulse.wave_names[w] = r.name; else delete S.pulse.wave_names[w]; }
+    toast(waveLabel(w) + ' saved', r.notes ? 'Notes kept with the wave; they move with it if the waves are reordered.' : '', 'ok');
+    return true;
+  } catch (e) { fail(e); return false; }
 }
 async function doMoveWave(morefs, current) {
   const wave = await askWave(morefs.length, current);

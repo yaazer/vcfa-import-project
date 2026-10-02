@@ -26,6 +26,9 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - Web console: no external assets (no CDN, no web fonts; the jump box may be air-gapped),
   every `/api` call needs the `X-VCFA-Token` header, and cluster-changing endpoints
   require `"confirm": true` on the server side too. Only one job runs at a time.
+- A wave's **name and notes** (`wave_info`, often the tenant it moves) belong to its VMs, not its
+  number: `swap_waves` moves them along. Setting them is an event (`Store.set_wave_info`), and
+  every "Wave N" label in the UI goes through `waveLabel()` (names arrive with `/api/pulse`).
 - A wave is not a state: `Store.set_vm_wave` / `swap_waves` log an event, not a
   transition, and refuse VMs already in a batch (`WAVE_LOCKED_STATES`).
 - **Anything that changes the cluster takes `service.WorkspaceLock`** (CLI: exit 7 when

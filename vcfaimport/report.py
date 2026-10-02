@@ -83,6 +83,7 @@ def bar(done: int, total: int, width: int = 32) -> str:
 
 def _wave_rows(store: st.Store) -> List[List[Any]]:
     rows: List[List[Any]] = []
+    names = store.wave_info()
     for wave in store.waves():
         counts = store.counts(wave=wave)
         total = sum(counts.values())
@@ -90,7 +91,7 @@ def _wave_rows(store: st.Store) -> List[List[Any]]:
         failed = counts.get(st.S_FAILED, 0) + counts.get(st.S_PRECHECK_FAILED, 0)
         active = counts.get(st.S_IMPORTING, 0) + counts.get(st.S_PRECHECK_RUNNING, 0)
         rows.append([
-            wave, total, done, failed, active,
+            wave, (names.get(wave) or {}).get("name", ""), total, done, failed, active,
             counts.get(st.S_AWAITING_COMMIT, 0),
             counts.get(st.S_PRECHECK_PASSED, 0),
             counts.get(st.S_PENDING, 0),
@@ -130,7 +131,7 @@ def render_status(store: st.Store, cfg: Config, failures: int = 10) -> str:
     out.append("")
     out.append("  By wave")
     out.append(table(
-        ["wave", "total", "done", "failed", "active", "hold", "ready", "pending", "progress"],
+        ["wave", "name", "total", "done", "failed", "active", "hold", "ready", "pending", "progress"],
         _wave_rows(store), indent="  ",
     ))
     out.append("")
@@ -213,7 +214,7 @@ def _duration(start: str, end: str) -> str:
 
 # ----------------------------------------------------------------------- csv
 TRACKER_COLUMNS = [
-    "vm_name", "moref", "namespace", "target_resource", "wave", "group", "mode",
+    "vm_name", "moref", "namespace", "target_resource", "wave", "wave_name", "group", "mode",
     "state", "attempts", "subnets",
     "src_vcenter", "src_cluster", "src_folder", "src_host", "src_networks",
     "src_power", "src_cpu", "src_memory_mb", "src_tools",
@@ -229,6 +230,7 @@ def write_csv(store: st.Store, path: str) -> int:
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
     rows = store.query_vms()
+    names = store.wave_info()
     with p.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(TRACKER_COLUMNS)
@@ -239,7 +241,8 @@ def write_csv(store: st.Store, path: str) -> int:
             )
             writer.writerow([
                 v["vm_name"], v["moref"], v["namespace"], v["target_resource"],
-                v["wave"], v["grp"], v["mode"], v["state"], v["attempts"], subnets,
+                v["wave"], (names.get(v["wave"]) or {}).get("name", ""),
+                v["grp"], v["mode"], v["state"], v["attempts"], subnets,
                 v["src_vcenter"], v["src_cluster"], v["src_folder"], v["src_host"],
                 v["src_networks"], v["src_power"], v["src_cpu"], v["src_memory_mb"],
                 v["src_tools"],
@@ -399,9 +402,9 @@ def write_html(store: st.Store, cfg: Config, path: str) -> str:
 
     wave_rows = []
     for row in _wave_rows(store):
-        wave, wtotal, wdone, wfailed = row[0], row[1], row[2], row[3]
+        wave, wname, wtotal, wdone, wfailed = row[0], row[1], row[2], row[3], row[4]
         wave_rows.append([
-            "wave {}".format(wave), wtotal, wdone, wfailed, row[4], row[5], row[7],
+            "wave {}{}".format(wave, " · " + wname if wname else ""), wtotal, wdone, wfailed, row[5], row[6], row[8],
             _Cell('<td>{}</td>'.format(_pbar(wdone, wfailed, wtotal))),
         ])
 
@@ -430,11 +433,13 @@ def write_html(store: st.Store, cfg: Config, path: str) -> str:
     # The tracker proper: what actually moved, from where, to where, how long.
     moved = [v for v in store.query_vms(states=[st.S_COMMITTED],
                                         order="committed_at DESC")]
+    wave_names = {w: i["name"] for w, i in store.wave_info().items() if i["name"]}
     moved_rows = [
         [v["vm_name"], v["moref"],
          "{}{}".format(v["src_cluster"] or "?",
                        " / " + v["src_folder"] if v["src_folder"] else ""),
          v["src_networks"] or "",
+         "{}{}".format(v["wave"], " · " + wave_names[v["wave"]] if wave_names.get(v["wave"]) else ""),
          v["namespace"], v["target_resource"] or "-",
          v["committed_at"] or "",
          _duration(v["import_started_at"], v["committed_at"])]
@@ -477,7 +482,7 @@ with where it came from and how long it took. Full per-VM history is in
         batches=_rows_html(["batch", "namespace", "stage", "state", "vms", "applied", "note"],
                            batch_rows),
         timing=timing,
-        moved=_rows_html(["vm", "moref", "source cluster / folder", "source networks",
+        moved=_rows_html(["vm", "moref", "source cluster / folder", "source networks", "wave",
                           "namespace", "target resource", "committed", "took"], moved_rows),
         fails=_rows_html(["vm", "moref", "namespace", "state", "batch", "message"], bad_rows),
     )

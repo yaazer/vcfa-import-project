@@ -183,7 +183,7 @@ VIEWS.schedule = view({
           <div class="row wrap" style="gap:14px">
             <div class="seg">${['precheck', 'import'].map((k) => html`<button class="${f.stage === k ? 'on' : ''}" data-act="fStage" data-k="${k}">${k === 'import' ? 'Import' : 'Precheck'}</button>`)}</div>
             <div class="chips"><span class="chip ${f.waves.size ? '' : 'on'}" data-act="fWave" data-w="all">All waves</span>
-              ${v.o.waves.map((w) => html`<span class="chip ${f.waves.has(w.wave) ? 'on' : ''}" data-act="fWave" data-w="${w.wave}">Wave ${w.wave}</span>`)}</div>
+              ${v.o.waves.map((w) => html`<span class="chip ${f.waves.has(w.wave) ? 'on' : ''}" data-act="fWave" data-w="${w.wave}">${waveLabel(w.wave)}</span>`)}</div>
           </div>
           <div class="form-grid">
             <label class="field"><span>Opens</span><input class="input" type="datetime-local" id="w-start" data-input="fTime" data-k="start" value="${f.start}"></label>

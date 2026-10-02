@@ -346,7 +346,7 @@ const FX = (() => {
   function streamModel(d) {
     let by = P.streamBy || 'stage';
     let groups = [];
-    if (by === 'wave') groups = (d.waves || []).map((w) => ({ id: 'w' + w.wave, label: 'Wave ' + w.wave, counts: w.counts }));
+    if (by === 'wave') groups = (d.waves || []).map((w) => ({ id: 'w' + w.wave, label: 'Wave ' + w.wave + (w.name ? ' · ' + w.name : ''), counts: w.counts }));
     else if (by === 'namespace') groups = (d.namespaces || []).map((x) => ({ id: 'n:' + x.namespace, label: x.namespace, counts: x.counts }));
     else if (by === 'app' && d.apps && d.apps.length) {
       groups = d.apps.map((a) => ({ id: 'a:' + a.app, label: a.app, counts: a.counts }));

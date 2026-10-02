@@ -646,7 +646,9 @@ def _execute(args, stage: str) -> int:
     log("about to {} {} VM(s){}:".format(
         "precheck" if stage == STAGE_PRECHECK else "IMPORT", total,
         " in " + describe_scope(scope, exact) if scope else ""))
-    log(report.table(["wave", "vms"], rows, indent="  "))
+    names = store.wave_info()
+    log(report.table(["wave", "name", "vms"], [[w, (names.get(w) or {}).get("name", ""), n] for w, n in rows],
+                     indent="  "))
     log("")
     log("  context      : {}".format(cfg.context or "(kubectl current-context)"))
     log("  batch size   : {}   parallel batches: {} (per namespace {})".format(
@@ -1225,6 +1227,36 @@ def cmd_schedule(args) -> int:
     return 0
 
 
+def cmd_waves(args) -> int:
+    _cfg, store, _kube, _engine = _open(args)
+    if args.action == "set":
+        if args.wave is None or (args.name is None and args.notes is None):
+            log("usage: waves set WAVE [--name TEXT] [--notes TEXT]   (\"\" clears a field)")
+            return 2
+        try:
+            info = store.set_wave_info(args.wave, name=args.name, notes=args.notes)
+        except ValueError as exc:
+            log(str(exc))
+            return 2
+        log("{}{}".format(service.wave_label(info["wave"], info["name"]),
+                          "\n  notes: " + info["notes"] if info["notes"] else ""))
+        return 0
+    waves = service.wave_summaries(store)
+    if args.json:
+        print(json.dumps(waves, indent=2))
+        return 0
+    if not waves:
+        log("the import queue is empty: no waves yet")
+        return 0
+    log(report.table(["wave", "name", "vms", "top-level folders", "notes"], [
+        [w["wave"], w["name"] or ("(suggested: {})".format(w["suggested_name"]) if w["suggested_name"] else ""),
+         w["vms"], ", ".join("{} ({})".format(f["folder"], f["vms"]) for f in w["top_folders"][:3])
+         + (" ..." if len(w["top_folders"]) > 3 else ""),
+         (w["notes"].splitlines() or [""])[0][:60]]
+        for w in waves], indent="  "))
+    return 0
+
+
 def cmd_settings(args) -> int:
     from . import settings as settings_mod
     cfg_file = _load_config(args)
@@ -1589,6 +1621,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--end", help="when the window closes; no batch starts that would not finish by then")
     sp.add_argument("--include-failed", action="store_true")
     sp.add_argument("--rollback-failed", action="store_true")
+
+    sp = add("waves", cmd_waves, "name waves and keep notes on them, e.g. the tenant each one moves")
+    sp.add_argument("action", nargs="?", choices=["list", "set"], default="list")
+    sp.add_argument("wave", nargs="?", type=int)
+    sp.add_argument("--name", help="short name shown next to the wave number; \"\" clears it")
+    sp.add_argument("--notes", help="free text; \"\" clears it")
+    sp.add_argument("--json", action="store_true")
 
     sp = add("settings", cmd_settings, "workspace settings shared with the web console")
     sp.add_argument("action", choices=["show", "set", "reset"])
