@@ -5352,10 +5352,73 @@ def t_cli_waves():
         eq(_run_cli(["-c", cfg, "waves", "set", "2"], env, tmp, expect=2).returncode, 2)
         assert "Globex" in _run_cli(["-c", cfg, "status"], env, tmp).stdout
 
+@test("a child whose VirtualMachine was deleted mid-import is failed, not awaiting commit")
+def t_status_child_vm_deleted():
+    from datetime import datetime, timezone
+    from vcfaimport.status import _fatal_condition
+    def child(ts):
+        return {"metadata": {"name": "op6", "ownerReferences": [{"kind": "ImportOperationBatch", "name": "imp-x"}]},
+                "spec": {"virtualMachineID": "vm-3101"},
+                "status": {"conditions": [
+                    {"type": "ReadyForCommit", "status": "True", "reason": "True"},
+                    {"type": "VirtualMachineCreated", "status": "False", "reason": "VMCRNotFoundPostCreation",
+                     "lastTransitionTime": ts,
+                     "message": 'VM CR was created but not found: VirtualMachine.vmoperator.vmware.com "vm-94szjrcm0v" not found'}]}}
+    now = datetime(2026, 10, 1, 19, 30, tzinfo=timezone.utc)
+    eq(_fatal_condition(child("2026-10-01T19:29:30Z"), now), None, "30 s old: give it a moment")
+    reason, msg = _fatal_condition(child("2026-10-01T19:25:01Z"), now)
+    eq(reason, "VMCRNotFoundPostCreation")
+    assert "deleted before the import completed" in msg and "vm-94szjrcm0v" in msg, msg
+    batch = {"metadata": {"name": "imp-x"}, "spec": {"operations": [{"name": "op6", "spec": {"virtualMachineID": "vm-3101"}}]},
+             "status": {"conditions": [
+                 {"type": "ReadyForImport", "status": "True", "reason": "True"},
+                 {"type": "ReadyForCommit", "status": "True", "reason": "True"},
+                 {"type": "Complete", "status": "False", "reason": "ObjectNotReady",
+                  "message": "Operations are not ready. Operation Names: op6"}]}}
+    op = batch_status(batch, Config(), [child("2026-10-01T19:25:01Z")], stage="import").by_moref()["vm-3101"]
+    eq(op.bucket, "failed")
+
+@test("e2e: a VM deleted before its import completed fails; rollback after commit is explained; abandon clears it")
+def t_e2e_vm_deleted_before_commit():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "wait", settle="1")
+        _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-ns-a"])
+        cfg = _write_config(tmp, commit_action="Wait")
+        inv = _inventory(tmp, 4, namespaces=("ns-a",), waves=(1,))
+        _run_cli(["-c", cfg, "load", "-i", inv], env, tmp)
+        _run_cli(["-c", cfg, "precheck", "-y"], env, tmp)
+        _run_cli(["-c", cfg, "run", "-y"], env, tmp)
+        vms = {v["moref"]: v for v in json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
+        eq({v["state"] for v in vms.values()}, {"awaiting_commit"})
+        batch = vms["vm-1002"]["batch_name"]
+
+        # Someone deletes vm-1002's VirtualMachine in the namespace, then the batch is committed.
+        cluster = json.loads(Path(tmp, "cluster.json").read_text())
+        cluster["batches"]["ns-a/" + batch]["_vm_deleted"] = ["vm-1002"]
+        Path(tmp, "cluster.json").write_text(json.dumps(cluster))
+        out = _run_cli(["-c", cfg, "commit", "-y"], env, tmp, expect=None).stdout
+        vms = {v["moref"]: v for v in json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
+        eq(vms["vm-1002"]["state"], "failed", out)
+        assert "deleted before the import completed" in vms["vm-1002"]["message"], vms["vm-1002"]["message"]
+        eq({vms[m]["state"] for m in ("vm-1001", "vm-1003", "vm-1004")}, {"committed"})
+
+        # The operator will not take a rollback on a committed batch; say so plainly.
+        out = _run_cli(["-c", cfg, "rollback", "--vm", "vm-1002", "-y"], env, tmp, expect=None).stdout
+        assert "immutable once a batch is committed" in out, out
+        after = {v["moref"]: v["state"] for v in json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
+        eq(after["vm-1002"], "failed", "a refused rollback changes nothing")
+
+        # abandon removes the batch; committed VMs stay committed.
+        out = _run_cli(["-c", cfg, "abandon", "--batch", batch, "-y"], env, tmp).stdout
+        assert "deleted 1 batch" in out, out
+        assert ("ns-a/" + batch) not in json.loads(Path(tmp, "cluster.json").read_text())["batches"]
+        vms = {v["moref"]: v for v in json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
+        eq({vms[m]["state"] for m in ("vm-1001", "vm-1003", "vm-1004")}, {"committed"})
+
 UNIT = [
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
     t_app_icon, t_status_child_blocking_condition, t_discovery_drift, t_precheck_max_age,
-    t_run_members_left_over, t_wave_info, t_web_wave_info, t_cli_waves,
+    t_run_members_left_over, t_wave_info, t_web_wave_info, t_cli_waves, t_status_child_vm_deleted,
     t_vcenter_portgroups,
     t_stage_ns_conflicts,
     t_serve_open_headless, t_python_version_message,
@@ -5394,7 +5457,7 @@ UNIT = [
 ]
 
 E2E = [
-    t_e2e_precheck_storage_release,
+    t_e2e_precheck_storage_release, t_e2e_vm_deleted_before_commit,
     t_e2e_portgroups_subnets,
     t_e2e_cluster_namespaces,
     t_e2e_web_governance, t_e2e_cli_governance,

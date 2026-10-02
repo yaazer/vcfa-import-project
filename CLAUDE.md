@@ -182,6 +182,15 @@ learned from a real cluster — the fakes should model what was observed.
   batches let the import proceed within seconds. So finished precheck batches are deleted
   (`Engine._release_precheck`), and a running child's blocking condition is surfaced
   (`status._blocking_condition`).
+- **A VirtualMachine deleted mid-import** (2026-10-01): the child keeps `ReadyForCommit: True`
+  and adds `VirtualMachineCreated: False (VMCRNotFoundPostCreation) VM CR was created but not
+  found`; the batch never reaches `Complete`, and a commit changes nothing for that VM. The vCenter
+  VM stays in the namespace's folder. Read as failed after 2 minutes (`status._fatal_condition`).
+- **`rollbackAction` is refused once a batch is committed**: the webhook answers
+  `rollbackAction: Invalid value: "Immediate": field is immutable`. Whether a batch *created*
+  with `commitAction: Auto` refuses it too is not known, so `rollback` explains the error rather
+  than refusing up front. Deleting a committed batch (finalizer included) left its imported
+  VMs alone: they carry no ownerReferences to the batch or its children.
 - Not yet observed: the per-op lists for failed/completed/rolled-back operations, the
   target VM resource name field. `status.py` tries several spellings; confirm when seen.
 - A wedged `systemd-resolved` on a Supervisor CP node showed up as

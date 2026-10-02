@@ -202,7 +202,12 @@ def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = No
             phase = "RolledBack" if reverted else "RollingBack"
             if not reverted:
                 terminal = False
-        if phase == "AwaitingCommit":
+        if not precheck and phase in ("Succeeded", "AwaitingCommit") and vm_id in (obj.get("_vm_deleted") or []):
+            # Observed 2026-10-01: the VirtualMachine the import created was deleted
+            # before the import completed. The operator retries for ever: the op stays
+            # ReadyForCommit, Complete never turns True, a commit changes nothing.
+            phase = "VmGone"
+        if phase in ("AwaitingCommit", "VmGone"):
             terminal = False
         ops.append({
             "name": entry.get("name"),
@@ -234,7 +239,8 @@ def real_vocabulary(obj: dict, ops: list, precheck: bool, rolling: bool, reverte
     waiting = [o["name"] for o in ops if o["phase"] == "AwaitingCommit"]
     rolled = [o["name"] for o in ops if o["phase"] == "RolledBack"]
     rolling_ops = [o["name"] for o in ops if o["phase"] == "RollingBack"]
-    not_ready_msg = "Operations are not ready. Operation Names: " + ", ".join(names)
+    gone = [o["name"] for o in ops if o["phase"] == "VmGone"]
+    not_ready_msg = "Operations are not ready. Operation Names: " + ", ".join(gone or names)
 
     def cond(kind, ok_flag, reason=None, message=""):
         return {"type": kind, "status": "True" if ok_flag else "False",
@@ -261,14 +267,14 @@ def real_vocabulary(obj: dict, ops: list, precheck: bool, rolling: bool, reverte
         return status
 
     # Import batch.
-    ready = ok + waiting + rolled + rolling_ops
+    ready = ok + waiting + rolled + rolling_ops + gone
     done = ok
     conds = [
         cond("ReadyForImport", bool(ready), message=not_ready_msg),
-        cond("ReadyForCommit", bool(ok or waiting) and not rolling,
+        cond("ReadyForCommit", bool(ok or waiting or gone) and not rolling,
              "RolledBack" if reverted else ("RollingBack" if rolling else None),
              "rollback requested" if rolling else not_ready_msg),
-        cond("Complete", bool(ok) and not waiting and not failed and not rolling,
+        cond("Complete", bool(ok) and not waiting and not failed and not rolling and not gone,
              "RolledBack" if reverted else ("RollingBack" if rolling else None),
              "rollback requested" if rolling else not_ready_msg),
     ]
@@ -375,6 +381,11 @@ def child_conditions(phase: str, message: str, precheck: bool = False) -> dict:
                 + [cond(k, reverted) for k in ("RollbackCompleted", "RollbackCustomResourceCompleted",
                                                "RollbackVirtualMachineLocationCompleted",
                                                "RollbackVirtualMachinePropertyCompleted")]}
+    if phase == "VmGone":
+        missing = cond("VirtualMachineCreated", False, "VMCRNotFoundPostCreation")
+        missing["message"] = 'VM CR was created but not found: VirtualMachine.vmoperator.vmware.com "vm-gone" not found'
+        missing["lastTransitionTime"] = "2026-10-01T19:25:01Z"
+        return {"conditions": [cond("PrecheckSucceeded", True), cond("ReadyForCommit", True), missing]}
     if phase == "Placing":
         # Observed 2026-10-01 while the namespace was out of storage quota.
         stuck = cond("VirtualMachineReadyForImport", False, "VirtualMachineRelocateFailure")
@@ -610,6 +621,13 @@ def main(argv: list) -> int:
             data["batches"][key]["spec"]["defaultSpec"]["controlAction"]["commitAction"] = "Auto"
         rollback = (patch.get("spec", {}).get("defaultSpec", {})
                     .get("controlAction", {}).get("rollbackAction"))
+        if rollback and data["batches"][key].get("_committed"):
+            # Observed 2026-10-01 once the commit gate had been released.
+            sys.stderr.write('Error from server (spec.defaultSpec.controlAction.rollbackAction: Invalid '
+                             'value: "Immediate": field is immutable): admission webhook '
+                             '"default.validating.importoperationbatch.v1alpha3.mobility-operator.vmware.com"'
+                             ' denied the request\n')
+            return 1
         if rollback:
             # Same effect as `kubectl edit` adding rollbackAction: Immediate.
             data["batches"][key].setdefault("_rollback_poll", data["polls"].get(key, 0))

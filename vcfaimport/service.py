@@ -441,6 +441,13 @@ KNOWN_ISSUES: List[Dict[str, Any]] = [
                "the second one never starts. Abandon the older batch (precheck batches are "
                "safe to abandon), then retry.",
      "actions": ["abandon", "retry"]},
+    {"id": "vm_deleted", "pattern": r"deleted before the import completed|VMCRNotFoundPostCreation",
+     "title": "The VM was deleted before its import completed",
+     "advice": "Its VirtualMachine in the namespace was deleted mid-import, so the operator can never "
+               "finish it. Before a commit, roll the batch back. After a commit the operator refuses "
+               "that: abandon the batch (committed VMs stay), delete the leftover VM in vCenter, then "
+               "skip it.",
+     "actions": ["rollback", "abandon", "skip"]},
     {"id": "rollback", "pattern": r"ROLLBACK FAILED",
      "title": "The operator could not hand the VM back to vCenter",
      "advice": "Needs a human: check the VM in vCenter and its ImportOperation in the "
