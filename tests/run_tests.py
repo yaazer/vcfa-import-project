@@ -5259,10 +5259,103 @@ def t_e2e_precheck_storage_release():
         eq({v["state"] for v in vms}, {"precheck_passed"}, "the verdict outlives the batch")
 
 
+@test("waves carry a name and notes; they follow their VMs when waves swap")
+def t_wave_info():
+    from vcfaimport import report, service
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        store.actor = "alice"
+        _seed_store_with_vms(store, 6, waves=(1, 2), folders=("Acme/Web", "Acme/DB", "Globex"))
+        # wave 1: vm-1000 Acme/Web, vm-1002 Globex, vm-1004 Acme/DB; wave 2: vm-1001 Acme/DB, ...
+        store.set_vm_wave(["vm-1002"], 3)                         # wave 1 is now all Acme
+        info = store.set_wave_info(1, name="  Acme   Corp ", notes="CAB-1234\nowner: j.smith")
+        eq((info["name"], info["notes"], info["updated_by"]), ("Acme Corp", "CAB-1234\nowner: j.smith", "alice"))
+        eq(store.set_wave_info(1, notes=None)["name"], "Acme Corp", "None leaves a field alone")
+        for bad in ({"name": "x" * 61}, {"notes": "x" * 2001}):
+            try:
+                store.set_wave_info(1, **bad)
+                raise AssertionError("accepted {}".format(list(bad)))
+            except ValueError:
+                pass
+        try:
+            store.set_wave_info(0, name="x")
+            raise AssertionError("wave 0 accepted")
+        except ValueError:
+            pass
+        events = [e["message"] for e in store.recent_events()]
+        assert "wave 1: named 'Acme Corp', notes updated" in events, events
+
+        summaries = {w["wave"]: w for w in service.wave_summaries(store)}
+        eq(summaries[1]["suggested_name"], "Acme", "one top-level folder: a tenant")
+        eq(summaries[2]["suggested_name"], "", "two tenants in one wave: no suggestion")
+        eq(summaries[3]["suggested_name"], "Globex")
+        eq([f["folder"] for f in summaries[2]["top_folders"]], ["Acme", "Globex"])
+
+        # Reordering moves the description with the VMs it describes.
+        store.set_wave_info(3, name="Globex")
+        ok, _ = store.swap_waves(1, 3)
+        assert ok
+        eq({w: i["name"] for w, i in store.wave_info().items()}, {1: "Globex", 3: "Acme Corp"})
+        eq(store.get_vm("vm-1000")["wave"], 3)
+        store.swap_waves(2, 3)                                    # only one side described
+        eq({w: i["name"] for w, i in store.wave_info().items()}, {1: "Globex", 2: "Acme Corp"})
+
+        # Shown wherever the wave is: status, the tracker and the HTML report.
+        text = report.render_status(store, Config())
+        assert "Acme Corp" in text, text
+        path = os.path.join(tmp, "tracker.csv")
+        report.write_csv(store, path)
+        rows = list(csv.DictReader(open(path, encoding="utf-8")))
+        eq({r["wave_name"] for r in rows if r["wave"] == "2"}, {"Acme Corp"})
+        eq(service.wave_label(2, "Acme Corp"), "Wave 2 · Acme Corp")
+        eq(store.set_wave_info(2, name="")["name"], "", '"" clears it')
+        store.close()
+
+
+@test("console: waves are named over the API, and the names reach every page via pulse")
+def t_web_wave_info():
+    from vcfaimport import access
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            _seed_store_with_vms(c.app.store, 6, folders=("Acme/Web", "Acme/DB"))
+            waves = c.ok("GET", "/api/waves")["waves"]
+            eq([(w["wave"], w["suggested_name"], w["vms"]) for w in waves], [(1, "Acme", 3), (2, "Acme", 3)])
+            r = c.ok("POST", "/api/waves/info", {"wave": 2, "name": "Acme Corp", "notes": "CAB-1234"})
+            eq((r["name"], r["notes"]), ("Acme Corp", "CAB-1234"))
+            eq(c.ok("GET", "/api/pulse")["wave_names"], {"2": "Acme Corp"})
+            ov = {w["wave"]: w for w in c.ok("GET", "/api/overview")["waves"]}
+            eq((ov[2]["name"], ov[2]["notes"], ov[1]["name"]), ("Acme Corp", "CAB-1234", ""))
+            for body in ({"name": "x"}, {"wave": 2, "name": 5}, {"wave": 2, "name": "x" * 61}, {"wave": 0, "name": "x"}):
+                status, data, _ = c.call("POST", "/api/waves/info", body)
+                eq(status, 400, json.dumps(body))
+            viewer = access.create_user(c.app.store, "auditor", "viewer", "owner")
+            status, _, _ = c.call("POST", "/api/waves/info", {"wave": 1, "name": "x"}, token=viewer)
+            eq(status, 403, "a viewer cannot rename waves")
+            eq(c.call("GET", "/api/waves", token=viewer)[0], 200)
+        finally:
+            c.close()
+
+
+@test("cli: waves lists names, notes and tenant folders; waves set describes one")
+def t_cli_waves():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "happy")
+        cfg = _write_config(tmp)
+        _run_cli(["-c", cfg, "load", "-i", _inventory(tmp, 4, namespaces=("ns-a",))], env, tmp)
+        out = _run_cli(["-c", cfg, "waves", "set", "2", "--name", "Globex", "--notes", "owner: k.lee"], env, tmp).stdout
+        assert "Wave 2 · Globex" in out and "owner: k.lee" in out, out
+        out = _run_cli(["-c", cfg, "waves"], env, tmp).stdout
+        assert "Globex" in out and "owner: k.lee" in out, out
+        listed = json.loads(_run_cli(["-c", cfg, "waves", "--json"], env, tmp).stdout)
+        eq([(w["wave"], w["name"]) for w in listed], [(1, ""), (2, "Globex")])
+        eq(_run_cli(["-c", cfg, "waves", "set", "2"], env, tmp, expect=2).returncode, 2)
+        assert "Globex" in _run_cli(["-c", cfg, "status"], env, tmp).stdout
+
 UNIT = [
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
     t_app_icon, t_status_child_blocking_condition, t_discovery_drift, t_precheck_max_age,
-    t_run_members_left_over,
+    t_run_members_left_over, t_wave_info, t_web_wave_info, t_cli_waves,
     t_vcenter_portgroups,
     t_stage_ns_conflicts,
     t_serve_open_headless, t_python_version_message,

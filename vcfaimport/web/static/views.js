@@ -45,7 +45,7 @@ function nextStep(d, p) {
   if (d.awaiting_commit) return box('warn', 'commit', plural(d.awaiting_commit, 'import') + ' waiting for commit', 'commitAction is Wait: these VMs are imported but held. Commit them, or roll them back to vCenter.', link('Review', 'execute'));
   if (d.failed) return box('bad', 'triage', plural(d.failed, 'VM') + ' need attention', 'Failures are grouped by cause on the Triage page, with the likely fix for each.', link('Triage', 'triage'));
   if (d.in_flight) return box('', 'refresh', plural(d.in_flight, 'VM') + ' in flight', 'Batches from an earlier session are still on the cluster. Watch them to record the outcome.', link('Execute', 'execute'));
-  if (c.precheck_passed) { const w = lowest('precheck_passed'); return box('ok', 'execute', 'Wave ' + w + ' is ready to import', plural(c.precheck_passed, 'VM') + ' passed precheck across all waves.', link('Import wave ' + w, 'execute', 'stage=import&waves=' + w)); }
+  if (c.precheck_passed) { const w = lowest('precheck_passed'); return box('ok', 'execute', waveLabel(w) + ' is ready to import', plural(c.precheck_passed, 'VM') + ' passed precheck across all waves.', link('Import wave ' + w, 'execute', 'stage=import&waves=' + w)); }
   if (c.pending) { const w = lowest('pending'); return box('', 'shield', 'Precheck wave ' + w, 'Run preflight to verify the cluster, then precheck: the operator validates each VM without moving anything.', link('Go to Execute', 'execute', 'stage=precheck&waves=' + w)); }
   if (d.total && c.committed === d.total) return box('ok', 'check', 'Campaign complete', 'Every queued VM is committed in VCF Automation. Export the tracker from Activity for the change record.', link('Exports', 'activity', 'tab=exports', false));
   if (c.rolled_back) return box('', 'rollback', plural(c.rolled_back, 'VM') + ' handed back to vCenter', 'Their failed imports were rolled back. Once the cause is fixed, retry them from Triage and precheck again.', link('Triage', 'triage'));
@@ -80,7 +80,7 @@ VIEWS.overview = view({
         <div class="card"><div class="card-h"><h3>Waves</h3><span class="sub">run in order, lowest first</span>
           <div class="tools"><button class="btn sm" data-act="go" data-to="waves">Arrange ${icon('arrow')}</button></div></div>
           ${d.waves.length ? html`<div class="table-wrap"><table class="t"><thead><tr><th>Wave</th><th style="width:40%">Progress</th><th class="right">VMs</th><th class="right">Done</th><th class="right">Failed</th><th></th></tr></thead><tbody>
-            ${d.waves.map((w) => html`<tr><td class="nowrap"><b>Wave ${w.wave}</b>${waveEta(d, w) ? html`<div class="tiny faint" title="estimated time for what is left in this wave">${icon('clock')} ${waveEta(d, w)} left</div>` : ''}</td><td>${segbar(w.counts, w.total)}</td><td class="right num">${n(w.total)}</td>
+            ${d.waves.map((w) => html`<tr><td class="nowrap"><b>${waveLabel(w.wave)}</b>${waveEta(d, w) ? html`<div class="tiny faint" title="estimated time for what is left in this wave">${icon('clock')} ${waveEta(d, w)} left</div>` : ''}</td><td>${segbar(w.counts, w.total)}</td><td class="right num">${n(w.total)}</td>
               <td class="right num">${n(w.counts.committed || 0)}</td><td class="right num ${fail(w) ? 'bad-text' : ''}">${n(fail(w))}</td>
               <td class="right nowrap"><button class="btn xs" data-act="go" data-to="execute" data-q="stage=precheck&waves=${w.wave}" ${attr(!w.counts.pending, 'disabled')}>Precheck</button>
                 <button class="btn xs" data-act="go" data-to="execute" data-q="stage=import&waves=${w.wave}" ${attr(!w.counts.precheck_passed, 'disabled')}>Import</button></td></tr>`)}
@@ -913,7 +913,7 @@ function stagePreview(v) {
     <div class="kpis">${kpi('Selected', p.selected, '')}${kpi('Stageable', p.records.length, '', null, 'var(--ok)')}
       ${kpi('Cannot place', p.problems.length, 'no namespace', null, p.problems.length ? 'var(--bad)' : '')}
       ${kpi('Unmapped networks', Object.keys(p.unmapped_networks).length, 'VMs keep no subnet for them', null, Object.keys(p.unmapped_networks).length ? 'var(--warn)' : '')}</div>
-    ${p.by_wave.length ? html`<div class="row wrap"><span class="small muted">By wave</span>${p.by_wave.map(([w, c]) => html`<span class="chip static">Wave ${w} <span class="n">${n(c)}</span></span>`)}
+    ${p.by_wave.length ? html`<div class="row wrap"><span class="small muted">By wave</span>${p.by_wave.map(([w, c]) => html`<span class="chip static">${waveLabel(w)} <span class="n">${n(c)}</span></span>`)}
       <span class="small muted" style="margin-left:14px">By namespace</span>${p.by_namespace.map(([ns, c]) => html`<span class="chip static mono">${ns} <span class="n">${n(c)}</span></span>`)}</div>` : ''}
     ${p.problems.length ? html`<details class="note bad"><summary><b>${plural(p.problems.length, 'VM')} cannot be staged</b> — expand for details</summary><ul class="plain small">${p.problems.slice(0, 60).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
     ${nsConflicts(p)}
@@ -931,8 +931,9 @@ VIEWS.waves = view({
   title: 'Waves', sub: 'Step 4 · order the queue: wave 1 runs first; drag VMs or whole folders between waves',
   init(v) { v.sel = new Set(); v.open = v.open || new Set(); v.q = ''; if (v.withApp === undefined) v.withApp = !!(S.info.features || {}).app_together; },
   async load(v) {
-    const [d, o] = await Promise.all([GET('/api/vms'), GET('/api/overview')]);
+    const [d, o, wi] = await Promise.all([GET('/api/vms'), GET('/api/overview'), GET('/api/waves')]);
     v.vms = d.vms; v.o = o; v.byMoref = new Map(v.vms.map((x) => [x.moref, x]));
+    v.info = new Map(wi.waves.map((x) => [x.wave, x]));
     S.waves = uniq(v.vms.map((x) => x.wave)).sort((a, b) => a - b);
   },
   paint(v) {
@@ -995,6 +996,17 @@ VIEWS.waves = view({
       if (await doMoveWave(morefs)) { v.sel.clear(); await v.refresh(); }
     },
     async moveNew(t, e, v) { await moveTo(v, Array.from(v.sel), (S.waves[S.waves.length - 1] || 0) + 1); },
+    async editWave(t, e, v) {
+      const w = +t.dataset.w, i = (v.info && v.info.get(w)) || {};
+      if (await doEditWave(w, i, i.suggested_name)) await v.refresh();
+    },
+    async nameWave(t, e, v) {
+      const w = +t.dataset.w;
+      try { await POST('/api/waves/info', { wave: w, name: t.dataset.name }); } catch (err) { fail(err); return; }
+      if (S.pulse) S.pulse.wave_names = Object.assign({}, S.pulse.wave_names, { [w]: t.dataset.name });
+      toast(waveLabel(w) + ' saved', 'Add notes with the edit button.', 'ok');
+      await v.refresh();
+    },
     async swap(t, e, v) {
       const a = +t.dataset.a, b = +t.dataset.b;
       try { await POST('/api/waves/swap', { a, b }); toast('Wave ' + a + ' and wave ' + b + ' swapped', 'Wave ' + Math.min(a, b) + ' now runs first.', 'ok'); } catch (err) { fail(err); }
@@ -1051,6 +1063,17 @@ async function moveTo(v, morefs, wave, withApp) {
   } catch (err) { fail(err); }
   await v.refresh();
 }
+// What a wave is for: its name (often the tenant) and notes, or the tenant folder it could be named after.
+function waveAbout(i, w) {
+  if (!i) return '';
+  if (!i.name && !i.notes) {
+    return i.suggested_name ? html`<div class="wave-about"><span class="tiny muted">All from <b>${i.suggested_name}</b></span>
+      <button class="btn xs ghost" data-act="nameWave" data-w="${w}" data-name="${i.suggested_name}">Use as wave name</button></div>` : '';
+  }
+  const first = (i.notes || '').split('\n').filter(Boolean);
+  return html`<div class="wave-about">${i.name ? html`<div class="wave-name" title="${i.name}">${i.name}</div>` : ''}
+    ${first.length ? html`<div class="wave-notes small muted" title="${i.notes}">${first.slice(0, 2).join(' · ')}${first.length > 2 ? '…' : ''}</div>` : ''}</div>`;
+}
 function waveColumn(v, w, idx, waves, hitSet, q) {
   const members = v.vms.filter((x) => x.wave === w);
   const counts = countBy(members, 'state');
@@ -1065,8 +1088,10 @@ function waveColumn(v, w, idx, waves, hitSet, q) {
     <div class="wcol-h">
       <div class="title"><span class="wave-no">${w}</span><h3>Wave ${w}</h3><span class="small muted">${plural(members.length, 'VM')}</span>
         <span class="grow"></span>
+        <button class="btn ghost icon xs" data-act="editWave" data-w="${w}" title="Name this wave and keep notes on it">${icon('edit')}</button>
         <button class="btn ghost icon xs" data-act="swap" data-a="${w}" data-b="${prev}" ${attr(prev === undefined, 'disabled')} title="Run earlier (swap with wave ${prev})">${icon('left')}</button>
         <button class="btn ghost icon xs" data-act="swap" data-a="${w}" data-b="${next}" ${attr(next === undefined, 'disabled')} title="Run later (swap with wave ${next})">${icon('right')}</button></div>
+      ${waveAbout(v.info && v.info.get(w), w)}
       ${segbar(counts, members.length)}
       <div class="row wrap tiny muted">${STATE_ORDER.filter((s) => counts[s]).map((s) => html`<span>${dot(s)} ${n(counts[s])} ${label(s)}</span>`)}</div>
       <div class="row wrap tiny">${nss.slice(0, 3).map((x) => html`<span class="tag mono">${x}</span>`)}${nss.length > 3 ? html`<span class="tag">+${nss.length - 3}</span>` : ''}
@@ -1157,7 +1182,7 @@ VIEWS.execute = view({
               : html`<b>Precheck</b> applies <code>precheckOnly</code> batches: the operator validates each VM against the target without migrating anything. Safe to repeat.`}</div>
             <div><div class="section-title" style="margin-top:0">Waves ${tip('wave')}</div><div class="chips">
               <span class="chip ${opt.waves.size ? '' : 'on'}" data-act="wave" data-w="all">All waves <span class="n">${n(Object.values(pl.eligible_by_wave).reduce((a, b) => a + b, 0))}</span></span>
-              ${Object.entries(pl.eligible_by_wave).map(([w, cnt]) => html`<span class="chip ${opt.waves.has(+w) ? 'on' : ''}" data-act="wave" data-w="${w}">Wave ${w} <span class="n">${n(cnt)}</span></span>`)}
+              ${Object.entries(pl.eligible_by_wave).map(([w, cnt]) => html`<span class="chip ${opt.waves.has(+w) ? 'on' : ''}" data-act="wave" data-w="${w}">${waveLabel(w)} <span class="n">${n(cnt)}</span></span>`)}
             </div><div class="tiny faint mt-s">Counts are VMs eligible for ${opt.stage} in each wave. Waves run one after another, lowest first.</div></div>
             <div class="form-grid">
               <label class="field"><span>Folder scope (optional) ${tip('folder_scope')}</span><input class="input" id="ex-folder" list="ex-folders" data-input="opt" data-k="folder" value="${opt.folder}" placeholder="every folder">
@@ -1186,7 +1211,7 @@ VIEWS.execute = view({
               <button class="btn danger-ghost" data-act="rollbackHeld" ${attr(!c.awaiting_commit || !!job, 'disabled')}>${icon('rollback')} Roll back instead</button></div></div>`, c.awaiting_commit ? 'warn' : '') : ''}
       ${flowSec(num(), html`${FX.streamHtml(o, { compact: true })}
         <div class="card"><div class="card-h"><h3>Waves</h3><span class="sub">live</span></div>
-        ${o.waves.length ? html`<div class="table-wrap"><table class="t"><tbody>${o.waves.map((w) => html`<tr><td style="width:90px"><b>Wave ${w.wave}</b></td><td>${segbar(w.counts, w.total)}</td>
+        ${o.waves.length ? html`<div class="table-wrap"><table class="t"><tbody>${o.waves.map((w) => html`<tr><td class="nowrap"><b>${waveLabel(w.wave)}</b></td><td>${segbar(w.counts, w.total)}</td>
           <td class="small muted nowrap" style="width:40%">${STATE_ORDER.filter((x) => w.counts[x]).map((x) => html`<span style="margin-right:10px">${dot(x)} ${n(w.counts[x])} ${label(x)}</span>`)}</td></tr>`)}</tbody></table></div>`
           : html`<div class="card-b muted">The queue is empty.</div>`}</div>
         <div class="card"><div class="card-h"><h3>On the cluster</h3><span class="sub">${plural(o.live_batches.length, 'live batch', 'live batches')}</span></div>
@@ -1294,7 +1319,7 @@ function planTable(v) {
   }
   const basis = pl.plan[0] && pl.plan[0].basis === 'measured' ? 'measured batch times from this campaign' : 'a default batch time, until batches have run here';
   return html`<table class="t compact" style="border:1px solid var(--line);border-radius:8px"><thead><tr><th>Wave</th><th class="right">VMs</th><th class="right">Batches</th><th>Namespaces</th><th class="right">Time ${tip('eta')}</th></tr></thead><tbody>
-    ${pl.plan.map((p) => html`<tr><td><b>${p.wave}</b></td><td class="right num">${n(p.vms)}${p.vms !== p.eligible ? html` <span class="faint">of ${n(p.eligible)}</span>` : ''}</td><td class="right num">${n(p.batches)}</td>
+    ${pl.plan.map((p) => html`<tr><td class="nowrap"><b>${waveLabel(p.wave)}</b></td><td class="right num">${n(p.vms)}${p.vms !== p.eligible ? html` <span class="faint">of ${n(p.eligible)}</span>` : ''}</td><td class="right num">${n(p.batches)}</td>
       <td class="small mono">${p.namespaces.join(', ')}</td><td class="right small nowrap">${eta(p.seconds)}</td></tr>`)}
     <tr><td><b>Total</b></td><td class="right num"><b>${n(pl.total)}</b></td><td class="right num"><b>${n(pl.plan.reduce((a, p) => a + p.batches, 0))}</b></td><td></td><td class="right nowrap"><b>${eta(pl.seconds)}</b></td></tr></tbody></table>
     <div class="tiny faint mt-s">Times use ${basis}; waves run one after another.</div>
@@ -1348,7 +1373,7 @@ VIEWS.queue = view({
     return html`<div class="card">
       <div class="toolbar">
         <div class="search">${icon('search')}<input class="input" id="q-q" placeholder="Search VM, moref, batch, message…" value="${f.q}" data-input="q"></div>
-        <select class="select" data-change="filter" data-k="wave"><option value="">All waves</option>${S.waves.map((w) => html`<option value="${w}" ${attr(String(w) === f.wave, 'selected')}>Wave ${w}</option>`)}</select>
+        <select class="select" data-change="filter" data-k="wave"><option value="">All waves</option>${S.waves.map((w) => html`<option value="${w}" ${attr(String(w) === f.wave, 'selected')}>${waveLabel(w)}</option>`)}</select>
         <select class="select" data-change="filter" data-k="ns"><option value="">All namespaces</option>${uniq(v.vms.map((x) => x.namespace)).sort().map((x) => html`<option ${attr(x === f.ns, 'selected')}>${x}</option>`)}</select>
         <input class="input" id="q-folder" placeholder="Folder…" value="${f.folder}" data-input="folderF" style="width:160px">
         ${apps.length ? html`<select class="select" data-change="filter" data-k="app"><option value="">All apps</option>${apps.map((a) => html`<option ${attr(a === f.app, 'selected')}>${a}</option>`)}</select>` : ''}

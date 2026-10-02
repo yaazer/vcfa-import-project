@@ -85,7 +85,7 @@ closed state is remembered per browser.
 | **1 Discover** | Connect to vCenter (server/user pre-filled from `VCFA_VC_*`; the password is used once and never stored) and read the inventory, with a live progress bar |
 | **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), then the VM list with search and facet filters (including **readiness**, vCenter **tag** and **application**), shift-click ranges and saved views. An optional, folded-away bar sets a namespace, wave or application on the selection by hand |
 | **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A folded *What you can map to* panel (its summary counts them; open it when you need the list, and filter it by name) lists the Supervisor's namespaces, its Subnets and SubnetSets (each with the namespace it lives in, VPC ones included) and every vCenter portgroup from the last discovery; each is suggested as you type in the matching field, a click fills the field you are in (or adds an unmapped portgroup to the map), and names that do not exist are flagged; if two maps name different namespaces for a VM, the preview says which one won. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
-| **4 Waves** | One row per wave, top to bottom, with its folders and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
+| **4 Waves** | One row per wave, top to bottom, with its folders and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. The pencil names a wave and keeps notes on it, typically the tenant it moves (see [Naming waves](#naming-waves)). With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
 | **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. When a precheck passes for every VM it ran, the page switches to Import for the same waves and folder, ready to review; it never starts the import for you, and a precheck with failures stays on Precheck. Includes a commit gate, a *Watch* for batches left over from an earlier session, an ETA per wave, what is held back and why, post-import verification, and *Schedule…* to run it in a change window instead |
 | **Import queue** (Monitor) | Every VM with state, application and verification filters and saved views; bulk retry / skip / move wave / verify / roll back / abandon |
 | **Batches** (Monitor) | Every `ImportOperationBatch` with its members, the manifest that was applied, and its events |
@@ -481,6 +481,28 @@ map → `--default-namespace`. Wave follows the same order. **A VM with no
 namespace is reported, never guessed** — `stage` lists it with its folder and
 leaves it out; folders with no rule are listed too.
 
+### Naming waves
+
+Waves are numbered by running order. Once a campaign is under way, the number alone does not say
+much; what people track is *whose* VMs a wave moves. Clients usually keep one top-level vCenter
+folder per tenant, so a wave can carry a **name** (up to 60 characters, e.g. the tenant) and free
+**notes** (contacts, the change ticket, what to watch for):
+
+```bash
+vcfa-import waves                                          # wave, name, VMs, top-level folders, notes
+vcfa-import waves set 2 --name "Acme Corp" --notes "CAB-1234; owner: j.smith"
+vcfa-import waves set 2 --notes ""                         # "" clears a field
+```
+
+In the console, the pencil on each wave on the Waves page does the same. A wave whose VMs all come
+from one top-level folder offers it: *All from Acme · Use as wave name*.
+
+The name then appears wherever the wave does: next to the wave number on the Overview, Execute,
+the Import queue filter, Change control and the Migration Stream lanes, in `status`, in the HTML
+report (including the *Moved into VCFA* table), and as a `wave_name` column in `tracker.csv`. It
+belongs to the wave's VMs, not to its number: when two waves swap places, their names and notes
+move with them. Naming a wave is recorded as an event, with who did it.
+
 ### Run by folder
 
 Folders are the unit of execution as well as collection. Every command that
@@ -638,6 +660,7 @@ it never touches batches it did not create.
 | `readiness` | grade discovered VMs from their vCenter facts before precheck (advisory); exit 4 when some are likely to fail |
 | `verify` | check committed VMs: powered on, Tools running, IP kept, ping, TCP ports |
 | `schedule` | change windows: `add --start --end`, `list`, `cancel ID`, `tick` (run from Task Scheduler or cron) |
+| `waves` | list the waves with their names, notes and top-level folders; `set WAVE --name ... --notes ...` describes one |
 | `settings` | show, `set key=value ...` or `reset key ...` the workspace settings the console edits |
 | `users` | personal console links: `add NAME --role viewer\|operator\|admin`, `list`, `disable`, `enable` |
 | `approvals` | the two-person rule: `list`, `request --stage`, `approve ID`, `reject ID` |

@@ -352,11 +352,45 @@ def vm_summary(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def wave_summaries(store: st.Store) -> List[Dict[str, Any]]:
+    """Every wave with VMs in it: its name and notes, and the top-level folders its VMs come from.
+
+    Clients usually keep one top-level folder per tenant, so when every VM of a wave
+    shares one, it is offered as the wave's name ("suggested") until one is given.
+    """
+    info = store.wave_info()
+    folders: Dict[int, Dict[str, int]] = {}
+    sizes: Dict[int, int] = {}
+    for r in store.conn.execute("SELECT wave, src_folder, COUNT(*) AS n FROM vms GROUP BY wave, src_folder"):
+        sizes[r["wave"]] = sizes.get(r["wave"], 0) + r["n"]
+        top = (r["src_folder"] or "").strip("/").split("/")[0]
+        f = folders.setdefault(r["wave"], {})
+        f[top] = f.get(top, 0) + r["n"]
+    out = []
+    for wave in store.waves():
+        i = info.get(wave) or {}
+        tops = folders.get(wave, {})
+        named = sorted((k for k in tops if k), key=lambda k: (-tops[k], k))
+        out.append({
+            "wave": wave, "name": i.get("name", ""), "notes": i.get("notes", ""),
+            "updated_at": i.get("updated_at"), "updated_by": i.get("updated_by"),
+            "vms": sizes.get(wave, 0), "top_folders": [{"folder": k, "vms": tops[k]} for k in named],
+            "suggested_name": named[0] if len(named) == 1 and not tops.get("") else "",
+        })
+    return out
+
+
+def wave_label(wave: int, name: str = "") -> str:
+    """'Wave 2', or 'Wave 2 · Acme' once it is named."""
+    return "Wave {}{}".format(wave, " · " + name if name else "")
+
+
 def overview(store: st.Store, cfg: Config) -> Dict[str, Any]:
     """Everything the dashboard shows, in a handful of queries."""
     counts = store.counts()
     total = sum(counts.values())
     by_wave = store.state_matrix("wave")
+    names = store.wave_info()
     by_ns = store.state_matrix("namespace")
     live = store.query_batches(states=[st.B_APPLIED, st.B_RUNNING, st.B_ROLLING_BACK])
     failures = store.query_vms(states=list(FAILED_STATES), order="updated_at DESC", limit=8)
@@ -367,7 +401,8 @@ def overview(store: st.Store, cfg: Config) -> Dict[str, Any]:
         "failed": sum(counts.get(s, 0) for s in FAILED_STATES),
         "in_flight": sum(counts.get(s, 0) for s in IN_FLIGHT_STATES),
         "awaiting_commit": counts.get(st.S_AWAITING_COMMIT, 0),
-        "waves": [{"wave": w, "total": sum(c.values()), "counts": c}
+        "waves": [{"wave": w, "total": sum(c.values()), "counts": c,
+                   "name": names.get(w, {}).get("name", ""), "notes": names.get(w, {}).get("notes", "")}
                   for w, c in sorted(by_wave.items())],
         "namespaces": [{"namespace": n, "total": sum(c.values()), "counts": c}
                        for n, c in sorted(by_ns.items())],

@@ -123,6 +123,17 @@ CREATE TABLE IF NOT EXISTS transitions (
 CREATE INDEX IF NOT EXISTS idx_trans_moref ON transitions(moref);
 CREATE INDEX IF NOT EXISTS idx_trans_ts    ON transitions(ts);
 
+-- What a wave is for, as the people running the campaign describe it: typically
+-- the tenant its VMs belong to. Keyed by wave number; it follows its VMs when
+-- two waves swap places.
+CREATE TABLE IF NOT EXISTS wave_info (
+    wave       INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    notes      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT,
+    updated_by TEXT
+);
+
 CREATE TABLE IF NOT EXISTS discovered (
     moref         TEXT PRIMARY KEY,
     name          TEXT NOT NULL DEFAULT '',
@@ -685,6 +696,49 @@ class Store:
         rows = self.conn.execute("SELECT DISTINCT wave FROM vms ORDER BY wave").fetchall()
         return [r["wave"] for r in rows]
 
+    WAVE_NAME_MAX = 60
+    WAVE_NOTES_MAX = 2000
+
+    def wave_info(self) -> Dict[int, Dict[str, Any]]:
+        """wave -> {name, notes, updated_at, updated_by}, for every wave ever described."""
+        return {r["wave"]: dict(r) for r in self.conn.execute("SELECT * FROM wave_info ORDER BY wave")}
+
+    def set_wave_info(self, wave: int, name: Optional[str] = None,
+                      notes: Optional[str] = None) -> Dict[str, Any]:
+        """Name a wave and/or write its notes. None leaves a field as it is; "" clears it.
+
+        Not a state change: recorded as an event, like moving VMs between waves.
+        """
+        wave = int(wave)
+        if wave < 1:
+            raise ValueError("wave must be 1 or higher")
+        current = self.wave_info().get(wave) or {"name": "", "notes": ""}
+        new_name = current["name"] if name is None else " ".join(str(name).split())
+        new_notes = current["notes"] if notes is None else str(notes).strip()
+        if len(new_name) > self.WAVE_NAME_MAX:
+            raise ValueError("a wave name is at most {} characters".format(self.WAVE_NAME_MAX))
+        if len(new_notes) > self.WAVE_NOTES_MAX:
+            raise ValueError("wave notes are at most {} characters".format(self.WAVE_NOTES_MAX))
+        if (new_name, new_notes) == (current["name"], current["notes"]):
+            return dict(current, wave=wave)
+        now = _now()
+        self.conn.execute(
+            "INSERT INTO wave_info(wave, name, notes, updated_at, updated_by) VALUES(?,?,?,?,?)"
+            " ON CONFLICT(wave) DO UPDATE SET name=excluded.name, notes=excluded.notes,"
+            " updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (wave, new_name, new_notes, now, self.actor))
+        what = []
+        if new_name != current["name"]:
+            what.append("named {!r}".format(new_name) if new_name else "name cleared")
+        if new_notes != current["notes"]:
+            what.append("notes updated" if new_notes else "notes cleared")
+        self.conn.execute(
+            "INSERT INTO events(ts, level, moref, batch, message, actor) VALUES(?,?,?,?,?,?)",
+            (now, "info", None, None, "wave {}: {}".format(wave, ", ".join(what)), self.actor))
+        self.conn.commit()
+        return {"wave": wave, "name": new_name, "notes": new_notes, "updated_at": now,
+                "updated_by": self.actor}
+
     def set_vm_wave(self, morefs: Sequence[str], wave: int) -> Tuple[int, List[str]]:
         """Move queued VMs to another wave. Returns (moved, refusals).
 
@@ -770,6 +824,10 @@ class Store:
             self.conn.execute(
                 "UPDATE discovered SET wave=(SELECT wave FROM vms WHERE moref=?) WHERE moref=?",
                 (moref, moref))
+        # A wave's name and notes describe its VMs (a tenant, say): they move with them.
+        self.conn.execute("UPDATE wave_info SET wave = -wave WHERE wave IN (?,?)", (a, b))
+        self.conn.execute("UPDATE wave_info SET wave = CASE WHEN wave=? THEN ? ELSE ? END WHERE wave IN (?,?)",
+                          (-a, b, a, -a, -b))
         self.conn.execute(
             "INSERT INTO events(ts, level, moref, batch, message) VALUES(?,?,?,?,?)",
             (_now(), "info", None, None,

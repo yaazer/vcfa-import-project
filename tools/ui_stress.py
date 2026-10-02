@@ -379,6 +379,21 @@ const SCENARIOS = {
 
   async waves() {
     await open('waves');
+    // Name wave 1 with the pencil; the name shows on the column and wherever wave 1 is listed.
+    click('[data-act="editWave"][data-w="1"]');
+    const nameIn = await waitFor(() => document.querySelector('.modal [data-field="name"]'));
+    check('the pencil opens the wave description', nameIn);
+    if (nameIn) {
+      type(nameIn, 'Tenant <b>Acme</b>');
+      type(document.querySelector('.modal [data-field="notes"]'), 'CAB-1234\nowner: j.smith');
+      click('.modal [data-m="yes"]');
+      check('the wave shows its name', await waitFor(() => [...document.querySelectorAll('.wave-name')].some((x) => x.textContent === 'Tenant <b>Acme</b>'), 5000));
+      check('a wave name is text, never markup', noInjection() && !document.querySelector('.wave-name b'));
+      check('the notes show under it', /CAB-1234/.test(document.querySelector('.wcol .wave-notes').textContent));
+      await open('overview');
+      check('the overview labels the wave by name', await waitFor(() => /Wave 1 · Tenant <b>Acme<\/b>/.test(document.querySelector('#view').textContent), 5000));
+      await open('waves');
+    }
     click('[data-act="expand"][data-on="1"]');
     await sleep(200);
     const src = document.querySelector('.vmrow[draggable="true"]');

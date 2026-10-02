@@ -230,6 +230,7 @@ class WebApp:
             counts = self.store.counts()
             disc = self.store.discovered_counts()
             waves = len(self.store.waves())
+            wave_names = {w: i["name"] for w, i in self.store.wave_info().items() if i["name"]}
             live = len(self.store.query_batches(
                 states=[st.B_APPLIED, st.B_RUNNING, st.B_ROLLING_BACK]))
             pending = self.store.conn.execute(
@@ -245,6 +246,7 @@ class WebApp:
             "awaiting_commit": counts.get(st.S_AWAITING_COMMIT, 0),
             "discovered": disc,
             "waves": waves,
+            "wave_names": wave_names,
             "live_batches": live,
             "job": active.summary() if active else None,
             "latest_job": latest[0] if latest else None,
@@ -520,6 +522,23 @@ class WebApp:
         with self.lock:
             return service.move_wave(self.store, self.cfg, morefs, wave,
                                      with_app=None if with_app is None else bool(with_app))
+
+    def waves(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            return {"waves": service.wave_summaries(self.store)}
+
+    def waves_info(self, q, body) -> Dict[str, Any]:
+        wave = _int(body.get("wave"), minimum=1)
+        if wave is None:
+            raise ApiError(400, "wave is required")
+        name, notes = body.get("name"), body.get("notes")
+        if (name is not None and not isinstance(name, str)) or (notes is not None and not isinstance(notes, str)):
+            raise ApiError(400, "name and notes must be text")
+        with self.lock:
+            try:
+                return self.store.set_wave_info(wave, name=name, notes=notes)
+            except ValueError as exc:
+                raise ApiError(400, str(exc))
 
     def waves_swap(self, q, body) -> Dict[str, Any]:
         a, b = _int(body.get("a"), minimum=1), _int(body.get("b"), minimum=1)
@@ -1399,6 +1418,8 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("POST", r"/api/vms/retry", "vms_retry"),
         ("GET", r"/api/vms/(?P<moref>[^/]+)", "vm_detail"),
         ("POST", r"/api/waves/swap", "waves_swap"),
+        ("GET", r"/api/waves", "waves"),
+        ("POST", r"/api/waves/info", "waves_info"),
         ("GET", r"/api/batches", "batches"),
         ("GET", r"/api/batches/(?P<ns>[^/]+)/(?P<name>[^/]+)", "batch_detail"),
         ("POST", r"/api/execute/preview", "execute_preview"),
