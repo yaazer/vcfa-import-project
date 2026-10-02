@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import (
@@ -221,6 +222,43 @@ def _blocking_condition(child: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# Child lifecycle reasons that mean the import can never finish, with what they mean.
+# VMCRNotFoundPostCreation (2026-10-01): the VirtualMachine the import created was
+# deleted before the import completed; the operator retries for ever and the batch
+# never reaches Complete. Held for FATAL_AFTER_S first, in case a reason also shows
+# up for a moment right after the VirtualMachine is created.
+FATAL_CHILD_REASONS = {
+    "vmcrnotfoundpostcreation": "the VirtualMachine was deleted before the import completed",
+}
+FATAL_AFTER_S = 120
+
+
+def _fatal_condition(child: Dict[str, Any], now: Optional[datetime] = None) -> Optional[Tuple[str, str]]:
+    """(reason, message) when a child carries a condition it cannot recover from."""
+    status = child.get("status") if isinstance(child.get("status"), dict) else {}
+    now = now or datetime.now(timezone.utc)
+    for cond in status.get("conditions") or []:
+        if not isinstance(cond, dict) or _is_true(cond):
+            continue
+        reason = str(cond.get("reason") or "")
+        meaning = FATAL_CHILD_REASONS.get(reason.replace(" ", "").replace("_", "").lower())
+        if not meaning:
+            continue
+        since = _parse_time(cond.get("lastTransitionTime"))
+        if since is not None and (now - since).total_seconds() < FATAL_AFTER_S:
+            continue
+        detail = _first_str(cond, ("message",))
+        return reason, "{}: {}{}".format(cond.get("type"), meaning, " ({})".format(detail) if detail else "")
+    return None
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def _child_operations(children: List[Dict[str, Any]], batch_name: str, cfg: Config,
                       stage: Optional[str] = None) -> List[OpStatus]:
     """Per-VM status from the batch's ImportOperation children.
@@ -251,6 +289,9 @@ def _child_operations(children: List[Dict[str, Any]], batch_name: str, cfg: Conf
         else:
             phase, message = extract_phase(obj, cfg)
             bucket = classify(phase, cfg)
+        fatal = _fatal_condition(obj)
+        if fatal and bucket not in (BUCKET_SUCCEEDED, BUCKET_ROLLED_BACK):
+            bucket, (phase, message) = BUCKET_FAILED, fatal
         if bucket == BUCKET_RUNNING and not message:
             message = _blocking_condition(obj)
         out.append(

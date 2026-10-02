@@ -1269,6 +1269,16 @@ class Engine:
                         "-- check vCenter".format(ns, name))
                     self.store.set_batch_state(name, ns, st.B_DELETED,
                                                "gone from cluster before rollback")
+                elif "immutable" in str(exc).lower():
+                    # Observed 2026-10-01: once the commit gate is released the operator's
+                    # webhook refuses rollbackAction ("field is immutable").
+                    msg = ("{}/{}: the operator refuses a rollback on this batch (rollbackAction is "
+                           "immutable once a batch is committed). Its VMs cannot be handed back to "
+                           "vCenter; one that never completed needs cleaning up by hand -- see "
+                           "'A VM deleted before its import completed' in the lab guide"
+                           .format(ns, name))
+                    result["errors"].append(msg)
+                    self.store.log_event(msg, "error", batch=name)
                 else:
                     result["errors"].append("{}/{}: {}".format(ns, name, str(exc)[:300]))
                 continue
