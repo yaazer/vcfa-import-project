@@ -477,8 +477,14 @@ def cmd_stage(args) -> int:
     folder_mapping = load_folder_map(args.folder_map) if args.folder_map else {}
     tag_mapping = load_tag_map(args.tag_map) if args.tag_map else {}
     result = stage(rows, cfg, mapping=mapping, folder_mapping=folder_mapping,
-                   default_namespace=args.default_namespace, default_wave=args.wave_single or 1,
-                   tag_mapping=tag_mapping)
+                   default_namespace=args.default_namespace, tag_mapping=tag_mapping)
+    choice_arg = str(args.stage_wave or "auto").strip().lower()
+    mode, number = (("wave", int(choice_arg)) if choice_arg.isdigit() else (choice_arg, None))
+    try:
+        choice = service.place_new_vms(store, cfg, rows, result.records, mode, number)
+    except SelectionError as exc:
+        log(str(exc))
+        return 2
     for move in result.app_moves[:20]:
         log("  ~ " + move)
     if result.ns_conflicts:
@@ -521,6 +527,8 @@ def cmd_stage(args) -> int:
     log("staged {} VM(s) into the import queue".format(len(result.records)))
     log("  added {} | updated {} | unchanged {} | locked (in flight) {}".format(
         summary["added"], summary["updated"], summary["unchanged"], summary["locked"]))
+    for line in service.wave_choice_lines(choice):
+        log(line)
     for conflict in summary["conflicts"][:10]:
         log("  ! " + conflict)
     log("")
@@ -1458,7 +1466,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="folder -> namespace[,wave][,group] mapping CSV; most specific folder wins")
     sp.add_argument("--tag-map", help="vCenter tag -> namespace[,wave][,group] mapping CSV")
     sp.add_argument("--default-namespace", help="namespace for VMs no map covers")
-    sp.add_argument("--wave", dest="wave_single", type=int, default=1)
+    sp.add_argument("--wave", dest="stage_wave", default="auto", metavar="next|maps|N",
+                    help="where VMs new to the queue go: next (one past the highest wave), maps (the "
+                         "maps' wave, as before), or a wave number. Default: maps for the first "
+                         "staging of a campaign, next after that. Queued VMs keep their wave.")
     sp.add_argument("--out", help="write an inventory CSV for review instead of staging directly")
 
     sp = add("preflight", cmd_preflight, "verify CRDs, namespaces, subnets and RBAC")

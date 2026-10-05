@@ -38,6 +38,7 @@ const GLOSSARY = {
   subnet_kind: { t: 'Kind and API group', d: 'Subnet or SubnetSet, and its API group (crd.nsx.vmware.com). Leave blank to use the config default.', doc: RM('the-inventory-csv') },
   default_namespace: { t: 'Default namespace', d: 'Only for VMs nothing else placed. Leave it empty to have them reported and left out instead.' },
   default_wave: { t: 'Default wave', d: 'The wave for VMs that no map or setting gave one.' },
+  stage_wave: { t: 'Wave for new VMs', d: 'Where VMs entering the queue go. Next wave: one past the highest wave in the queue, so each staging of a running campaign opens a new wave. As the maps say: the wave the maps give them. Wave…: one you choose. VMs already in the queue keep their wave, and a wave set on a VM in Select always wins. Until you choose, the first staging follows the maps and later ones go to the next wave.', doc: RM('waves-for-newly-staged-vms') },
   batch_size: { t: 'Batch size', d: 'VMs per ImportOperationBatch. Small batches are easier to inspect and roll back; large ones finish a wave in fewer rounds.', doc: RM('running-1800-vms') },
   parallel: { t: 'Parallel batches', d: 'Batches in flight at once, cluster-wide (with a per-namespace cap). Faster, at the cost of more load on vCenter and the operator.', doc: RM('running-1800-vms') },
   limit: { t: 'Max VMs per wave', d: 'Takes at most this many VMs of each wave in this run — a pilot of ten, say. Empty means all.', doc: RM('running-1800-vms') },

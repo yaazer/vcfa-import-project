@@ -26,6 +26,10 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - Web console: no external assets (no CDN, no web fonts; the jump box may be air-gapped),
   every `/api` call needs the `X-VCFA-Token` header, and cluster-changing endpoints
   require `"confirm": true` on the server side too. Only one job runs at a time.
+- **Staging decides waves only for VMs entering the queue** (`service.place_new_vms`): "auto" =
+  the maps on a campaign's first staging (empty queue), the next wave (highest + 1) after that;
+  "next" / "maps" / a number on request. Queued VMs keep their wave unless "maps" (the old
+  behaviour, which re-applies the maps to pending VMs); a wave set in Select always wins.
 - A wave's **name and notes** (`wave_info`, often the tenant it moves) belong to its VMs, not its
   number: `swap_waves` moves them along. Setting them is an event (`Store.set_wave_info`), and
   every "Wave N" label in the UI goes through `waveLabel()` (names arrive with `/api/pulse`).
