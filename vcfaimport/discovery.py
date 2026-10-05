@@ -411,6 +411,8 @@ class StageResult:
     app_moves: List[str] = field(default_factory=list)    # VMs pulled into their app's wave
     # VMs whose sources named different namespaces: the first won, the rest are listed.
     ns_conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    # Where VMs entering the queue were placed (service.place_new_vms), once decided.
+    wave_choice: Dict[str, Any] = field(default_factory=dict)
 
 
 def stage(

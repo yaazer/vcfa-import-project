@@ -262,6 +262,34 @@ const SCENARIOS = {
     const recs = () => S.view.preview.records;
     const n0 = recs().length;
     check('preview lists the selected VMs', n0 > 0, n0);
+    // The queue already holds waves here, so new VMs default to the next one.
+    const sel = await waitFor(() => document.querySelector('#stage-wave-mode'));
+    const wc = S.view.preview.wave_choice;
+    check('a wave choice for new VMs is offered', sel && wc, JSON.stringify(wc));
+    if (sel && wc) {
+      check('it defaults to the next wave', sel.value === 'next' && /Next wave \(\d+\)/.test(sel.selectedOptions[0].textContent), sel.value);
+      // Where new VMs land is said plainly, and a map wave that will not be used is not shown.
+      const covTxt = () => document.querySelector('#cov-folders').textContent;
+      const waveInputs = () => document.querySelectorAll('.maptable input[data-col="wave"]').length;
+      check('folder rows show where new VMs land', new RegExp('→ Wave ' + wc.next_wave + '\\b').test(covTxt()) && document.querySelector('#cov-folders .wave-dest'), covTxt().slice(0, 300));
+      const fresh = recs().filter((r) => !r.queue_state).length, bar = document.querySelector('#stage-count').textContent;
+      check('so does the Stage bar, for the VMs new to the queue',
+        fresh ? new RegExp(fresh + ' new VMs? ready to stage → Wave ' + wc.next_wave + '\\b').test(bar) : /all already queued/.test(bar), bar);
+      check('the maps\' wave columns are hidden while they do not decide', waveInputs() === 0, waveInputs());
+      const chips = [...document.querySelectorAll('#stage-preview .chip')].map((x) => x.textContent.replace(/\s+/g, ' ').trim());
+      check('the by-wave chips say what they count', chips.some((t) => /^Wave \d+.* · \d+ (new )?VMs?/.test(t)), chips.slice(0, 4).join(' | '));
+      check('and the folder map is titled without a wave', !/& wave/.test(document.querySelector('#sec-folders h3').textContent));
+      sel.value = 'maps'; sel.dispatchEvent(new Event('change', { bubbles: true }));
+      check('as the maps say, the wave columns come back', await waitFor(() => waveInputs() > 0, 5000));
+      check('and the rows show the map\'s own wave', /→ Wave \d/.test(covTxt()), covTxt().slice(0, 300));
+      const s1 = document.querySelector('#stage-wave-mode');   // re-rendered on every change
+      s1.value = 'wave'; s1.dispatchEvent(new Event('change', { bubbles: true }));
+      const num = await waitFor(() => document.querySelector('#def-wave'));
+      check('Wave… asks for a number, starting at the next wave', num && +num.value === wc.next_wave, num && num.value);
+      const s2 = document.querySelector('#stage-wave-mode');
+      s2.value = 'maps'; s2.dispatchEvent(new Event('change', { bubbles: true }));   // the map edits below include a wave
+      await waitFor(() => waveInputs() > 0, 5000);
+    }
     const rowsBefore = S.view.fr.length;
     click('[data-act="addRow"][data-m="f"]:not([data-key])');
     await sleep(100);
@@ -322,7 +350,7 @@ const SCENARIOS = {
     check('the Supervisor\'s subnets are listed with their namespace', sbChip && /^(prod-web-ns1|prod-db-ns2|dmz-ns3)$/.test((sbChip.querySelector('small') || {}).textContent || ''), sbChip && sbChip.textContent);
     check('portgroup and subnet fields suggest them', document.querySelector('#pg-options option[value="VLAN300-Spare"]') && document.querySelector('#subnet-options option[value="subnet-vlan200"]'));
     check('the portgroup and subnet columns are wired to them', document.getElementById('n-0-portgroup').getAttribute('list') === 'pg-options' && document.getElementById('n-0-subnet').getAttribute('list') === 'subnet-options');
-    document.getElementById('def-wave').focus();          // no portgroup field in focus: the click adds a row
+    document.getElementById('stage-wave-mode').focus();   // no portgroup field in focus: the click adds a row
     const nBefore = S.view.nr.length;
     pgChip.click();
     check('clicking an unmapped portgroup adds it to the portgroup map', await waitFor(() => S.view.nr.length === nBefore + 1 && S.view.nr[nBefore].portgroup === 'VLAN300-Spare', 3000));
@@ -335,7 +363,7 @@ const SCENARIOS = {
     check('a portgroup pattern that matches nothing is flagged', document.getElementById('n-' + nBefore + '-portgroup').classList.contains('unknown'));
     type('#n-' + nBefore + '-portgroup', 'vlan3*');
     check('a pattern matches portgroups case-insensitively, as staging does', !document.getElementById('n-' + nBefore + '-portgroup').classList.contains('unknown'));
-    document.getElementById('def-wave').focus();
+    document.getElementById('stage-wave-mode').focus();
     [...document.querySelectorAll('.nsbar .sbchip')][0].click();
     check('a subnet click with no subnet field in focus explains what to do', await waitFor(() => [...document.querySelectorAll('.toast')].some((x) => /Subnet field first/.test(x.textContent)), 3000));
     click('[data-act="delRow"][data-m="n"][data-i="' + nBefore + '"]');

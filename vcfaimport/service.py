@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import Config
-from .discovery import match_folder_map, _match_mapping  # noqa: F401  (re-exported for web)
+from .discovery import SelectionError, match_folder_map, _match_mapping  # noqa: F401  (re-exported for web)
 from .engine import STAGE_IMPORT, AbortRun, Engine, cleanup_candidates
 from .kube import Kubectl, KubectlError
 from .folders import folder_matches, norm_folder
@@ -350,6 +350,92 @@ def vm_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "updated_at": row["updated_at"],
         "locked": row["state"] in st.WAVE_LOCKED_STATES,
     }
+
+
+# ------------------------------------------------------------ staging waves
+# Where VMs entering the queue go. "maps": the wave the maps (or the default wave)
+# give them -- as staging always did. "next": one past the highest wave in the
+# queue, so each staging pass of a running campaign opens the next wave. "wave":
+# a wave named by number. "auto" is "maps" for the first staging of a campaign
+# (an empty queue: the maps lay out the waves) and "next" after that.
+WAVE_MODES = ("auto", "next", "maps", "wave")
+
+
+def next_wave(store: st.Store) -> int:
+    waves = store.waves()
+    return (max(waves) + 1) if waves else 1
+
+
+def place_new_vms(store: st.Store, cfg: Config, rows: Sequence[sqlite3.Row], records: Sequence[Any],
+                  mode: str = "auto", wave: Optional[int] = None) -> Dict[str, Any]:
+    """Settle the wave of every staged record, in place. Returns what was decided.
+
+    Under "next" and "wave", only VMs entering the queue are placed: a VM already
+    queued keeps its wave (re-staging still refreshes its namespace and subnets;
+    moving it is the Waves page's job), a wave set on the VM in Select still wins,
+    and with app_together a new VM joins its application's wave if the app is
+    already queued. "maps" leaves stage()'s waves exactly as they were.
+    """
+    mode = (mode or "auto").lower()
+    if mode not in WAVE_MODES:
+        raise SelectionError("wave choice must be one of: {}".format(", ".join(WAVE_MODES)))
+    queued = {r["moref"]: (r["wave"], r["app"]) for r in store.conn.execute("SELECT moref, wave, app FROM vms")}
+    nxt = (max(w for w, _ in queued.values()) + 1) if queued else 1
+    resolved = mode if mode != "auto" else ("next" if queued else "maps")
+    out: Dict[str, Any] = {"mode": resolved, "asked": mode, "next_wave": nxt, "wave": None,
+                           "placed": 0, "kept": 0, "explicit": 0, "with_app": 0, "maps_overridden": 0}
+    if resolved == "maps":
+        return out
+    if resolved == "wave":
+        if not wave or int(wave) < 1:
+            raise SelectionError("a wave number of 1 or higher is needed")
+        target = int(wave)
+    else:
+        target = nxt
+    out["wave"] = target
+    explicit = {r["moref"]: int(r["wave"] or 0) for r in rows}
+    app_wave: Dict[str, int] = {}
+    if getattr(cfg, "app_together", False):
+        for w, app in queued.values():
+            if app:
+                app_wave[app] = min(app_wave.get(app, w), w)
+    for rec in records:
+        if rec.moref in queued:
+            rec.wave = queued[rec.moref][0]
+            out["kept"] += 1
+        elif explicit.get(rec.moref):
+            rec.wave = explicit[rec.moref]
+            out["explicit"] += 1
+        elif rec.app and rec.app in app_wave:
+            rec.wave = app_wave[rec.app]
+            out["with_app"] += 1
+        else:
+            if rec.wave != target and rec.wave != 1:
+                out["maps_overridden"] += 1      # the maps named a wave; this choice beats it
+            rec.wave = target
+            out["placed"] += 1
+    return out
+
+
+def wave_choice_lines(choice: Dict[str, Any]) -> List[str]:
+    """What place_new_vms decided, for the CLI and the console log."""
+    if choice["mode"] == "maps":
+        return ["  waves: as the maps say{}".format(" (first staging of the campaign)" if choice["asked"] == "auto" else "")]
+    if choice["placed"]:
+        lines = ["  waves: {} new VM(s) into wave {}{}".format(
+            choice["placed"], choice["wave"], " (the next wave)" if choice["mode"] == "next" else "")]
+    else:
+        lines = ["  waves: nothing new to place; wave {} is where new VMs would go".format(choice["wave"])]
+    if choice["maps_overridden"]:
+        lines.append("    the maps named another wave for {} of them; choose \"As the maps say\" "
+                     "(--wave maps) to follow the maps".format(choice["maps_overridden"]))
+    if choice["kept"]:
+        lines.append("    {} already queued keep their wave (move them on the Waves page)".format(choice["kept"]))
+    if choice["explicit"]:
+        lines.append("    {} keep the wave set on them in Select".format(choice["explicit"]))
+    if choice["with_app"]:
+        lines.append("    {} join their application's wave".format(choice["with_app"]))
+    return lines
 
 
 def wave_summaries(store: st.Store) -> List[Dict[str, Any]]:

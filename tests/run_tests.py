@@ -3126,6 +3126,13 @@ def t_web_stage_edges():
 
             body = {"folder_rows": [{"folder": "Prod", "namespace": "ns-new", "wave": "5"}],
                     "default_namespace": "ns-default", "default_wave": 2}
+            # Every VM here is already queued: by default they keep their waves ...
+            p = c.ok("POST", "/api/stage/preview", body)
+            eq(p["wave_choice"]["mode"], "next")
+            eq({r["wave"] for r in p["records"]}, {1, 2}, "queued VMs keep their wave")
+            eq(p["wave_choice"]["kept"], 9)
+            # ... and "as the maps say" re-applies the maps and the default wave, as staging always did.
+            body["wave_mode"] = "maps"
             p = c.ok("POST", "/api/stage/preview", body)
             eq(p["problems"], [])
             nss = {r["moref"]: (r["namespace"], r["wave"]) for r in p["records"]}
@@ -5415,10 +5422,127 @@ def t_e2e_vm_deleted_before_commit():
         vms = {v["moref"]: v for v in json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
         eq({vms[m]["state"] for m in ("vm-1001", "vm-1003", "vm-1004")}, {"committed"})
 
+@test("staging opens the next wave for new VMs; queued and explicit waves are kept")
+def t_place_new_vms():
+    from vcfaimport import service
+    from vcfaimport.discovery import SelectionError
+    from vcfaimport.inventory import VmRecord
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        def recs(*specs):
+            return [VmRecord(moref=m, vm_name=m, namespace="ns-a", nics=[], wave=w, app=a) for m, w, a in specs]
+        def rows(*specs):
+            return [{"moref": m, "wave": w} for m, w in specs]
+
+        # An empty queue: the first staging follows the maps.
+        first = recs(("vm-1", 2, ""), ("vm-2", 2, ""))
+        choice = service.place_new_vms(store, Config(), rows(("vm-1", 0), ("vm-2", 0)), first)
+        eq((choice["mode"], [r.wave for r in first]), ("maps", [2, 2]))
+        store.sync_inventory(first)
+
+        # Later passes open the next wave, whatever the map says.
+        cfg = Config()
+        cfg.app_together = True
+        store.sync_inventory(recs(("vm-3", 4, "Payroll")))              # waves 2 and 4 queued
+        later = recs(("vm-1", 2, ""), ("vm-10", 2, ""), ("vm-11", 1, ""), ("vm-12", 2, ""), ("vm-13", 2, "Payroll"))
+        choice = service.place_new_vms(store, cfg, rows(("vm-1", 0), ("vm-10", 0), ("vm-11", 0), ("vm-12", 7), ("vm-13", 0)), later)
+        eq((choice["mode"], choice["wave"], choice["next_wave"]), ("next", 5, 5))
+        eq({r.moref: r.wave for r in later}, {"vm-1": 2, "vm-10": 5, "vm-11": 5, "vm-12": 7, "vm-13": 4})
+        eq((choice["placed"], choice["kept"], choice["explicit"], choice["with_app"], choice["maps_overridden"]),
+           (2, 1, 1, 1, 1), "vm-10's map said 2; vm-11 had no map wave")
+        lines = service.wave_choice_lines(choice)
+        assert "2 new VM(s) into wave 5 (the next wave)" in lines[0] and "--wave maps" in lines[1], lines
+
+        # Nothing new: say so plainly rather than "0 new VM(s) into wave 5".
+        again = recs(("vm-1", 2, ""))
+        lines = service.wave_choice_lines(service.place_new_vms(store, cfg, rows(("vm-1", 0)), again))
+        assert lines[0].strip() == "waves: nothing new to place; wave 5 is where new VMs would go", lines
+        assert "1 already queued keep their wave" in lines[1], lines
+
+        # A named wave, and the maps on request.
+        named = recs(("vm-20", 2, ""))
+        eq(service.place_new_vms(store, cfg, rows(("vm-20", 0)), named, "wave", 3)["wave"], 3)
+        eq(named[0].wave, 3)
+        mapped = recs(("vm-21", 2, ""), ("vm-1", 9, ""))
+        service.place_new_vms(store, cfg, rows(("vm-21", 0), ("vm-1", 0)), mapped, "maps")
+        eq([r.wave for r in mapped], [2, 9], "maps: exactly what the maps said, queued VMs included")
+        for mode, wave in (("sideways", None), ("wave", None), ("wave", 0)):
+            try:
+                service.place_new_vms(store, cfg, [], [], mode, wave)
+                raise AssertionError("accepted {} {}".format(mode, wave))
+            except SelectionError:
+                pass
+        store.close()
+
+
+@test("console: each staging of a running campaign lands in the next wave (lab, 2026-10-05)")
+def t_web_stage_next_wave():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            store = c.app.store
+            store.upsert_discovered([{"moref": "vm-{}".format(100 + i), "name": "lab-{:02d}".format(i),
+                                      "power_state": "POWERED_ON", "folder": "migration-wave3",
+                                      "nics": [{"device_key": 4000, "network_name": "mgmt-tools"}]} for i in range(9)])
+            # The lab's maps: the folder always says wave 2.
+            body = {"folder_rows": [{"folder": "migration-wave3", "namespace": "ns-a", "wave": "2"}],
+                    "network_rows": [{"portgroup": "mgmt-tools", "subnet": "sub-a", "namespace": "", "wave": "2"}]}
+            waves_seen = []
+            for batch in (range(0, 3), range(3, 6), range(6, 9)):
+                store.set_selected([r["moref"] for r in store.query_discovered()], False)
+                store.set_selected(["vm-{}".format(100 + i) for i in batch], True)
+                p = c.ok("POST", "/api/stage/preview", body)
+                waves_seen.append(sorted({r["wave"] for r in p["records"]}))
+                r = c.ok("POST", "/api/stage", body)
+                eq(r["added"], 3)
+            eq(waves_seen, [[2], [3], [4]], "maps first, then the next wave each time")
+            eq(store.waves(), [2, 3, 4])
+            assert any("wave 4" in e["message"] for e in store.recent_events()), "the event says where they went"
+            # Choosing the maps follows them again, for new VMs and queued ones alike.
+            store.set_selected(["vm-108"], True)
+            p = c.ok("POST", "/api/stage/preview", dict(body, wave_mode="maps"))
+            eq({r["wave"] for r in p["records"]}, {2})
+            eq(c.call("POST", "/api/stage/preview", dict(body, wave_mode="wave"))[0], 400, "Wave… needs a number")
+            eq({r["wave"] for r in c.ok("POST", "/api/stage/preview", dict(body, wave_mode="wave", wave=9))["records"]}, {4},
+               "a queued VM keeps its wave even when a wave is named")
+        finally:
+            c.close()
+
+@test("cli: stage --wave next|maps|N, and the next wave by default after the first staging")
+def t_cli_stage_wave():
+    from vcfaimport.state import Store
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "happy")
+        cfg = _write_config(tmp)
+        store = Store(str(Path(tmp, "run", "state.db")))
+        store.upsert_discovered([{"moref": "vm-{}".format(100 + i), "name": "lab-{:02d}".format(i),
+                                  "power_state": "POWERED_ON", "folder": "migration-wave3", "nics": []}
+                                 for i in range(4)])
+        store.set_selected(["vm-100", "vm-101"], True)
+        store.close()
+        fmap = str(Path(tmp, "folder-map.csv"))
+        write_csv(fmap, [["migration-wave3", "ns-a", "2", ""]], ["folder", "namespace", "wave", "group"])
+        stage = ["-c", cfg, "stage", "--folder-map", fmap]
+        out = _run_cli(stage, env, tmp).stdout
+        assert "waves: as the maps say (first staging of the campaign)" in out, out
+        db = Store(str(Path(tmp, "run", "state.db")))
+        db.set_selected(["vm-102"], True)
+        db.close()
+        out = _run_cli(stage, env, tmp).stdout
+        assert "1 new VM(s) into wave 3 (the next wave)" in out and "2 already queued keep their wave" in out, out
+        db = Store(str(Path(tmp, "run", "state.db")))
+        db.set_selected(["vm-103"], True)
+        db.close()
+        assert "waves: as the maps say" in _run_cli(stage + ["--wave", "maps"], env, tmp).stdout
+        _run_cli(stage + ["--wave", "sideways"], env, tmp, expect=2)
+        vms = {v["moref"]: v["wave"] for v in json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
+        eq(vms, {"vm-100": 2, "vm-101": 2, "vm-102": 2, "vm-103": 2},
+           "--wave maps re-applies the map to every pending VM, as staging always did")
+
 UNIT = [
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
     t_app_icon, t_status_child_blocking_condition, t_discovery_drift, t_precheck_max_age,
-    t_run_members_left_over, t_wave_info, t_web_wave_info, t_cli_waves, t_status_child_vm_deleted,
+    t_run_members_left_over, t_place_new_vms, t_web_stage_next_wave, t_cli_stage_wave, t_wave_info, t_web_wave_info, t_cli_waves, t_status_child_vm_deleted,
     t_vcenter_portgroups,
     t_stage_ns_conflicts,
     t_serve_open_headless, t_python_version_message,

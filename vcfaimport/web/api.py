@@ -408,11 +408,15 @@ class WebApp:
                                         else self._tag_rows())
         default_ns = (body.get("default_namespace") or "").strip() or None
         default_wave = _int(body.get("default_wave"), default=1, minimum=1)
+        wave_mode = str(body.get("wave_mode") or "auto")
+        wave_no = _int(body.get("wave"), minimum=1)
         with self.lock:
             selected = self.store.query_discovered(selected=True)
             result = stage(selected, self.cfg, mapping=network_mapping,
                            folder_mapping=folder_mapping, default_namespace=default_ns,
                            default_wave=default_wave, tag_mapping=tag_mapping)
+            result.wave_choice = service.place_new_vms(self.store, self.cfg, selected, result.records,
+                                                       wave_mode, wave_no)
         coverage = service.mapping_coverage(selected, folder_mapping, network_mapping)
         coverage["tags"] = self._tag_coverage(selected, tag_mapping)
         return selected, result, coverage
@@ -449,6 +453,8 @@ class WebApp:
             "coverage": coverage,
             "app_moves": result.app_moves,
             "ns_conflicts": result.ns_conflicts,
+            "wave_choice": result.wave_choice,
+            "wave_notes": service.wave_choice_lines(result.wave_choice),
         }
 
     def stage_commit(self, q, body) -> Dict[str, Any]:
@@ -462,12 +468,16 @@ class WebApp:
                 "; ".join(result.problems[:3]) or "no records"))
         with self.lock:
             summary = self.store.sync_inventory(result.records)
-            self.store.log_event("staged {} VM(s) from the web console ({} added, {} updated)"
-                                 .format(len(result.records), summary["added"], summary["updated"]))
+            wc = result.wave_choice
+            self.store.log_event("staged {} VM(s) from the web console ({} added, {} updated); {}"
+                                 .format(len(result.records), summary["added"], summary["updated"],
+                                         "waves as the maps say" if wc["mode"] == "maps" else
+                                         "new VMs into wave {}".format(wc["wave"])))
         summary["staged"] = len(result.records)
         summary["problems"] = result.problems
         summary["app_moves"] = result.app_moves
         summary["ns_conflicts"] = result.ns_conflicts
+        summary["wave_choice"] = result.wave_choice
         return summary
 
     # =============================================================== queue

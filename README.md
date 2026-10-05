@@ -477,9 +477,45 @@ VLAN2*,,subnet-vlan2xx,2,,,
 `init` writes both map files with every column present.
 
 Namespace precedence: picker / `select --namespace` → folder map → portgroup
-map → `--default-namespace`. Wave follows the same order. **A VM with no
-namespace is reported, never guessed** — `stage` lists it with its folder and
-leaves it out; folders with no rule are listed too.
+map → `--default-namespace`. Wave follows the same order, unless staging puts new
+VMs in the next wave (below). **A VM with no namespace is reported, never
+guessed** — `stage` lists it with its folder and leaves it out; folders with no
+rule are listed too.
+
+### Waves for newly staged VMs
+
+A campaign usually moves one wave at a time: stage some VMs, import them, stage the next
+batch. So staging decides where VMs **new to the queue** go:
+
+| choice | `stage --wave` | console (*Map & Stage → Wave for new VMs*) | new VMs go to |
+|---|---|---|---|
+| next wave | `next` | *Next wave (N)* | one past the highest wave in the queue |
+| the maps | `maps` | *As the maps say* | the wave the tag, folder or portgroup map gives them (1 if none does): how staging always worked |
+| a wave | `3` | *Wave…* | that wave |
+
+Without a choice, the first staging of a campaign (an empty queue) follows the maps, so
+they can lay out the opening waves, and every staging after that goes to the **next wave**.
+A wave in the maps (`migration-wave3,ns,2`) therefore no longer pins every later staging to
+wave 2: the preview and the CLI say when a map's wave was set aside, and `--wave maps` follows
+it.
+
+In the console, every folder and tag row and the bar next to the *Stage* button say where the
+new VMs land (*3 new VMs ready to stage → Wave 6*). The maps' own *Wave* column is only shown while
+*As the maps say* is chosen; its values stay in the map files either way.
+
+Whatever the choice:
+
+- **VMs already in the queue keep their wave.** Staging again still refreshes their namespace and
+  subnets; moving them between waves is the Waves page's job (or `--wave maps`, which re-applies
+  the maps to pending VMs as before).
+- **A wave set on a VM in Select** (the picker, the selection bar, `select --wave`) wins.
+- **With `app_together`,** a new VM whose application is already queued joins that application's wave.
+
+```bash
+vcfa-import stage --folder-map folder-map.csv --map portgroup-map.csv              # next wave after the first staging
+vcfa-import stage --folder-map folder-map.csv --map portgroup-map.csv --wave maps  # follow the maps' wave column
+vcfa-import stage --folder-map folder-map.csv --map portgroup-map.csv --wave 4
+```
 
 ### Naming waves
 

@@ -679,7 +679,7 @@ function nsConflicts(p) {
 // ============================================================ MAP & STAGE
 VIEWS.stage = view({
   title: 'Map & Stage', sub: 'Step 3 · decide namespace, wave and subnet, then build the import queue',
-  init(v) { v.defaults = v.defaults || { ns: '', wave: 1 }; v.recPage = 0; v.adv = v.adv || false; v.result = null; },
+  init(v) { v.defaults = v.defaults || { ns: '', wave: '' }; v.recPage = 0; v.adv = v.adv || false; v.result = null; },
   async load(v) {
     const m = await GET('/api/maps');
     v.maps = m;
@@ -702,15 +702,15 @@ VIEWS.stage = view({
     return html`
       <details class="note info how" ${attr(v.howOpen, 'open')} data-toggle="howOpen"><summary><b>How each VM's namespace, wave and subnet are decided</b></summary>
         <p>A VM's <b>namespace</b> comes from, in order: the namespace set on it in Select, the tag map, the folder map (most specific folder wins), the portgroup map, then the default in step 4.
-        <b>Wave</b> follows the same order. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.</p>
+        <b>Wave</b> follows the same order for the first staging of a campaign; after that, VMs new to the queue go to the next wave unless you choose otherwise under <b>Wave for new VMs</b>. VMs already queued keep their wave. <b>Subnets</b> come from the portgroup map. Nothing is guessed: a VM with no namespace is reported and left out.</p>
         <p>Name a VM's namespace in one place — usually the folder map — and use the portgroup map for subnets.</p></details>
       <datalist id="ns-options">${nsOptions(inMaps)}</datalist>
       <datalist id="pg-options">${pgOptions(uniq(v.nr.map((r) => r.portgroup)).sort())}</datalist>
       <datalist id="subnet-options">${subnetOptions(uniq(v.nr.map((r) => r.subnet)).sort())}</datalist>
       <div class="mt">${targetsPanel(v)}</div>
       <div class="flow mt">
-      ${flowSec(1, html`<div class="card"><div class="card-h"><h3>Folders → namespace &amp; wave ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
-          <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage)}</div></div>
+      ${flowSec(1, html`<div class="card"><div class="card-h"><h3>Folders → namespace${mapsDecideWaves(p.wave_choice) ? html` &amp; wave` : ''} ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
+          <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage, p.wave_choice)}</div></div>
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'f')}</div>
           <div class="card-f"><button class="btn sm" data-act="addRow" data-m="f">${icon('plus')} Add entry</button><span class="small muted">Globs allowed, e.g. <code>Legacy/*</code>. A folder covers its whole subtree.</span>${tip('batch_group')}</div></div>`, st.folders, 'sec-folders')}
       ${flowSec(2, html`<div class="card"><div class="card-h"><h3>Networks → subnet ${tip('portgroup_map')}</h3><span class="sub mono tiny" title="${v.maps.network.path}">${v.maps.network.path.split(/[\\/]/).pop()}</span>
@@ -719,17 +719,16 @@ VIEWS.stage = view({
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'n')}</div>
           <div class="card-f"><button class="btn sm" data-act="addRow" data-m="n">${icon('plus')} Add entry</button><span class="small muted">In a VPC namespace, name the Subnet as it appears in the VPC's own namespace.</span>${tip('subnet')}</div></div>`, st.networks, 'sec-networks')}
       ${flowSec(3, html`<details class="card tagmap" ${attr(v.tr.length || (p.coverage.tags || []).length && v.tagOpen !== false, 'open')} data-toggle="tagOpen">
-        <summary class="card-h"><h3>${icon('tag')} vCenter tags → namespace &amp; wave ${tip('tag_map')}</h3><span class="sub">optional · beats the folder map · <span class="mono tiny">${v.maps.tag.path.split(/[\\/]/).pop()}</span></span></summary>
-        <div class="card-b"><div class="small muted mb">Tags on the selected VMs</div><div id="cov-tags" class="cov">${covTags(p.coverage)}</div></div>
+        <summary class="card-h"><h3>${icon('tag')} vCenter tags → namespace${mapsDecideWaves(p.wave_choice) ? html` &amp; wave` : ''} ${tip('tag_map')}</h3><span class="sub">optional · beats the folder map · <span class="mono tiny">${v.maps.tag.path.split(/[\\/]/).pop()}</span></span></summary>
+        <div class="card-b"><div class="small muted mb">Tags on the selected VMs</div><div id="cov-tags" class="cov">${covTags(p.coverage, p.wave_choice)}</div></div>
         <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 't')}</div>
         <div class="card-f"><button class="btn sm" data-act="addRow" data-m="t">${icon('plus')} Add entry</button><span class="small muted">Tags are <code>Category:Tag</code>; globs allowed, e.g. <code>Application:*</code>. An exact tag beats a glob.</span></div></details>`, 'opt')}
       ${flowSec(4, html`<div class="card"><div class="card-h"><h3>Review the result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
         <div class="tools"><label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default namespace ${tip('default_namespace')}</span>
           <input class="input sm ${nsInputClass(v.defaults.ns)}" id="def-ns" list="ns-options" data-input="defNs" value="${v.defaults.ns}" placeholder="none — report instead" style="width:200px"${nsInputAttrs(v.defaults.ns)}></label>
-          <label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Default wave ${tip('default_wave')}</span>
-          <input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px"></label></div></div>
+          <span id="stage-wave">${waveChoiceControl(v)}</span></div></div>
         <div id="stage-preview">${stagePreview(v)}</div></div>`, st.result, 'sec-result')}
-      ${flowNext('stage', plural(p.records.length, 'VM') + ' ready to stage',
+      ${flowNext('stage', stageCountTitle(p),
         html`${dirty ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span>` : 'Maps saved.'} Staging again later is safe: VMs already in flight are never changed.`,
         html`<button class="btn" data-act="saveMaps">Save maps</button>
         <button class="btn primary" data-act="stage" ${attr(!p.records.length, 'disabled')}>Stage ${icon('arrow')}</button>`, { title: 'stage-count', text: 'stage-dirty' })}
@@ -793,6 +792,14 @@ VIEWS.stage = view({
     howOpen(t, e, v) { v.howOpen = t.open; },
     adv(t, e, v) { v.adv = t.checked; v.render(); },
     defNs(t, e, v) { v.defaults.ns = t.value; markNs(t); schedulePreview(v); },
+    async waveMode(t, e, v) {
+      v.defaults.waveMode = t.value;
+      if (t.value === 'wave' && !v.defaults.wave) v.defaults.wave = (v.preview.wave_choice || {}).next_wave || 1;
+      mount($('#stage-wave'), waveChoiceControl(v));
+      // The maps' wave columns only exist while the maps decide: redraw once the preview says so.
+      await runPreview(v);
+      if (S.view === v) v.render();
+    },
     defWave(t, e, v) { v.defaults.wave = t.value; schedulePreview(v); },
     page(t, e, v) { v.recPage = +t.dataset.page; mount($('#stage-preview'), stagePreview(v)); },
     async saveMaps(t, e, v) {
@@ -840,16 +847,29 @@ function markField(input, kind) {
 }
 const markNs = (input) => markField(input, 'namespace');
 function stageBody(v) {
-  return { folder_rows: v.fr, network_rows: v.nr, tag_rows: v.tr, default_namespace: v.defaults.ns, default_wave: parseInt(v.defaults.wave, 10) || 1 };
+  return { folder_rows: v.fr, network_rows: v.nr, tag_rows: v.tr, default_namespace: v.defaults.ns,
+    wave_mode: v.defaults.waveMode || 'auto', wave: v.defaults.waveMode === 'wave' ? parseInt(v.defaults.wave, 10) || null : null };
+}
+// Where VMs new to the queue go. Until the user picks, the server decides ("auto"):
+// the maps on a campaign's first staging, the next wave after that.
+function waveChoiceControl(v) {
+  const wc = (v.preview && v.preview.wave_choice) || { mode: 'maps', next_wave: 1 };
+  const mode = v.defaults.waveMode || wc.mode;
+  return html`<label class="field" style="grid-auto-flow:column;align-items:center;gap:8px"><span>Wave for new VMs ${tip('stage_wave')}</span>
+    <select class="select sm" id="stage-wave-mode" data-change="waveMode">
+      <option value="next" ${attr(mode === 'next', 'selected')}>Next wave (${wc.next_wave})</option>
+      <option value="maps" ${attr(mode === 'maps', 'selected')}>As the maps say</option>
+      <option value="wave" ${attr(mode === 'wave', 'selected')}>Wave…</option></select>
+    ${mode === 'wave' ? html`<input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px">` : ''}</label>`;
 }
 const mapsSig = (v) => JSON.stringify([v.fr, v.nr, v.tr]);
 const rowsOf = (v, m) => (m === 'f' ? v.fr : m === 't' ? v.tr : v.nr);
-function covTags(cov) {
+function covTags(cov, wc) {
   const tags = cov.tags || [];
   if (!tags.length) return html`<span class="small muted">The selected VMs carry no vCenter tags${S.info.features ? '' : ''} (or discovery skipped them).</span>`;
   return tags.map((x) => html`<div class="covrow ${x.pattern ? '' : 'dim'}">${icon('tag')}<span class="p mono" title="${x.tag}">${x.tag}</span>
     <span class="small muted">${plural(x.vms, 'VM')}</span><span class="arrow">→</span>
-    ${x.pattern ? html`<span class="small"><span class="mono">${x.namespace || html`<span class="faint">no namespace</span>`}</span>${x.wave ? ' · wave ' + x.wave : ''}
+    ${x.pattern ? html`<span class="small"><span class="mono">${x.namespace || html`<span class="faint">no namespace</span>`}</span>${mapWave(x.wave, wc)}
       ${x.pattern !== x.tag ? html`<span class="tag" title="matched by ${x.pattern}">via ${x.pattern}</span>` : ''}</span>`
       : html`<span class="small faint">not mapped</span><button class="btn xs" data-act="addRow" data-m="t" data-key="${x.tag}">${icon('plus')} Map</button>`}</div>`);
 }
@@ -860,11 +880,12 @@ async function runPreview(v) {
   } catch (e) { v.previewErr = e.message; }
   if (S.view !== v) return;
   mount($('#stage-preview'), stagePreview(v));
-  mount($('#cov-folders'), covFolders(v.preview.coverage));
+  if (!v.previewErr) mount($('#stage-wave'), waveChoiceControl(v));
+  mount($('#cov-folders'), covFolders(v.preview.coverage, v.preview.wave_choice));
   mount($('#cov-networks'), covNetworks(v.preview.coverage));
-  mount($('#cov-tags'), covTags(v.preview.coverage));
+  mount($('#cov-tags'), covTags(v.preview.coverage, v.preview.wave_choice));
   const c = $('#stage-count');
-  if (c) c.textContent = plural(v.preview.records.length, 'VM') + ' ready to stage';
+  if (c) mount(c, stageCountTitle(v.preview));
   const st = stageStates(v);
   setSecState('sec-folders', st.folders);
   setSecState('sec-networks', st.networks);
@@ -875,24 +896,46 @@ async function runPreview(v) {
 const schedulePreview = debounce((v) => runPreview(v), 400);
 function mapTable(v, m) {
   const rows = rowsOf(v, m);
-  const cols = m === 'f' ? [['folder', 'Folder', ''], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', ''], ['group', 'Batch group', '']]
+  // A map's wave only applies while Wave for new VMs follows the maps; otherwise the column is
+  // hidden (its values stay in the file) so nobody reads a wave that will not be used.
+  const showWave = mapsDecideWaves(v.preview && v.preview.wave_choice);
+  const cols = (m === 'f' ? [['folder', 'Folder', ''], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', ''], ['group', 'Batch group', '']]
     : m === 't' ? [['tag', 'Tag (Category:Tag)', ''], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', ''], ['group', 'Batch group', '']]
     : [['portgroup', 'Portgroup', 'pg-options'], ['subnet', 'Subnet', 'subnet-options'], ['namespace', 'Namespace', 'ns-options'], ['wave', 'Wave', '']]
-      .concat(v.adv ? [['device_key', 'Device key', ''], ['subnet_kind', 'Kind', ''], ['subnet_api_group', 'API group', '']] : []);
+      .concat(v.adv ? [['device_key', 'Device key', ''], ['subnet_kind', 'Kind', ''], ['subnet_api_group', 'API group', '']] : []))
+    .filter((c) => showWave || c[0] !== 'wave');
   if (!rows.length) return html`<div class="card-b small muted">No entries yet. Use <b>+ Map</b> next to a ${m === 'f' ? 'folder' : m === 't' ? 'tag' : 'network'} above, or add one.</div>`;
   return html`<div class="table-wrap" style="max-height:340px" data-scroll="map-${m}"><table class="t maptable"><thead><tr>${cols.map((c) => html`<th>${c[1]}</th>`)}<th></th></tr></thead><tbody>
     ${rows.map((r, i) => html`<tr>${cols.map(([k, , list]) => html`<td style="${k === 'wave' || k === 'device_key' ? 'width:70px' : ''}"><input class="input ${k === 'folder' || k === 'portgroup' || k === 'tag' ? 'mono' : ''} ${fieldBad(k, r[k]) ? 'unknown' : ''}"
       id="${m}-${i}-${k}" data-input="cell" data-m="${m}" data-i="${i}" data-col="${k}" value="${r[k] || ''}" ${list ? raw(`list="${list}"`) : ''} ${k === 'wave' || k === 'device_key' ? raw('inputmode="numeric"') : ''}${fieldAttrs(k, r[k])}></td>`)}
       <td style="width:34px"><button class="btn ghost icon sm" data-act="delRow" data-m="${m}" data-i="${i}" title="Remove">${icon('x')}</button></td></tr>`)}</tbody></table></div>`;
 }
-function covFolders(cov) {
+// A map's wave only decides when Wave for new VMs follows the maps. Either way each row says,
+// plainly and prominently, which wave its new VMs will land in.
+function mapsDecideWaves(wc) { return !wc || wc.mode === 'maps'; }
+function waveDest(w, title) { return html`<span class="wave-dest" title="${title || ''}">→ ${waveLabel(w)}</span>`; }
+function mapWave(wave, wc) {
+  if (mapsDecideWaves(wc)) return wave ? html` ${waveDest(wave, 'The wave this map entry gives')}` : '';
+  return html` ${waveDest(wc.wave, (wc.mode === 'next' ? 'The next wave' : 'The wave chosen under Wave for new VMs') +
+    (wave ? ' (the map says wave ' + wave + '; choose “As the maps say” to use it)' : '') + '. VMs already queued keep their wave.')}`;
+}
+// "3 new VMs ready to stage → Wave 6", said where the Stage button is. Only VMs new to the queue
+// are placed; the ones already queued keep their wave, so they are counted, not sent anywhere.
+function stageCountTitle(p) {
+  const fresh = p.records.filter((r) => !r.queue_state), queued = p.records.length - fresh.length;
+  if (!fresh.length) return html`${plural(p.records.length, 'VM')} ready to stage <span class="small muted">· all already queued, nothing new</span>`;
+  const waves = uniq(fresh.map((r) => r.wave)).sort((a, b) => a - b);
+  const where = waves.length === 1 ? waveDest(waves[0]) : html`<span class="wave-dest">→ waves ${waves.join(', ')}</span>`;
+  return html`${plural(fresh.length, 'new VM')} ready to stage ${where}${queued ? html` <span class="small muted">· ${n(queued)} already queued keep their wave</span>` : ''}`;
+}
+function covFolders(cov, wc) {
   if (!cov.folders.length) return html`<span class="small muted">—</span>`;
   return cov.folders.map((f) => {
     const mapped = f.pattern !== null;
     const miss = !mapped && f.explicit_namespace < f.vms;
     return html`<div class="covrow ${miss ? 'miss' : ''}">${icon('folder', 'art')}<span class="p" title="${f.folder}">${f.folder || '(datacenter root)'}</span>
       <span class="small muted">${plural(f.vms, 'VM')}</span><span class="arrow">→</span>
-      ${mapped ? html`<span class="small"><span class="mono">${f.namespace || html`<span class="faint">no namespace</span>`}</span>${f.wave ? ' · wave ' + f.wave : ''}
+      ${mapped ? html`<span class="small"><span class="mono">${f.namespace || html`<span class="faint">no namespace</span>`}</span>${mapWave(f.wave, wc)}
         ${f.pattern !== f.folder ? html`<span class="tag" title="matched by ${f.pattern}">via ${f.pattern}</span>` : ''}</span>`
         : (f.explicit_namespace ? html`<span class="small muted">${f.explicit_namespace} set in Select</span>` : html`<span class="small bad-text">unmapped</span>`)}
       ${(mapped && f.pattern === f.folder) || !f.folder ? '' : html`<button class="btn xs" data-act="addRow" data-m="f" data-key="${f.folder}">${icon('plus')} Map</button>`}</div>`;
@@ -905,6 +948,17 @@ function covNetworks(cov) {
     ${x.mapped ? html`<span class="small mono">${x.subnet || html`<span class="faint">no subnet</span>`}</span>` : html`<span class="small bad-text">unmapped</span>`}
     ${x.mapped ? '' : html`<button class="btn xs" data-act="addRow" data-m="n" data-key="${x.network}">${icon('plus')} Map</button>`}</div>`);
 }
+// "Wave 6 · 3 new VMs", "Wave 5 · 3 VMs, already queued": what each wave's count is, in words.
+function waveChips(p) {
+  const by = new Map();
+  p.records.forEach((r) => { const e = by.get(r.wave) || { fresh: 0, queued: 0 }; e[r.queue_state ? 'queued' : 'fresh'] += 1; by.set(r.wave, e); });
+  return [...by.entries()].sort((a, b) => a[0] - b[0]).map(([w, e]) => {
+    const what = !e.queued ? plural(e.fresh, 'new VM') : !e.fresh ? plural(e.queued, 'VM') + ', already queued'
+      : plural(e.fresh, 'new VM') + ' + ' + n(e.queued) + ' already queued';
+    return html`<span class="chip static ${e.fresh ? 'wave-chip-new' : ''}"><b>${waveLabel(w)}</b> · ${what}</span>`;
+  });
+}
+const sentence = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 function stagePreview(v) {
   const p = v.preview;
   if (v.previewErr) return html`<div class="card-b"><div class="note bad">${v.previewErr}</div></div>`;
@@ -913,8 +967,9 @@ function stagePreview(v) {
     <div class="kpis">${kpi('Selected', p.selected, '')}${kpi('Stageable', p.records.length, '', null, 'var(--ok)')}
       ${kpi('Cannot place', p.problems.length, 'no namespace', null, p.problems.length ? 'var(--bad)' : '')}
       ${kpi('Unmapped networks', Object.keys(p.unmapped_networks).length, 'VMs keep no subnet for them', null, Object.keys(p.unmapped_networks).length ? 'var(--warn)' : '')}</div>
-    ${p.by_wave.length ? html`<div class="row wrap"><span class="small muted">By wave</span>${p.by_wave.map(([w, c]) => html`<span class="chip static">${waveLabel(w)} <span class="n">${n(c)}</span></span>`)}
-      <span class="small muted" style="margin-left:14px">By namespace</span>${p.by_namespace.map(([ns, c]) => html`<span class="chip static mono">${ns} <span class="n">${n(c)}</span></span>`)}</div>` : ''}
+    ${p.by_wave.length ? html`<div class="row wrap"><span class="small muted">By wave</span>${waveChips(p)}
+      <span class="small muted" style="margin-left:14px">By namespace</span>${p.by_namespace.map(([ns, c]) => html`<span class="chip static"><span class="mono">${ns}</span> · ${plural(c, 'VM')}</span>`)}</div>` : ''}
+    ${(p.wave_notes || []).length ? html`<div class="note info small">${p.wave_notes.map((x) => html`<div>${sentence(x.trim().replace(/^waves: /, ''))}</div>`)}</div>` : ''}
     ${p.problems.length ? html`<details class="note bad"><summary><b>${plural(p.problems.length, 'VM')} cannot be staged</b> — expand for details</summary><ul class="plain small">${p.problems.slice(0, 60).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
     ${nsConflicts(p)}
     ${(p.app_moves || []).length ? html`<details class="note info"><summary><b>${plural(p.app_moves.length, 'application')} aligned to one wave</b> — apps are kept together</summary><ul class="plain small">${p.app_moves.slice(0, 40).map((x) => html`<li>${x}</li>`)}</ul></details>` : ''}
