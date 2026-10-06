@@ -530,6 +530,266 @@ def failure_groups(store: st.Store) -> Dict[str, Any]:
     }
 
 
+# ----------------------------------------------------------------- activity
+# What is happening right now, and if it looks stuck, why: the Activity page's
+# "Right now" panel. Signals come from the store and the running job only; nothing
+# here calls the cluster, so it is cheap enough to refresh with every pulse.
+
+# A running job with no log line, no VM state change and no event for this long is
+# worth a look. Polling is silent until something changes, so this is a nudge, not a verdict.
+QUIET_AFTER_S = 600
+_LEVEL_ORDER = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
+
+
+def _ts_epoch(ts: Optional[str]) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        from datetime import datetime, timezone
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _pid_alive(pid: int) -> Optional[bool]:
+    """Whether a process exists; None if that cannot be told."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ctypes.get_last_error() == 5             # access denied: it exists
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+            k32.CloseHandle(handle)
+            return bool(ok) and code.value == 259               # STILL_ACTIVE
+        except (OSError, AttributeError):
+            return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
+def other_lock_holder(cfg: Config) -> str:
+    """Who holds this workspace from another live process (a CLI run), or "".
+
+    The holder's text stays in the lock file after a crash; the OS has released the
+    lock itself, so a dead holder blocks nothing and is not reported."""
+    text = WorkspaceLock(cfg, "").holder()
+    m = re.search(r"\(pid (\d+)", text or "")
+    if not m or int(m.group(1)) == os.getpid():
+        return ""
+    return text if _pid_alive(int(m.group(1))) else ""
+
+
+def activity_now(store: st.Store, cfg: Config, *, job: Optional[Dict[str, Any]] = None,
+                 latest_job: Optional[Dict[str, Any]] = None, other_holder: str = "",
+                 approvals_pending: int = 0, next_window: Optional[Dict[str, Any]] = None,
+                 now: Optional[float] = None) -> Dict[str, Any]:
+    """A verdict (idle / running / possibly stuck / needs attention), the signals behind
+    it -- each with the evidence and what to do -- and the batches on the cluster."""
+    now = now or time.time()
+    signals: List[Dict[str, Any]] = []
+
+    def add(level: str, key: str, title: str, detail: str = "", action: Optional[Dict[str, str]] = None) -> None:
+        signals.append({"level": level, "key": key, "title": title, "detail": detail, "action": action})
+
+    counts = store.counts()
+    timeout_s = cfg.batch_timeout_minutes * 60
+    in_flight = store.query_vms(states=list(IN_FLIGHT_STATES))
+    # How long each batch has really been going: from its VMs' start stamps (a batch's
+    # applied_at is rewritten as it is polled).
+    started: Dict[Tuple[str, str], float] = {}
+    members: Dict[Tuple[str, str], List[sqlite3.Row]] = {}
+    for v in in_flight:
+        name = v["precheck_batch"] if v["state"] == st.S_PRECHECK_RUNNING else v["batch_name"]
+        t = _ts_epoch(v["precheck_started_at"] if v["state"] == st.S_PRECHECK_RUNNING else v["import_started_at"])
+        key = (v["namespace"], name or "")
+        members.setdefault(key, []).append(v)
+        if t is not None:
+            started[key] = min(started.get(key, t), t)
+
+    batches: List[Dict[str, Any]] = []
+    issues: Dict[str, Dict[str, Any]] = {}
+    for b in store.query_batches(states=[st.B_APPLIED, st.B_RUNNING, st.B_ROLLING_BACK]):
+        key = (b["namespace"], b["name"])
+        age = now - started[key] if key in started else None
+        vm_msgs = [m["message"] or m["last_phase"] or "" for m in members.get(key, [])]
+        issue = classify_failure(b["message"] or "") or next(
+            (i for i in (classify_failure(x) for x in vm_msgs if x) if i), None)
+        entry = {"name": b["name"], "namespace": b["namespace"], "stage": b["stage"], "state": b["state"],
+                 "wave": b["wave"], "vms": b["vm_count"], "in_flight": len(members.get(key, [])),
+                 "age_s": round(age) if age is not None else None, "timeout_s": timeout_s,
+                 "message": b["message"] or next((x for x in vm_msgs if x), ""),
+                 "issue": {"id": issue["id"], "title": issue["title"], "advice": issue["advice"]} if issue else None}
+        batches.append(entry)
+        if issue:
+            issues.setdefault(issue["id"], {"issue": issue, "batches": []})["batches"].append(b["name"])
+        elif age is not None and age > timeout_s / 2 and members.get(key):
+            add("warn", "long:" + b["name"], "{} has been running {:.0f} min (it times out at {} min)".format(
+                b["name"], age / 60, cfg.batch_timeout_minutes),
+                "The operator says: {}".format(entry["message"]) if entry["message"] else
+                "The operator has not reported a reason. Open the batch to see its conditions.",
+                {"label": "Open batch", "batch": b["name"], "ns": b["namespace"]})
+
+    for found in issues.values():
+        i, names = found["issue"], found["batches"]
+        add("bad", "issue:" + i["id"], "{} ({})".format(i["title"], plural_s(len(names), "batch", "batches")),
+            "{} Seen in: {}.".format(i["advice"], ", ".join(names[:4]) + (" …" if len(names) > 4 else "")),
+            {"label": "Open batch", "batch": names[0], "ns": next(b["namespace"] for b in batches if b["name"] == names[0])})
+
+    # In flight inside a batch that timed out: nobody polls them any more.
+    timed_out = {(b["namespace"], b["name"]) for b in store.query_batches(states=[st.B_TIMEDOUT])}
+    stalled = [v for v in in_flight if (v["namespace"], v["batch_name"]) in timed_out
+               or (v["namespace"], v["precheck_batch"]) in timed_out]
+    if stalled:
+        add("bad", "stalled", "{} in a batch that timed out, and nothing polls them".format(plural_s(len(stalled), "VM")),
+            "The batch passed batch_timeout_minutes ({} min). Refresh to pick up a late result, or roll back.".format(
+                cfg.batch_timeout_minutes), {"label": "Open Triage", "go": "triage"})
+
+    running = job is not None and job.get("status") == "running"
+    if batches and not running and not other_holder:
+        add("warn", "unwatched", "{} on the cluster and nothing is polling {}".format(
+            plural_s(len(batches), "batch", "batches"), "it" if len(batches) == 1 else "them"),
+            "A run that ended early (stopped, or the console restarted) leaves batches behind; their results "
+            "are only recorded when something polls them.", {"label": "Watch until done", "act": "watch"})
+
+    quiet_s = None
+    if running:
+        last = max(filter(None, [_ts_epoch(job.get("last_log_at")), _ts_epoch(job.get("started_at")),
+                                 _ts_epoch(_last_ts(store, "transitions")),
+                                 _ts_epoch(_last_ts(store, "events"))]), default=None)
+        quiet_s = now - last if last else None
+        if quiet_s is not None and quiet_s > max(QUIET_AFTER_S, 30 * cfg.poll_interval_seconds):
+            add("warn", "quiet", "No progress for {:.0f} min".format(quiet_s / 60),
+                "No log line, no VM state change and no event since then. The last line was: “{}”. "
+                "Batches are still polled every {}s; check them above for the operator's reason.".format(
+                    job.get("last_line") or "(none)", cfg.poll_interval_seconds),
+                {"label": "Open log", "job": job["id"]})
+    if other_holder:
+        add("info", "holder", "A run outside this console is changing the workspace",
+            other_holder + ". Its log is in the terminal that started it; its VM state changes still appear in the timeline.")
+    if counts.get(st.S_AWAITING_COMMIT):
+        add("info", "commit", "{} held at the commit gate".format(plural_s(counts[st.S_AWAITING_COMMIT], "VM")),
+            "commitAction Wait: nothing moves until someone commits them, or rolls them back.",
+            {"label": "Go to Execute", "go": "execute"})
+    if approvals_pending:
+        add("info", "approvals", "{} waiting for approval".format(plural_s(approvals_pending, "request")),
+            "Nothing runs until someone other than the requester approves it.", {"label": "Change control", "go": "schedule"})
+    if next_window and next_window.get("state") in ("scheduled", "awaiting_approval"):
+        add("info", "window", "Next change window: {} {}".format(next_window.get("stage", ""), next_window.get("start_at", "")),
+            "It starts on its own at that time.", {"label": "Change control", "go": "schedule"})
+    failed = sum(counts.get(s, 0) for s in FAILED_STATES)
+    if failed:
+        groups = failure_groups(store)["groups"]
+        top = groups[0] if groups else None
+        cause = (top["issue"]["title"] if top and top["issue"] else (top["message"] if top else "")) or "see Triage"
+        add("warn", "failed", "{} failed".format(plural_s(failed, "VM")),
+            "Most common cause: {}.".format(cause[:200]), {"label": "Open Triage", "go": "triage"})
+    if not running and latest_job and latest_job.get("status") == "failed":
+        add("bad", "lastjob", "The last job failed: {}".format(latest_job.get("title", "")),
+            latest_job.get("error") or "", {"label": "Open log", "job": latest_job["id"]})
+
+    signals.sort(key=lambda s: _LEVEL_ORDER[s["level"]])
+    worst = signals[0]["level"] if signals else "ok"
+    if worst == "bad":
+        verdict = {"level": "bad", "title": "Needs attention", "detail": signals[0]["title"]}
+    elif running and any(s["key"] == "quiet" for s in signals):
+        verdict = {"level": "warn", "title": "Possibly stuck", "detail": "{} has been quiet for {:.0f} min".format(
+            job.get("title", "The job"), (quiet_s or 0) / 60)}
+    elif running:
+        verdict = {"level": "busy", "title": "Running: " + job.get("title", ""),
+                   "detail": "{} on the cluster".format(plural_s(len(batches), "batch", "batches")) if batches else "working"}
+    elif worst == "warn":
+        verdict = {"level": "warn", "title": "Needs a look", "detail": signals[0]["title"]}
+    elif counts.get(st.S_AWAITING_COMMIT) or approvals_pending:
+        verdict = {"level": "info", "title": "Waiting on you", "detail": signals[0]["title"] if signals else ""}
+    else:
+        verdict = {"level": "ok", "title": "Idle", "detail": "Nothing running." + (
+            " Last: {} ({})".format(latest_job.get("title", ""), latest_job.get("status", "")) if latest_job else "")}
+    return {"verdict": verdict, "signals": signals, "batches": batches, "quiet_s": round(quiet_s) if quiet_s else None}
+
+
+def plural_s(count: int, word: str, many: str = "") -> str:
+    return "{} {}".format(count, word if count == 1 else (many or word + "s"))
+
+
+def _last_ts(store: st.Store, table: str) -> Optional[str]:
+    """The newest timestamp in events or transitions (both keep ts in UTC ISO form)."""
+    assert table in ("events", "transitions")
+    row = store.conn.execute("SELECT MAX(ts) AS t FROM {}".format(table)).fetchone()
+    return row["t"] if row else None
+
+
+_CHANGE_LEVEL = {st.S_FAILED: "bad", st.S_PRECHECK_FAILED: "bad", st.S_ROLLED_BACK: "warn",
+                 st.S_COMMITTED: "ok", st.S_PRECHECK_PASSED: "ok", st.S_AWAITING_COMMIT: "info"}
+_JOB_LEVEL = {"failed": "bad", "warning": "warn", "stopped": "warn", "succeeded": "ok"}
+
+
+def activity_timeline(store: st.Store, *, jobs: Sequence[Dict[str, Any]] = (), since: Optional[str] = None,
+                      until: Optional[str] = None, limit: int = 300) -> List[Dict[str, Any]]:
+    """Jobs, events and VM state changes as one stream, newest first.
+
+    State changes made together (same from -> to, stage, batch and actor, within a
+    minute) collapse into one entry listing the VMs, so a batch of twelve reads as one
+    line, not twelve."""
+    def inside(ts: Optional[str]) -> bool:
+        return bool(ts) and (not since or ts >= since) and (not until or ts <= until)
+
+    out: List[Dict[str, Any]] = []
+    ns_of = {b["name"]: b["namespace"] for b in store.query_batches()}     # to open a batch from an entry
+    for j in jobs:
+        if inside(j.get("started_at")):
+            out.append({"ts": j["started_at"], "kind": "job", "level": "info", "job": j["id"],
+                        "title": "Started: " + j.get("title", ""), "actor": j.get("user") or ""})
+        if j.get("finished_at") and inside(j["finished_at"]):
+            out.append({"ts": j["finished_at"], "kind": "job", "level": _JOB_LEVEL.get(j.get("status"), "info"),
+                        "job": j["id"], "title": "{} {}".format(j.get("title", ""), {
+                            "succeeded": "finished", "warning": "finished with warnings"}.get(j.get("status"), j.get("status"))),
+                        "detail": j.get("error") or "", "actor": j.get("user") or ""})
+    changes = store.transitions(limit=limit * 20, since=since, until=until, newest_first=True)
+    # An event that only repeats a VM's state change (same VM, same message) adds nothing.
+    said = {(t["moref"], (t["message"] or "").strip()) for t in changes if t["message"]}
+    for e in store.recent_events(limit=limit * 2, since=since, until=until):
+        if e["moref"] and (e["moref"], (e["message"] or "").strip()) in said:
+            continue
+        out.append({"ts": e["ts"], "kind": "event", "level": {"error": "bad", "warn": "warn"}.get(e["level"], "info"),
+                    "title": e["message"], "moref": e["moref"], "batch": e["batch"],
+                    "ns": ns_of.get(e["batch"] or "", ""), "actor": e["actor"] or ""})
+    group: Optional[Dict[str, Any]] = None
+    for t in changes:
+        key = (t["from_state"], t["to_state"], t["stage"], t["batch"], t["actor"])
+        t_epoch = _ts_epoch(t["ts"]) or 0
+        if group is not None and group["_key"] == key and group["_oldest"] - t_epoch <= 60:
+            group["count"] += 1
+            group["_oldest"] = t_epoch
+            if len(group["vms"]) < 50:
+                group["vms"].append({"moref": t["moref"], "name": t["vm_name"]})
+            if (t["message"] or "") != group["message"]:
+                group["mixed"] = True
+            continue
+        group = {"ts": t["ts"], "kind": "change", "level": _CHANGE_LEVEL.get(t["to_state"], "info"),
+                 "from": t["from_state"], "to": t["to_state"], "stage": t["stage"] or "", "batch": t["batch"],
+                 "ns": ns_of.get(t["batch"] or "", t["namespace"] or ""),
+                 "actor": t["actor"] or "", "count": 1, "vms": [{"moref": t["moref"], "name": t["vm_name"]}],
+                 "message": t["message"] or "", "mixed": False, "_key": key, "_oldest": t_epoch}
+        out.append(group)
+    for e in out:
+        e.pop("_key", None)
+        e.pop("_oldest", None)
+    out.sort(key=lambda e: e["ts"] or "", reverse=True)
+    return out[:limit]
+
+
 # ----------------------------------------------------------------- mapping
 def mapping_coverage(rows: Sequence[sqlite3.Row], folder_mapping: Dict[str, Any],
                      network_mapping: Dict[str, Any]) -> Dict[str, Any]:

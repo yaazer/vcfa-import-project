@@ -570,12 +570,46 @@ table.t input.input { width: 100%; }
 .tabs button.on { color: var(--fg); background: var(--panel-3); box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 40%, transparent), 0 6px 18px -8px var(--accent); }
 .tabs button .n { font-size: 11px; color: var(--faint); margin-left: 4px; }
 
-.joblist { display: grid; max-height: calc(100vh - 270px); overflow: auto; }
-.jobitem { display: flex; gap: 10px; align-items: center; padding: 11px 16px; border-bottom: 1px solid var(--line); cursor: pointer; transition: background .15s; }
-.jobitem:hover { background: var(--panel-2); }
-.jobitem.on { background: color-mix(in oklab, var(--accent) 12%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
-.jobitem .t { font-weight: 650; font-size: 13px; }
-.jobitem .m { font-size: 11.5px; color: var(--muted); }
+/* Activity: the "right now" verdict and its signals, one timeline, the job log */
+.lvl-ok { --lv: var(--ok); } .lvl-info, .lvl-busy { --lv: var(--accent); } .lvl-warn { --lv: var(--warn); } .lvl-bad { --lv: var(--bad); }
+.now-card { border-left: 3px solid var(--lv); }
+.now-h { display: flex; gap: 14px; align-items: center; padding: 16px 20px; flex-wrap: wrap; }
+.now-h h2 { font-size: 19px; }
+.now-h .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.now-ic { width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; flex: none; color: var(--lv);
+  background: color-mix(in oklab, var(--lv) 16%, transparent); }
+.now-ic svg { width: 19px; height: 19px; }
+.now-job { max-width: 46%; min-width: 0; text-align: right; }
+.signals { display: grid; border-top: 1px solid var(--line); }
+.signal { display: flex; gap: 12px; align-items: center; padding: 10px 20px; border-bottom: 1px solid var(--line); }
+.signal:last-child { border-bottom: 0; }
+.signal .sig-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--lv); flex: none; align-self: flex-start; margin-top: 6px; }
+.now-batches { border-top: 1px solid var(--line); padding: 4px 20px 12px; }
+.now-batches .section-title { margin: 10px 0 6px; }
+.agebar { height: 6px; border-radius: 6px; background: var(--panel-3); overflow: hidden; }
+.agebar > span { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.agebar.warn > span { background: var(--warn); } .agebar.bad > span { background: var(--bad); }
+.act-split { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 18px; align-items: start; }
+.tl-card .chips { flex: 1; }
+.act-tl { max-height: calc(100vh - 300px); min-height: 220px; overflow: auto; }
+.tl-row { display: flex; gap: 10px; align-items: flex-start; padding: 8px 16px; border-bottom: 1px solid var(--line); border-left: 3px solid transparent; }
+.tl-row.lvl-bad, .tl-row.lvl-warn { border-left-color: var(--lv); }
+.tl-ts { font-family: var(--mono); font-size: 11.5px; color: var(--faint); flex: none; min-width: 64px; white-space: nowrap; padding-top: 1px; }
+.tl-ic { flex: none; color: var(--lv, var(--faint)); padding-top: 1px; }
+.tl-ic svg { width: 14px; height: 14px; }
+.tl-t { font-size: 13px; }
+.tl-m { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+.tl-msg { font-size: 12px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+.tl-vms { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 12px; }
+.tl-job { cursor: pointer; }
+.tl-job:hover { background: var(--panel-2); }
+.tl-job.on { background: color-mix(in oklab, var(--accent) 10%, transparent); }
+.log-card .card-h .select { min-width: 0; }
+.log-card .log { max-height: calc(100vh - 360px); min-height: 220px; border-radius: 0 0 var(--radius) var(--radius); }
+.act-exports { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 14px; }
+.act-exports .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--faint); font-weight: 750; }
+.act-exports .mono { max-width: 40ch; }
+@media (max-width: 1100px) { .act-split { grid-template-columns: minmax(0, 1fr); } .now-job { max-width: 100%; text-align: left; } }
 
 .maptable td { padding: 5px 7px !important; }
 .maptable .input { padding: 6px 9px; font-size: 12.5px; }

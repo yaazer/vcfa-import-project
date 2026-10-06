@@ -624,6 +624,7 @@ class Store:
         to_state: Optional[str] = None,
         since: Optional[str] = None,
         newest_first: bool = False,
+        until: Optional[str] = None,
     ) -> List[sqlite3.Row]:
         sql = "SELECT * FROM transitions WHERE 1=1"
         params: List[Any] = []
@@ -636,6 +637,9 @@ class Store:
         if since:
             sql += " AND ts >= ?"
             params.append(since)
+        if until:
+            sql += " AND ts <= ?"
+            params.append(until)
         sql += " ORDER BY id DESC" if newest_first else " ORDER BY id ASC"
         if limit:
             sql += " LIMIT {}".format(int(limit))
@@ -1167,9 +1171,17 @@ class Store:
 
     def recent_events(self, limit: int = 50, level: Optional[str] = None,
                       moref: Optional[str] = None,
-                      batch: Optional[str] = None) -> List[sqlite3.Row]:
+                      batch: Optional[str] = None,
+                      since: Optional[str] = None,
+                      until: Optional[str] = None) -> List[sqlite3.Row]:
         sql = "SELECT * FROM events WHERE 1=1"
         params: List[Any] = []
+        if since:
+            sql += " AND ts >= ?"
+            params.append(since)
+        if until:
+            sql += " AND ts <= ?"
+            params.append(until)
         if level:
             sql += " AND level=?"
             params.append(level)

@@ -65,6 +65,10 @@ class Job:
         # does is registered later by the job itself (on_stop).
         self.stoppable = stoppable
         self.line_count = 0
+        # When the job last said anything, and what: a job silent for a long time is
+        # the first thing to look at when something seems stuck (Activity).
+        self.last_log_at: Optional[str] = None
+        self.last_line = ""
         self._lines: List[List[Any]] = []     # [seq, ts, text]
         self._first_seq = 0
         self._lock = threading.Lock()
@@ -89,6 +93,9 @@ class Job:
                 self.line_count += 1
                 if self._fh:
                     self._fh.write("{} {}\n".format(ts, line))
+                if line.strip():
+                    self.last_line = line.strip()[:300]
+            self.last_log_at = _now_iso()
             if len(self._lines) > MAX_LINES_IN_MEMORY:
                 drop = len(self._lines) - MAX_LINES_IN_MEMORY
                 self._lines = self._lines[drop:]
@@ -122,6 +129,7 @@ class Job:
             "finished_at": self.finished_at, "result": self.result, "error": self.error,
             "progress": self.progress, "stoppable": self.stoppable and self.status == RUNNING,
             "stop_requested": self.stop_requested, "lines": self.line_count,
+            "last_log_at": self.last_log_at, "last_line": self.last_line,
         }
 
     def snapshot(self, since: int = 0, limit: int = 5000) -> Dict[str, Any]:

@@ -47,7 +47,7 @@ function nextStep(d, p) {
   if (d.in_flight) return box('', 'refresh', plural(d.in_flight, 'VM') + ' in flight', 'Batches from an earlier session are still on the cluster. Watch them to record the outcome.', link('Execute', 'execute'));
   if (c.precheck_passed) { const w = lowest('precheck_passed'); return box('ok', 'execute', waveLabel(w) + ' is ready to import', plural(c.precheck_passed, 'VM') + ' passed precheck across all waves.', link('Import wave ' + w, 'execute', 'stage=import&waves=' + w)); }
   if (c.pending) { const w = lowest('pending'); return box('', 'shield', 'Precheck wave ' + w, 'Run preflight to verify the cluster, then precheck: the operator validates each VM without moving anything.', link('Go to Execute', 'execute', 'stage=precheck&waves=' + w)); }
-  if (d.total && c.committed === d.total) return box('ok', 'check', 'Campaign complete', 'Every queued VM is committed in VCF Automation. Export the tracker from Activity for the change record.', link('Exports', 'activity', 'tab=exports', false));
+  if (d.total && c.committed === d.total) return box('ok', 'check', 'Campaign complete', 'Every queued VM is committed in VCF Automation. Export the tracker from Activity for the change record.', link('Exports', 'activity', '', false));
   if (c.rolled_back) return box('', 'rollback', plural(c.rolled_back, 'VM') + ' handed back to vCenter', 'Their failed imports were rolled back. Once the cause is fixed, retry them from Triage and precheck again.', link('Triage', 'triage'));
   if (d.total) return box('', 'queue', 'Nothing left to run', 'Remaining VMs are skipped or rolled back. Retry or unskip them from the queue.', link('Queue', 'queue'));
   if (d.discovered.selected) return box('', 'stage', plural(d.discovered.selected, 'VM') + ' selected', 'Map their folders and networks to namespaces and subnets, then stage them into the import queue.', link('Map & Stage', 'stage'));
@@ -1534,91 +1534,137 @@ VIEWS.batches = view({
 });
 
 // ================================================================= ACTIVITY
+// One pane for "what is it doing, and why is it stuck?": a verdict with the signals
+// behind it (service.activity_now), everything that led here as one timeline -- jobs,
+// events, and state changes grouped by batch (service.activity_timeline) -- and the
+// log of the job you pick. Exports sit at the foot.
+const TL_KINDS = [['all', 'All'], ['problems', 'Problems'], ['job', 'Jobs'], ['change', 'State changes'], ['event', 'Events']];
 VIEWS.activity = view({
-  title: 'Activity & logs', sub: 'Job logs, the event log, every state change, and exports', live: true,
-  init(v, p) { v.tab = p.tab || v.tab || 'jobs'; v.jobId = p.job || v.jobId || null; v.filter = ''; v.errOnly = false; v.level = ''; v.state = ''; v.q = ''; },
+  title: 'Activity & logs', sub: 'What is happening now, why it may be stuck, and everything that led here', live: true,
+  init(v, p) {
+    v.jobId = p.job || null; v.scope = p.scope || null;
+    v.kind = p.kind || 'all'; v.q = ''; v.filter = ''; v.errOnly = false; v.open = new Set(); v.follow = true;
+  },
   async load(v) {
-    if (v.tab === 'jobs') {
-      const d = await GET('/api/jobs');
-      v.jobs = d.jobs;
-      if (!v.jobId && v.jobs.length) v.jobId = v.jobs[0].id;
-      if (v.jobId) {
-        const same = v.job && v.job.id === v.jobId && v.job.status !== 'running';
-        if (!same) v.job = await GET('/api/jobs/' + encodeURIComponent(v.jobId));
-      }
-    } else if (v.tab === 'events') {
-      v.events = (await GET('/api/events?' + qs({ limit: 1000, level: v.level }))).events;
-    } else if (v.tab === 'movement') {
-      const d = await GET('/api/transitions?' + qs({ limit: 1000, state: v.state }));
-      v.trans = d.transitions; v.stats = d.stats; v.ledger = d.ledger_path;
-    }
+    const d = await GET('/api/activity?' + qs({ job: v.jobId || '', scope: v.scope || '' }));
+    v.d = d;
+    const logId = v.jobId || d.active || (d.jobs[0] && d.jobs[0].id) || null;
+    if (logId) {
+      const same = v.job && v.job.id === logId && v.job.status !== 'running';
+      if (!same) v.job = await GET('/api/jobs/' + encodeURIComponent(logId));
+    } else v.job = null;
   },
   paint(v) {
-    const tabs = [['jobs', 'Jobs'], ['events', 'Event log'], ['movement', 'Movement log'], ['exports', 'Exports']];
-    return html`<div class="tabs">${tabs.map(([k, l]) => html`<button class="${v.tab === k ? 'on' : ''}" data-act="tab" data-k="${k}">${l}</button>`)}</div>
-      ${v.tab === 'jobs' ? jobsTab(v) : v.tab === 'events' ? eventsTab(v) : v.tab === 'movement' ? movementTab(v) : exportsTab()}`;
+    const d = v.d;
+    return html`${nowPanel(v)}
+      <div class="act-split">${timelineCard(v)}${logCard(v)}</div>
+      <div class="act-exports"><span class="lbl">Exports</span>
+        ${[['tracker.csv', 'One row per VM: source facts, target, batches and timings'], ['transitions.csv', 'Every state change of every VM'],
+          ['ledger.jsonl', 'The append-only ledger, for a SIEM or a change record'], ['report.html', 'A standalone progress report']]
+          .map(([f, hint]) => html`<a class="btn xs ghost" href="${exportUrl(f)}" download="${f}" title="${hint}">${icon('download')} ${f}</a>`)}
+        <span class="tiny faint mono ellipsis" title="${d.ledger_path}">ledger: ${d.ledger_path}</span></div>`;
   },
   after(v) { const log = $('#act-log'); if (log && v.follow) log.scrollTop = log.scrollHeight; },
   act: {
-    tab(t, e, v) { v.tab = t.dataset.k; v.loaded = false; v.refresh(); },
-    pickJob(t, e, v) { v.jobId = t.dataset.id; v.job = null; v.follow = true; v.refresh(); },
+    pickJob(t, e, v) { v.jobId = t.value || t.dataset.id || null; v.scope = null; v.job = null; v.follow = true; v.refresh(); },
+    scope(t, e, v) { v.scope = t.dataset.k; v.refresh(); },
+    kind(t, e, v) { v.kind = t.dataset.k; v.render(); },
+    tlq: debounce((t, e, v) => { v.q = t.value; v.render(); }, 150),
+    tlOpen(t, e, v) { const k = t.dataset.k; if (v.open.has(k)) v.open.delete(k); else v.open.add(k); v.render(); },
     logFilter: debounce((t, e, v) => { v.filter = t.value; v.follow = false; v.render(); }, 150),
     errOnly(t, e, v) { v.errOnly = t.checked; v.render(); },
-    level(t, e, v) { v.level = t.value; v.refresh(); },
-    tstate(t, e, v) { v.state = t.value; v.refresh(); },
-    evq: debounce((t, e, v) => { v.q = t.value; v.render(); }, 150),
-    follow(t, e, v) { followJob(t.dataset.id, true); },
-    async verify() {
-      const d = await GET('/api/transitions?limit=1');
-      toast('Ledger', d.stats.transitions + ' transitions in the database; ledger at ' + d.ledger_path, 'info', 8000);
-    },
+    follow(t) { followJob(t.dataset.id, true); },
+    watch: () => startJob('watch', {}),
   },
 });
-function jobsTab(v) {
-  if (!v.jobs.length) return emptyState('terminal', 'No jobs yet', 'Every discovery, preflight, precheck, import and rollback started from the console is logged here, and kept under <workdir>/jobs.');
-  const j = v.job;
+
+const LVL_ICON = { ok: 'check', info: 'info', warn: 'triage', bad: 'x' };
+function nowPanel(v) {
+  const now = v.d.now, vd = now.verdict;
+  const job = v.d.active ? v.d.jobs.find((j) => j.id === v.d.active) : null;
+  return html`<div class="card now-card lvl-${vd.level} mb" id="act-now">
+    <div class="now-h"><span class="now-ic">${vd.level === 'busy' ? html`<span class="spinner"></span>` : icon(LVL_ICON[vd.level] || 'info')}</span>
+      <div class="grow"><h2>${vd.title}</h2>${vd.detail ? html`<div class="sub">${vd.detail}</div>` : ''}</div>
+      ${job ? html`<div class="now-job"><div class="small"><b>${fmtDur(elapsed(job))}</b> running${job.progress ? html` · ${n(job.progress.done)} / ${n(job.progress.total)} ${job.progress.label}` : ''}</div>
+        <div class="tiny muted ellipsis">last line ${job.last_log_at ? fmtAgo(job.last_log_at) : '—'}: <span class="mono">${(job.last_line || '').slice(0, 140)}</span></div></div>` : ''}</div>
+    ${now.signals.length ? html`<div class="signals">${now.signals.map((s) => html`<div class="signal lvl-${s.level}" data-key="${s.key}">
+        <span class="sig-dot"></span><div class="grow"><b>${s.title}</b>${s.detail ? html`<div class="small muted">${s.detail}</div>` : ''}</div>${sigAction(s.action)}</div>`)}</div>` : ''}
+    ${now.batches.length ? html`<div class="now-batches"><div class="section-title">On the cluster ${tip('batch_age')}</div>
+      <div class="table-wrap"><table class="t compact"><tbody>${now.batches.map((b) => html`<tr class="click" data-act="batch" data-ns="${b.namespace}" data-name="${b.name}">
+        <td class="mono small">${b.name}<div class="tiny faint">${b.stage} · wave ${b.wave} · ${plural(b.in_flight, 'VM')} in flight</div></td>
+        <td style="width:150px">${ageBar(b)}</td>
+        <td class="msg">${b.issue ? html`<span class="tag bad">${b.issue.title}</span> ` : ''}<div>${b.message || html`<span class="faint">no reason reported yet</span>`}</div></td></tr>`)}</tbody></table></div></div>` : ''}
+  </div>`;
+}
+function ageBar(b) {
+  if (b.age_s === null || b.age_s === undefined) return html`<span class="tiny faint">age unknown</span>`;
+  const pc = Math.min(100, Math.round(100 * b.age_s / b.timeout_s));
+  return html`<div class="agebar ${pc >= 100 ? 'bad' : pc >= 50 ? 'warn' : ''}"><span style="width:${pc}%"></span></div><div class="tiny muted">${fmtDur(b.age_s)} of ${fmtDur(b.timeout_s)}</div>`;
+}
+function sigAction(a) {
+  if (!a) return '';
+  if (a.go) return html`<button class="btn xs" data-act="go" data-to="${a.go}">${a.label}</button>`;
+  if (a.batch) return html`<button class="btn xs" data-act="batch" data-ns="${a.ns}" data-name="${a.batch}">${a.label}</button>`;
+  if (a.job) return html`<button class="btn xs" data-act="pickJob" data-id="${a.job}">${a.label}</button>`;
+  if (a.act) return html`<button class="btn xs primary" data-act="${a.act}">${a.label}</button>`;
+  return '';
+}
+
+function tlMatch(e, kind) { return kind === 'all' || (kind === 'problems' ? e.level === 'bad' || e.level === 'warn' : e.kind === kind); }
+function timelineCard(v) {
+  const d = v.d, q = v.q.toLowerCase();
+  const text = (e) => [e.title, e.message, e.batch, e.moref, e.actor, e.from, e.to, ...(e.vms || []).map((x) => x.name + ' ' + x.moref)].join(' ').toLowerCase();
+  const rows = d.timeline.filter((e) => tlMatch(e, v.kind) && (!q || text(e).includes(q)));
+  const count = (k) => d.timeline.filter((e) => tlMatch(e, k)).length;
+  const picked = d.job ? d.jobs.find((j) => j.id === d.job) : null;
+  const scopes = [['job', 'This job', !picked], ['day', 'Last 24 h'], ['all', 'Everything']];
+  return html`<div class="card tl-card"><div class="card-h"><h3>Timeline</h3>
+      <span class="sub">${d.scope === 'job' && picked ? picked.title : d.scope === 'day' ? 'last 24 hours' : 'everything'} · newest first</span>
+      <div class="tools"><div class="seg">${scopes.map(([k, l, off]) => html`<button class="${d.scope === k ? 'on' : ''}" data-act="scope" data-k="${k}" ${attr(!!off, 'disabled')}>${l}</button>`)}</div></div></div>
+    <div class="toolbar"><div class="chips">${TL_KINDS.map(([k, l]) => html`<span class="chip ${v.kind === k ? 'on' : ''}" data-act="kind" data-k="${k}">${l} <span class="n">${n(count(k))}</span></span>`)}</div>
+      <div class="search grow">${icon('search')}<input class="input sm" id="tl-q" placeholder="Search VMs, batches, messages" value="${v.q}" data-input="tlq"></div></div>
+    <div class="act-tl" id="act-tl" data-scroll="acttl">${rows.length ? rows.map((e) => tlRow(v, e))
+      : html`<div class="card-b small muted">Nothing ${v.kind === 'all' ? '' : 'of this kind '}in this window.${d.scope !== 'all' ? ' Widen it with Everything.' : ''}</div>`}</div>
+    ${d.timeline.length >= 300 ? html`<div class="card-f tiny faint">The newest 300 entries. Pick a job to narrow the window.</div>` : ''}</div>`;
+}
+function tlLinks(parts) { return parts.filter(Boolean).map((x, i) => html`${i ? ' · ' : ''}${x}`); }
+function tlRow(v, e) {
+  const when = html`<span class="tl-ts" title="${fmtTime(e.ts, true)}">${fmtTime(e.ts)}</span>`;
+  if (e.kind === 'change') {
+    const first = e.vms[0] || {};
+    const k = 'c|' + e.ts + '|' + (e.batch || '') + '|' + e.to + '|' + first.moref;
+    const open = v.open.has(k);
+    return html`<div class="tl-row lvl-${e.level}">${when}<span class="tl-ic">${icon('arrow')}</span>
+      <div class="grow"><div class="tl-t">${e.count === 1 ? html`<a data-act="vm" data-moref="${first.moref}">${first.name || first.moref}</a>`
+        : html`<a data-act="tlOpen" data-k="${k}">${plural(e.count, 'VM')} ${open ? '▴' : '▾'}</a>`}
+        <span class="faint">${e.from ? label(e.from) : 'queued'} →</span> <b>${label(e.to)}</b></div>
+        <div class="tl-m">${tlLinks([e.stage, e.batch ? html`<a class="mono" data-act="batch" data-ns="${e.ns || ''}" data-name="${e.batch}">${e.batch}</a>` : '',
+          e.actor && e.actor !== 'owner' ? e.actor : ''])}</div>
+        ${e.message ? html`<div class="tl-msg">${e.message}${e.mixed ? html` <span class="faint">(differs per VM)</span>` : ''}</div>` : ''}
+        ${open ? html`<div class="tl-vms">${e.vms.map((x) => html`<a data-act="vm" data-moref="${x.moref}">${x.name || x.moref}</a>`)}${e.count > e.vms.length ? html`<span class="faint">+${n(e.count - e.vms.length)} more</span>` : ''}</div>` : ''}</div></div>`;
+  }
+  if (e.kind === 'event') {
+    return html`<div class="tl-row lvl-${e.level}">${when}<span class="tl-ic">${icon(LVL_ICON[e.level] || 'info')}</span>
+      <div class="grow"><div class="tl-t">${e.title}</div>
+        <div class="tl-m">${tlLinks([e.moref ? html`<a data-act="vm" data-moref="${e.moref}">${e.moref}</a>` : '',
+          e.batch ? html`<a class="mono" data-act="batch" data-ns="${e.ns || ''}" data-name="${e.batch}">${e.batch}</a>` : '', e.actor && e.actor !== 'owner' ? e.actor : ''])}</div></div></div>`;
+  }
+  return html`<div class="tl-row tl-job lvl-${e.level} ${v.d.job === e.job ? 'on' : ''}" data-act="pickJob" data-id="${e.job}" title="Show this job's log, and only what happened during it">
+    ${when}<span class="tl-ic">${icon('terminal')}</span>
+    <div class="grow"><div class="tl-t"><b>${e.title}</b></div>${e.detail ? html`<div class="tl-msg bad-text">${e.detail}</div>` : ''}</div><span class="tiny faint">log</span></div>`;
+}
+
+function logCard(v) {
+  const j = v.job, d = v.d;
+  if (!d.jobs.length) return html`<div class="card log-card">${emptyState('terminal', 'No jobs yet', 'Every discovery, preflight, precheck, import and rollback started from the console is logged here, and kept under <workdir>/jobs.')}</div>`;
   let lines = j ? j.log : [];
   if (v.errOnly) lines = lines.filter(([, , t]) => ['bad', 'warn'].includes(lineClass(t)));
-  return html`<div class="grid side">
-    <div class="card"><div class="joblist" data-scroll="jobs">${v.jobs.map((x) => html`<div class="jobitem ${x.id === v.jobId ? 'on' : ''}" data-act="pickJob" data-id="${x.id}">
-      ${statusIcon(x.status)}<div class="grow" style="min-width:0"><div class="t ellipsis">${x.title}</div><div class="m">${fmtTime(x.started_at, true)} · ${fmtDur(elapsed(x))}${x.user && x.user !== 'owner' ? ' · ' + x.user : ''}</div></div></div>`)}</div></div>
-    <div class="card">${j ? html`<div class="card-h">${statusIcon(j.status)}<div class="grow"><h3>${j.title}</h3>
-        <div class="sub">${jobWord(j)} · started ${fmtTime(j.started_at, true)} by ${j.user || 'owner'} · ${fmtDur(elapsed(j))}${j.error ? html` · <span class="bad-text">${j.error}</span>` : ''}</div></div>
-        ${j.status === 'running' ? html`<button class="btn sm" data-act="follow" data-id="${j.id}">Follow live</button>` : ''}</div>
-      <div class="toolbar"><div class="search">${icon('search')}<input class="input sm" id="act-filter" placeholder="Filter lines" value="${v.filter}" data-input="logFilter"></div>
-        <label class="check small"><input type="checkbox" data-change="errOnly" ${attr(v.errOnly, 'checked')}> Problems only</label>
-        <span class="grow"></span><span class="small muted">${plural(j.log.length, 'line')}</span></div>
-      <div class="log" id="act-log" style="max-height:calc(100vh - 330px);border-radius:0 0 var(--radius) var(--radius)" data-scroll="actlog">${logLines(lines, v.filter)}</div>` : html`<div class="card-b muted">Pick a job.</div>`}</div></div>`;
-}
-function eventsTab(v) {
-  const q = v.q.toLowerCase();
-  const rows = v.events.filter((e) => !q || [e.message, e.moref, e.batch, e.actor].join(' ').toLowerCase().includes(q));
-  return html`<div class="card"><div class="toolbar">
-      <div class="search">${icon('search')}<input class="input" id="ev-q" placeholder="Search events" value="${v.q}" data-input="evq"></div>
-      <select class="select" data-change="level"><option value="">All levels</option>${['info', 'warn', 'error'].map((l) => html`<option ${attr(v.level === l, 'selected')}>${l}</option>`)}</select>
-      <span class="small muted">${plural(rows.length, 'event')} (newest first)</span></div>
-    <div class="table-wrap"><table class="t compact"><thead><tr><th>When</th><th>Level</th><th>Who</th><th>VM</th><th>Batch</th><th>Message</th></tr></thead><tbody>
-    ${rows.slice(0, 500).map((e) => html`<tr><td class="nowrap small muted">${fmtTime(e.ts, true)}</td><td><span class="tag ${e.level === 'error' ? 'bad' : e.level === 'warn' ? 'warn' : ''}">${e.level}</span></td><td class="small">${e.actor || ''}</td>
-      <td>${e.moref ? html`<a data-act="vm" data-moref="${e.moref}">${e.moref}</a>` : ''}</td><td class="mono tiny">${e.batch || ''}</td><td class="small">${e.message}</td></tr>`)}</tbody></table></div></div>`;
-}
-function movementTab(v) {
-  const s = v.stats || {};
-  return html`<div class="kpis mb">${kpi('Transitions', s.transitions || 0, 'every state change, ever')}
-      ${s.import_seconds ? kpi('Avg import', fmtDur(s.import_seconds.avg), 'min ' + fmtDur(s.import_seconds.min) + ' · max ' + fmtDur(s.import_seconds.max)) : ''}
-      ${kpi('First', s.first ? fmtTime(s.first, true) : '—', '')}${kpi('Latest', s.last ? fmtTime(s.last, true) : '—', '')}</div>
-    <div class="card"><div class="toolbar"><select class="select" data-change="tstate"><option value="">Into any state</option>${STATE_ORDER.map((x) => html`<option value="${x}" ${attr(v.state === x, 'selected')}>into ${label(x)}</option>`)}</select>
-      <span class="small muted">append-only ledger: <span class="mono">${v.ledger}</span></span></div>
-    <div class="table-wrap"><table class="t compact"><thead><tr><th>When</th><th>VM</th><th>Change</th><th>Stage</th><th>Batch</th><th>Held</th><th>Detail</th></tr></thead><tbody>
-    ${v.trans.map((t) => html`<tr class="click" data-act="vm" data-moref="${t.moref}"><td class="nowrap small muted">${fmtTime(t.ts, true)}</td><td><span class="vm-name">${t.vm_name}<small>${t.moref}</small></span></td>
-      <td class="nowrap">${t.from_state ? html`${dot(t.from_state)} <span class="faint">→</span> ` : ''}${pill(t.to_state)}</td><td class="small">${t.stage || ''}</td><td class="mono tiny">${t.batch || ''}</td>
-      <td class="small num">${t.held_secs !== null && t.held_secs !== undefined ? fmtDur(t.held_secs) : ''}</td><td class="msg"><div>${t.message || t.phase || ''}</div></td></tr>`)}</tbody></table></div></div>`;
-}
-function exportsTab() {
-  const card = (name, title, text) => html`<div class="card"><div class="card-b"><h3>${title}</h3><p class="small muted">${text}</p>
-    <a class="btn" href="${exportUrl(name)}" download="${name}">${icon('download')} ${name}</a></div></div>`;
-  return html`<div class="grid two">
-    ${card('tracker.csv', 'Tracker', 'One row per VM: source facts, target namespace and resource, batches, and timings. For the change ticket.')}
-    ${card('transitions.csv', 'Movement log', 'Every state change of every VM, with how long it was held. The audit trail in CSV.')}
-    ${card('ledger.jsonl', 'Ledger', 'The append-only JSONL ledger. Survives a rebuilt database; ship it to a SIEM or a change record.')}
-    ${card('report.html', 'HTML report', 'A standalone progress report, including the moved-into-VCFA table. Opens in any browser.')}</div>`;
+  return html`<div class="card log-card"><div class="card-h">${j ? statusIcon(j.status) : ''}
+      <select class="select sm grow" data-change="pickJob" aria-label="Job log to show">${d.jobs.map((x) => html`<option value="${x.id}" ${attr(!!j && x.id === j.id, 'selected')}>${fmtTime(x.started_at)} · ${x.title} · ${jobWord(x)}</option>`)}</select>
+      ${j && j.status === 'running' ? html`<button class="btn xs" data-act="follow" data-id="${j.id}" title="Follow it in the dock on every page">Dock</button>` : ''}</div>
+    ${j ? html`<div class="toolbar small"><span class="muted">${jobWord(j)} · ${fmtDur(elapsed(j))} · by ${j.user || 'owner'}</span>${j.error ? html`<span class="bad-text ellipsis" title="${j.error}">${j.error}</span>` : ''}</div>
+    <div class="toolbar"><div class="search grow">${icon('search')}<input class="input sm" id="act-filter" placeholder="Filter lines" value="${v.filter}" data-input="logFilter"></div>
+      <label class="check small"><input type="checkbox" data-change="errOnly" ${attr(v.errOnly, 'checked')}> Problems only</label>
+      <span class="small muted">${plural(lines.length, 'line')}</span></div>
+    <div class="log" id="act-log" data-scroll="actlog">${logLines(lines, v.filter)}</div>` : ''}</div>`;
 }
