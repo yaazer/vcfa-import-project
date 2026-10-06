@@ -70,6 +70,7 @@ const GLOSSARY = {
   powered_on: { t: 'Powered-on VMs only', d: 'Leaves powered-off VMs out of the inventory. Tools cannot report while a VM is off.' },
   no_tools: { t: 'Skip the VM Tools check', d: 'Faster discovery, but the Tools column and readiness cannot warn about VMs whose Tools are not running.' },
   no_tags: { t: 'Skip vCenter tags', d: 'Tags feed the tag filter, the tag map and applications. Skipping them saves a few calls.' },
+  batch_age: { t: 'Batches on the cluster', d: 'How long each batch has been running, against batch_timeout_minutes, and the operator’s latest reason. A known cause (such as the Supervisor’s DNS stall) is named in red with what to do.' },
   rediscovery: { t: 'Re-discovery', d: 'Renamed and moved VMs are updated in place. A VM this pass did not return is looked up by moref; only when vCenter answers “not found” is it removed, and a queued VM not yet handed to the importer becomes skipped. VMs in flight or committed are never touched.', doc: RM('re-discovery-renamed-moved-and-removed-vms') },
   mass_removal: { t: 'Allow mass removal', d: 'When vCenter reports more than half of the discovered VMs gone, nothing is removed: usually the account lost sight of part of the inventory. Tick this only if they really are gone.', tone: 'warn', doc: RM('re-discovery-renamed-moved-and-removed-vms') },
   attempts: { t: 'Attempts', d: 'How many times the VM went into a batch. Automatic retries stop at max_retries; a forced retry goes past it.' },

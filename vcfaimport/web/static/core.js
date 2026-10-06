@@ -441,7 +441,7 @@ function renderDock(full, fresh) {
     el.innerHTML = fmt(html`${bar}${D.open ? html`<div class="dock-body">
       <div class="dock-tools"><div class="search" style="width:260px">${icon('search')}<input class="input sm" id="dock-filter" placeholder="Filter log" value="${D.filter}" data-input="dockFilter"></div>
       <span class="small muted grow">${j ? html`${n(j.lines)} lines · started ${fmtTime(j.started_at)}` : ''}</span>
-      <a class="btn sm ghost" href="#/activity?tab=jobs&job=${D.id}">Open in Activity</a></div>
+      <a class="btn sm ghost" href="#/activity?job=${D.id}">Open in Activity</a></div>
       <div class="log" id="dock-log">${logLines(D.lines, D.filter)}</div></div>` : ''}`);
     const log = $('#dock-log');
     if (log) log.scrollTop = log.scrollHeight;

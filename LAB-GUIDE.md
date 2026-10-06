@@ -207,7 +207,7 @@ open the Theme Studio (palette icon) and choose **Rendering: Lite**.
 | 8 roll back | **Execute → Commit gate → Roll back instead**, or the VM's drawer → **Roll back** |
 | 9 commit | **Execute → Commit** (type `COMMIT`) |
 | 9 verify | **Execute → Post-import verification → Verify**. The vCenter checks need a session: tick *Keep these credentials in memory* on Discover, or set `VCFA_VC_PASSWORD` before starting the console; without it only ping runs. Ping goes out from the jump box (`sudo apt install iputils-ping` if `ping` is missing; without it that check is skipped) |
-| 10 tracker | **Activity & logs → Exports** |
+| 10 tracker | **Activity & logs**, the downloads at the foot of the page |
 | 10b start over | **Batches** → the batch → **Abandon** |
 
 The CLI still works alongside it on the same workspace, for example

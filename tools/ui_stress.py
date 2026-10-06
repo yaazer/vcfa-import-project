@@ -174,10 +174,16 @@ const SCENARIOS = {
       check('no markup injected on ' + id, noInjection());
       if (HP.get('narrow')) check('no page-level horizontal scroll on ' + id, document.documentElement.scrollWidth <= innerWidth + 2, document.documentElement.scrollWidth + ' > ' + innerWidth + ': ' + overflowers());
     }
-    for (const tab of ['jobs', 'events', 'movement', 'exports']) {
-      await open('activity', 'tab=' + tab);
-      check('activity tab ' + tab + ' renders', !brokeView() && document.querySelector('.tabs button.on').textContent.length > 0);
+    await open('activity');
+    check('activity leads with a verdict', await waitFor(() => document.querySelector('#act-now h2'), 5000));
+    check('activity shows one timeline and a job log', document.querySelector('#act-tl') && document.querySelector('.log-card'));
+    for (const k of ['problems', 'job', 'change', 'event', 'all']) {
+      click('[data-act="kind"][data-k="' + k + '"]');
+      check('timeline filter ' + k + ' renders', await waitFor(() => document.querySelector('[data-act="kind"].on[data-k="' + k + '"]'), 3000) && !brokeView());
     }
+    await open('activity', 'scope=all');
+    check('the whole history renders', !brokeView() && document.querySelector('[data-act="scope"].on[data-k="all"]'));
+    check('exports sit at the foot', document.querySelectorAll('.act-exports a[download]').length === 4);
     await open('queue');
     const first = document.querySelector('#view').firstChild;
     S.view.render();
@@ -525,6 +531,17 @@ const SCENARIOS = {
     const imp = await waitJob('execute', since);
     check('import job finished', imp && ['succeeded', 'warning'].includes(imp.status), imp && imp.status);
     check('execute view never broke', !brokeView());
+
+    // Activity: a batch's VMs read as one timeline entry; a job's row scopes the timeline to it.
+    await open('activity');
+    check('activity groups a batch\'s state changes', await waitFor(() => [...document.querySelectorAll('#act-tl .tl-row')].some((r) => /\d+ VMs/.test(r.textContent)), 8000));
+    const jobRow = document.querySelector('#act-tl .tl-job');
+    check('jobs appear in the timeline', jobRow);
+    if (jobRow) {
+      jobRow.click();
+      check('picking a job scopes the timeline to it', await waitFor(() => document.querySelector('[data-act="scope"].on[data-k="job"]'), 5000));
+      check('and shows its log', await waitFor(() => document.querySelectorAll('#act-log .ln').length > 0, 5000));
+    }
   },
 
   async drawers() {

@@ -691,6 +691,37 @@ class WebApp:
             return service.failure_groups(self.store)
 
     # ============================================================ activity
+    def activity(self, q, body) -> Dict[str, Any]:
+        """The Activity page in one call: what is happening now (and why it may be
+        stuck), one merged timeline, and the jobs to pick a log from.
+
+        scope: job (the picked job's time window), day (last 24 hours) or all."""
+        jobs = self.jobs.list()
+        active = self.jobs.active
+        job_id = q.get("job") or ""
+        picked = next((j for j in jobs if j["id"] == job_id), None)
+        scope = q.get("scope") or ("job" if picked else "day")
+        since = until = None
+        if scope == "job" and picked:
+            since, until = picked["started_at"], picked.get("finished_at")
+        elif scope == "day":
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+        else:
+            scope = "all"
+        holder = service.other_lock_holder(self.cfg)
+        with self.lock:
+            pending = self.store.conn.execute(
+                "SELECT COUNT(*) FROM approvals WHERE state=?", (access.PENDING,)).fetchone()[0]
+            now = service.activity_now(
+                self.store, self.cfg, job=active.summary() if active else None,
+                latest_job=jobs[0] if jobs else None, other_holder=holder,
+                approvals_pending=pending, next_window=sch.next_open(self.store))
+            timeline = service.activity_timeline(self.store, jobs=jobs, since=since, until=until,
+                                                 limit=_int(q.get("limit"), default=300, minimum=1))
+        return {"now": now, "timeline": timeline, "jobs": jobs, "scope": scope, "job": picked["id"] if picked else None,
+                "since": since, "until": until, "ledger_path": self.store.ledger_path,
+                "active": active.id if active else None}
+
     def events(self, q, body) -> Dict[str, Any]:
         with self.lock:
             rows = self.store.recent_events(
@@ -1436,6 +1467,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("POST", r"/api/rollback/preview", "rollback_preview"),
         ("POST", r"/api/abandon/preview", "abandon_preview"),
         ("GET", r"/api/triage", "triage"),
+        ("GET", r"/api/activity", "activity"),
         ("GET", r"/api/events", "events"),
         ("GET", r"/api/transitions", "transitions"),
         ("GET", r"/api/jobs", "jobs_list"),

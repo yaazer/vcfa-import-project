@@ -5539,7 +5539,98 @@ def t_cli_stage_wave():
         eq(vms, {"vm-100": 2, "vm-101": 2, "vm-102": 2, "vm-103": 2},
            "--wave maps re-applies the map to every pending VM, as staging always did")
 
+
+# ------------------------------------------------------------------ activity
+@test("activity: the verdict names a known stall, an unwatched batch, a quiet job and a timed-out batch")
+def t_activity_now():
+    import time
+    from vcfaimport import service
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        cfg = Config()
+        cfg.workdir = tmp
+        eq(service.activity_now(store, cfg)["verdict"]["title"], "Idle")
+        for i in (1, 2, 3):
+            _record(store, "vm-{}".format(i), "web-{}".format(i))
+        for i in (1, 2, 3):
+            store.set_vm_state("vm-{}".format(i), vst.S_PRECHECK_RUNNING, stage="precheck", precheck_batch="b1")
+        store.create_batch("b1", "ns-a", "r1", 1, "precheck", 3)
+        store.set_batch_state("b1", "ns-a", vst.B_RUNNING, "waiting")
+        now = service.activity_now(store, cfg)
+        eq([s["key"] for s in now["signals"]], ["unwatched"], "a batch on the cluster with nothing polling it")
+        eq(now["verdict"]["level"], "warn")
+        eq(now["batches"][0]["in_flight"], 3)
+        # the lab's DNS stall in the operator's message: named while the batch still runs
+        store.set_batch_state("b1", "ns-a", vst.B_RUNNING, "lookup vc.lab on 127.0.0.53:53: i/o timeout")
+        now = service.activity_now(store, cfg)
+        eq(now["signals"][0]["key"], "issue:dns")
+        eq(now["verdict"]["title"], "Needs attention")
+        eq(now["batches"][0]["issue"]["id"], "dns")
+        # a running job that has said nothing for an hour
+        store.set_batch_state("b1", "ns-a", vst.B_RUNNING, "waiting")
+        job = {"id": "j1", "title": "Precheck wave 1", "status": "running", "started_at": "2026-01-01T00:00:00Z",
+               "last_log_at": "2026-01-01T00:00:00Z", "last_line": "-> applied b1"}
+        now = service.activity_now(store, cfg, job=job, now=time.time() + 3600)
+        assert any(s["key"] == "quiet" for s in now["signals"]), now["signals"]
+        assert not any(s["key"] == "unwatched" for s in now["signals"]), "a running job is watching"
+        eq(now["verdict"]["title"], "Possibly stuck")
+        # the batch timed out: nothing polls its VMs any more
+        store.set_batch_state("b1", "ns-a", vst.B_TIMEDOUT, "batch exceeded batch_timeout_minutes=90")
+        now = service.activity_now(store, cfg)
+        assert any(s["key"] == "stalled" and s["level"] == "bad" for s in now["signals"]), now["signals"]
+        store.close()
+
+
+@test("activity: one timeline, with a batch's state changes collapsed into one entry")
+def t_activity_timeline():
+    from vcfaimport import service
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        for i in range(1, 5):
+            _record(store, "vm-{}".format(i), "web-{}".format(i))
+        for i in range(1, 5):
+            store.set_vm_state("vm-{}".format(i), vst.S_PRECHECK_RUNNING, stage="precheck", precheck_batch="b1")
+        store.create_batch("b1", "ns-a", "r1", 1, "precheck", 4)
+        store.log_event("precheck batch deleted once its verdict was recorded", batch="b1")
+        jobs = [{"id": "j1", "title": "Precheck wave 1", "status": "succeeded", "user": "owner",
+                 "started_at": "2000-01-01T00:00:00Z", "finished_at": "2999-01-01T00:00:00Z"}]
+        tl = service.activity_timeline(store, jobs=jobs)
+        moved = [e for e in tl if e["kind"] == "change" and e["to"] == vst.S_PRECHECK_RUNNING]
+        eq(len(moved), 1, "four VMs moving together are one entry")
+        eq(moved[0]["count"], 4)
+        eq(moved[0]["ns"], "ns-a", "the batch can be opened from the entry")
+        eq(len([e for e in tl if e["kind"] == "change" and e["to"] == vst.S_PENDING]), 1)
+        eq([e["ns"] for e in tl if e["kind"] == "event"], ["ns-a"])
+        eq([e["title"] for e in tl if e["kind"] == "job"], ["Precheck wave 1 finished", "Started: Precheck wave 1"])
+        eq(tl[0]["kind"], "job", "newest first")
+        eq(service.activity_timeline(store, jobs=jobs, since="2999-06-01T00:00:00Z"), [], "the window applies")
+        # a failure is a state change and an event with the same message: it shows once
+        store.set_vm_state("vm-1", vst.S_PRECHECK_FAILED, stage="precheck", message="VM Tools not running")
+        store.log_event("VM Tools not running", "error", moref="vm-1")
+        tl = service.activity_timeline(store, jobs=jobs)
+        eq([e["title"] for e in tl if e["kind"] == "event" and e.get("moref") == "vm-1"], [])
+        eq(len([e for e in tl if e["kind"] == "change" and e["to"] == vst.S_PRECHECK_FAILED]), 1)
+        store.close()
+
+
+@test("activity: the console serves the whole page in one call")
+def t_web_activity():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            d = c.ok("GET", "/api/activity")
+            assert {"now", "timeline", "jobs", "scope", "ledger_path"} <= set(d), sorted(d)
+            eq(d["scope"], "day")
+            eq(d["now"]["verdict"]["title"], "Idle")
+            eq(c.ok("GET", "/api/activity?scope=all")["scope"], "all")
+        finally:
+            c.close()
+
+
 UNIT = [
+    t_activity_now, t_activity_timeline, t_web_activity,
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
     t_app_icon, t_status_child_blocking_condition, t_discovery_drift, t_precheck_max_age,
     t_run_members_left_over, t_place_new_vms, t_web_stage_next_wave, t_cli_stage_wave, t_wave_info, t_web_wave_info, t_cli_waves, t_status_child_vm_deleted,
