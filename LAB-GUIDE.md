@@ -572,6 +572,7 @@ in `run/ledger.jsonl` survives even if you delete the database.
 ## Cleanup
 
 Committed VMs cannot be returned to vCenter by this tool (or by the operator).
-To reset the lab, delete them from the namespace and recreate them in vCenter.
-Batch objects for rolled-back imports: `vcfa-import cleanup`. The workspace
-directory can simply be deleted.
+To reset the lab, delete them from the namespace and recreate them in vCenter, then reset the
+campaign: Settings → *Reset campaign*, or `vcfa-import reset` (it archives the old one first).
+Batch objects of finished waves, rolled-back imports and old prechecks: `vcfa-import cleanup`
+(or Execute → *Clean up finished waves* in the console).

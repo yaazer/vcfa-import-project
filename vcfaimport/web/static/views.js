@@ -1177,7 +1177,7 @@ function waveColumn(v, w, idx, waves, hitSet, q) {
 
 // ================================================================== EXECUTE
 VIEWS.execute = view({
-  title: 'Execute', sub: 'Step 5 · preflight, precheck, import, commit',
+  title: 'Execute', sub: 'Step 5 · preflight, precheck, import, commit, clean up',
   live: true,
   init(v, p) {
     v.o = null;
@@ -1282,6 +1282,7 @@ VIEWS.execute = view({
               ${S.info.features.vcenter_remembered || S.info.vcenter.password_from_env ? '' : ' Without a vCenter session only ping and port checks run: tick "keep credentials" on Discover.'}</p></div>
             <div class="card-f"><button class="btn" data-act="verify" data-unverified="1" ${attr(!!job || !(o.verify && o.verify.none), 'disabled')}>${icon('check')} Verify ${n((o.verify && o.verify.none) || 0)} unchecked</button>
               <button class="btn ghost" data-act="verify" ${attr(!!job, 'disabled')}>Re-verify all</button></div></div>`, o.verify && o.verify.fail ? 'warn' : '') : ''}
+      ${(o.wave_cleanup || []).length ? flowSec(num(), waveCleanupCard(o.wave_cleanup, job), waveCleanupState(o.wave_cleanup), 'sec-cleanup') : ''}
       </div>`;
   },
   // A precheck that every VM it ran passed flips the page to Import for the same waves and folder:
@@ -1319,6 +1320,8 @@ VIEWS.execute = view({
     refreshCluster: () => startJob('refresh', {}),
     commit: (t, e, v) => doCommit({}, v.o.counts.awaiting_commit),
     rollbackHeld: () => doRollback({ failed: true }),
+    cleanWave: (t) => doCleanupWaves([+t.dataset.w], +t.dataset.n),
+    cleanWaves: (t) => doCleanupWaves(t.dataset.w.split(',').map(Number), +t.dataset.n),
     schedule(t, e, v) { go('schedule', qs({ stage: v.opt.stage, waves: Array.from(v.opt.waves).join(',') })); },
     async start(t, e, v) {
       await replan(v, false);
@@ -1341,6 +1344,37 @@ VIEWS.execute = view({
     },
   },
 });
+// Step 6: once every VM of a wave is committed (or skipped), its batch objects only clutter the
+// namespace. One row per wave says whether it is finished and what is still on the cluster.
+function waveCleanupState(rows) {
+  if (rows.some((w) => w.finished && w.cleanable)) return 'now';
+  return rows.every((w) => w.finished && !w.on_cluster) ? 'done' : '';
+}
+function waveCleanupCard(rows, job) {
+  const ready = rows.filter((w) => w.finished && w.cleanable);
+  const total = ready.reduce((a, w) => a + w.cleanable, 0);
+  const openText = (w) => STATE_ORDER.filter((s) => w.open[s]).map((s) => n(w.open[s]) + ' ' + label(s)).join(' · ');
+  return html`<div class="card"><div class="card-h"><h3>Clean up finished waves ${tip('wave_cleanup')}</h3><span class="sub">batch objects left on the cluster</span></div>
+    <div class="table-wrap"><table class="t"><tbody>${rows.map((w) => html`<tr>
+      <td class="nowrap"><b>${waveLabel(w.wave)}</b></td>
+      <td>${w.finished ? html`<span class="tag ok">finished</span> <span class="small muted">${plural(w.committed, 'VM')} committed</span>`
+        : html`<span class="tag">in progress</span> <span class="small muted">${openText(w)}</span>`}</td>
+      <td class="small nowrap">${w.on_cluster ? plural(w.on_cluster, 'batch object') + ' on the cluster' : html`<span class="muted">${icon('check')} nothing left on the cluster</span>`}</td>
+      <td class="right">${w.finished && w.cleanable ? html`<button class="btn sm" data-act="cleanWave" data-w="${w.wave}" data-n="${w.cleanable}" ${attr(!!job, 'disabled')}>${icon('trash')} Clean up</button>`
+        : !w.finished && w.on_cluster ? html`<span class="tiny faint">once every VM is committed</span>` : ''}</td></tr>`)}</tbody></table></div>
+    <div class="card-f"><button class="btn primary" data-act="cleanWaves" data-w="${ready.map((w) => w.wave).join(',')}" data-n="${total}" ${attr(!total || !!job, 'disabled')}>${icon('trash')} Clean up ${ready.length > 1 ? 'all ' + ready.length + ' finished waves' : 'finished waves'} (${plural(total, 'batch object')})</button>
+      <span class="small muted">Committed VMs are not affected; every result stays in the history and the ledger.</span></div></div>`;
+}
+async function doCleanupWaves(waves, count) {
+  const ok = await modal({
+    title: 'Clean up ' + (waves.length === 1 ? waveLabel(waves[0]) : plural(waves.length, 'wave')) + '?', ic: 'trash', confirm: 'Delete ' + plural(count, 'batch object'),
+    body: html`<p>Deletes ${plural(count, 'ImportOperationBatch object')} of ${waves.length === 1 ? 'this finished wave' : 'these finished waves'} from the cluster, with their ImportOperation records.</p>
+      <ul class="plain small"><li><b>Committed VMs are not affected</b>: they stay in their namespaces.</li>
+      <li>Every result stays here: each VM's history, the ledger and the Batches page (shown as cleaned up).</li></ul>`,
+  });
+  if (!ok) return;
+  await startJob('cleanup', { waves, confirm: true });
+}
 // Every VM the precheck run applied reached "passed": nothing failed, nothing left without a
 // verdict (an unknown operator phase keeps a VM running, not passed), and the run went the whole way.
 function precheckPassed(j) {
@@ -1557,19 +1591,23 @@ function issueCard(v, g, i) {
 // ================================================================== BATCHES
 VIEWS.batches = view({
   title: 'Batches', sub: 'ImportOperationBatch objects this campaign created', live: true,
-  init(v) { v.f = { stage: '', states: new Set(), q: '' }; v.page = 0; v.sort = { key: 'created_at', dir: -1 }; },
+  init(v) { v.f = { stage: '', states: new Set(), q: '', showDeleted: false }; v.page = 0; v.sort = { key: 'created_at', dir: -1 }; },
   async load(v) { v.d = await GET('/api/batches'); },
   paint(v) {
     const all = v.d.batches;
     if (!all.length) return emptyState('batches', 'No batches yet', 'Batches are created when you precheck or import. Every batch holds VMs from one namespace, wave and folder.');
     const f = v.f, q = f.q.trim().toLowerCase();
-    const base = all.filter((b) => (!f.stage || b.stage === f.stage) && (!q || (b.name + ' ' + b.namespace + ' ' + (b.message || '')).toLowerCase().includes(q)));
+    // Cleaned-up batches (finished prechecks, finished waves) are no longer on the cluster: hidden unless asked for.
+    const deleted = all.filter((b) => b.state === 'deleted').length;
+    const base = all.filter((b) => (f.showDeleted || f.states.has('deleted') || b.state !== 'deleted') &&
+      (!f.stage || b.stage === f.stage) && (!q || (b.name + ' ' + b.namespace + ' ' + (b.message || '')).toLowerCase().includes(q)));
     const counts = countBy(base, 'state');
     const rows = sortRows(base.filter((b) => !f.states.size || f.states.has(b.state)), v.sort.key, v.sort.dir);
     const pageRows = rows.slice(v.page * PAGE, (v.page + 1) * PAGE);
     return html`<div class="card">
       <div class="toolbar"><div class="search">${icon('search')}<input class="input" id="b-q" placeholder="Search batch, namespace, message…" value="${f.q}" data-input="q"></div>
         <div class="seg">${[['', 'All'], ['precheck', 'Precheck'], ['import', 'Import']].map(([k, l]) => html`<button class="${f.stage === k ? 'on' : ''}" data-act="stage" data-k="${k}">${l}</button>`)}</div>
+        ${deleted ? html`<label class="check small" title="Finished prechecks and finished waves, deleted from the cluster. Their results stay on each VM."><input type="checkbox" id="b-showdel" data-change="showDel" ${attr(f.showDeleted, 'checked')}> Show cleaned up (${n(deleted)})</label>` : ''}
         <div class="chips">${Object.entries(counts).map(([s, c]) => html`<span class="chip ${f.states.has(s) ? 'on' : ''}" data-act="st" data-s="${s}">${s.replace(/_/g, ' ')} <span class="n">${n(c)}</span></span>`)}</div></div>
       <div class="table-wrap"><table class="t"><thead><tr>${th(v, 'name', 'Batch')}${th(v, 'namespace', 'Namespace')}${th(v, 'stage', 'Stage')}${th(v, 'wave', 'Wave')}${th(v, 'state', 'State')}
         <th style="width:150px">Members</th>${th(v, 'applied_at', 'Applied')}${th(v, 'finished_at', 'Finished')}${th(v, 'message', 'Message')}</tr></thead>
@@ -1582,6 +1620,7 @@ VIEWS.batches = view({
   act: {
     q: debounce((t, e, v) => { v.f.q = t.value; v.page = 0; v.render(); }, 180),
     stage(t, e, v) { v.f.stage = t.dataset.k; v.page = 0; v.render(); },
+    showDel(t, e, v) { v.f.showDeleted = t.checked; v.page = 0; v.render(); },
     st(t, e, v) { const s = t.dataset.s; if (v.f.states.has(s)) v.f.states.delete(s); else v.f.states.add(s); v.page = 0; v.render(); },
     sort(t, e, v) { const k = t.dataset.key; v.sort = { key: k, dir: v.sort.key === k ? -v.sort.dir : 1 }; v.render(); },
     page(t, e, v) { v.page = +t.dataset.page; v.render(); },

@@ -1019,6 +1019,7 @@ function jobSummary(j) {
     case 'rollback': return n(r.reverted) + ' VM(s) reverted to vCenter';
     case 'commit': return n(r.committed) + ' VM(s) committed' + (r.failed ? ' · failed ' + n(r.failed) : '') + ((r.pending || []).length ? ' · not confirmed yet, refresh' : '');
     case 'abandon': return (r.deleted || []).length + ' batch(es) deleted, ' + n(r.requeued) + ' VM(s) requeued';
+    case 'reset': return plural(r.vms || 0, 'VM') + ' archived to ' + (r.archive || 'the archive') + '; a fresh campaign starts';
     default: return 'took ' + fmtDur(r.seconds);
   }
 }

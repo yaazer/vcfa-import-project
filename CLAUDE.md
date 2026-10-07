@@ -26,6 +26,15 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - Web console: no external assets (no CDN, no web fonts; the jump box may be air-gapped),
   every `/api` call needs the `X-VCFA-Token` header, and cluster-changing endpoints
   require `"confirm": true` on the server side too. Only one job runs at a time.
+- **A finished wave** (every VM committed or skipped, `engine.wave_finished`) can have all its batch
+  objects deleted (`engine.cleanup_plan` / `delete_batches`, Execute step "Clean up finished waves",
+  `cleanup --wave`). `delete_batches` re-checks each batch at delete time; a wave with anything open
+  is never touched. Cleaned-up batches stay in the store as `deleted`.
+- **A campaign reset** (`service.reset_campaign`; Settings → *Reset campaign*, `reset`) is refused
+  while a VM is in flight or awaiting commit, deletes the campaign's batch objects first (one failure
+  = nothing reset), archives `state.db` + local ledger + job logs to `<workdir>/archive/`, then
+  empties `Store.CAMPAIGN_TABLES`. Users, settings and maps survive; a shared `ledger_path` is never moved.
+  `POST /api/reset` needs `"confirm_phrase": "RESET"` as well as `confirm` (the HTTP fuzz test sends `confirm: true`).
 - **Staging decides waves only for VMs entering the queue** (`service.place_new_vms`): "auto" =
   the maps on a campaign's first staging (empty queue), the next wave (highest + 1) after that;
   "next" / "maps" / a number on request. Queued VMs keep their wave unless "maps" (the old

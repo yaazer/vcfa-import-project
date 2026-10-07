@@ -47,6 +47,33 @@ class PreflightResult:
 
 
 
+# A wave is finished once every VM in it is committed or skipped: nothing of it is in
+# flight, held at the commit gate, failed or waiting to be retried. Its batch objects
+# then only clutter the namespace (deleting a committed batch left its VMs alone,
+# 2026-10-01), and over a campaign they number in the hundreds.
+SETTLED_STATES = (st.S_COMMITTED, st.S_SKIPPED)
+
+
+def wave_finished(store: st.Store, wave: int) -> bool:
+    counts = store.counts(wave=wave)
+    return bool(counts) and all(state in SETTLED_STATES for state in counts)
+
+
+def cleanup_plan(store: st.Store, waves: Optional[Sequence[int]] = None) -> List[sqlite3.Row]:
+    """Every batch object cleanup may delete: confirmed rollbacks and finished prechecks
+    (in any wave), and every batch of a finished wave still on the cluster."""
+    rows = {(b["namespace"], b["name"]): b for b in cleanup_candidates(store)}
+    finished = {w for w in store.waves() if wave_finished(store, w)}
+    for b in store.query_batches():
+        if b["state"] != st.B_DELETED and b["wave"] in finished:
+            rows.setdefault((b["namespace"], b["name"]), b)
+    out = list(rows.values())
+    if waves:
+        wanted = {int(w) for w in waves}
+        out = [b for b in out if b["wave"] in wanted]
+    return sorted(out, key=lambda b: (b["wave"], b["stage"], b["name"]))
+
+
 def cleanup_candidates(store: st.Store) -> List[sqlite3.Row]:
     """Batch objects the cluster no longer needs: confirmed rollbacks, and finished
     prechecks (deleted automatically since 2026-10; older workspaces still hold some)."""
@@ -1434,21 +1461,48 @@ class Engine:
         return cleanup_candidates(self.store)
 
     def delete_batches(self, batches: Sequence[sqlite3.Row]) -> Dict[str, Any]:
+        """Delete batch objects the cluster no longer needs, re-checking each one first:
+        a finished precheck, a confirmed rollback, or any batch of a finished wave."""
         result: Dict[str, Any] = {"deleted": [], "errors": []}
-        prechecks = [b for b in batches if b["stage"] == STAGE_PRECHECK]
-        self._delete_rolled_back([b for b in batches if b["stage"] != STAGE_PRECHECK], result)
-        for row in prechecks:
+        rolled: List[sqlite3.Row] = []
+        for row in batches:
             ns, name = row["namespace"], row["name"]
             current = self.store.get_batch(name, ns)
-            if current is None or current["state"] not in st.PRECHECK_DONE_STATES:
-                result["errors"].append("{}/{}: not deleted -- the precheck has not finished ({})".format(
-                    ns, name, current["state"] if current else "unknown"))
+            if current is None or current["state"] == st.B_DELETED:
                 continue
-            if self._release_precheck(ns, name, "precheck {}".format(current["state"])):
-                result["deleted"].append(name)
+            finished = wave_finished(self.store, current["wave"])
+            if current["stage"] == STAGE_PRECHECK:
+                if current["state"] not in st.PRECHECK_DONE_STATES and not finished:
+                    result["errors"].append("{}/{}: not deleted -- the precheck has not finished ({})".format(
+                        ns, name, current["state"]))
+                elif self._release_precheck(ns, name, "precheck {}".format(current["state"])):
+                    result["deleted"].append(name)
+                else:
+                    result["errors"].append("{}/{}: delete failed".format(ns, name))
+            elif current["state"] == st.B_ROLLED_BACK:
+                rolled.append(current)
+            elif finished:
+                self._delete_finished_wave_batch(current, result)
             else:
-                result["errors"].append("{}/{}: delete failed".format(ns, name))
+                result["errors"].append(
+                    "{}/{}: not deleted -- wave {} is not finished (not every VM is committed or "
+                    "skipped) and this is not a confirmed rollback".format(ns, name, current["wave"]))
+        self._delete_rolled_back(rolled, result)
         return result
+
+    def _delete_finished_wave_batch(self, row: sqlite3.Row, result: Dict[str, Any]) -> None:
+        ns, name = row["namespace"], row["name"]
+        try:
+            self.kube.delete(self.cfg.batch_resource, name, ns)
+        except KubectlError as exc:
+            result["errors"].append("{}/{}: delete failed: {}".format(ns, name, str(exc)[:300]))
+            return
+        self.store.set_batch_state(name, ns, st.B_DELETED,
+                                   "wave {} finished: deleted from the cluster; its VMs stay as they are"
+                                   .format(row["wave"]))
+        self.store.log_event("batch deleted: wave {} finished".format(row["wave"]), batch=name)
+        self.log("  x  deleted {}/{} (wave {} finished)".format(ns, name, row["wave"]))
+        result["deleted"].append(name)
 
     # ---------------------------------------------------------------- retry
     def requeue(self, morefs: Optional[Sequence[str]] = None, wave: Optional[int] = None,

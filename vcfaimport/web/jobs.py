@@ -278,7 +278,7 @@ class JobManager:
                 job.log("error: {}".format(exc))
                 known = type(exc).__name__ in (
                     "ConfigError", "InventoryError", "SelectionError", "VCenterError",
-                    "VCenterAuthError", "KubectlError", "WorkspaceBusy")
+                    "VCenterAuthError", "KubectlError", "WorkspaceBusy", "ResetRefused")
                 if not known:
                     job.log(traceback.format_exc().rstrip())
                 job.finish(FAILED, error=str(exc)[:2000] or type(exc).__name__)
@@ -299,6 +299,12 @@ class JobManager:
 
     def list(self) -> List[Dict[str, Any]]:
         return [j.summary() for j in reversed(list(self._jobs.values()))]
+
+    def forget_others(self, keep_id: str) -> None:
+        """Drop every job but one from the history (a campaign reset archived their files)."""
+        with self._lock:
+            for job_id in [j for j in self._jobs if j != keep_id]:
+                del self._jobs[job_id]
 
     def _trim(self) -> None:
         while len(self._jobs) > MAX_JOBS_KEPT:

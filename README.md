@@ -683,8 +683,9 @@ it never touches batches it did not create.
 | `watch` | redraw `status` on an interval until nothing is in flight |
 | `commit` | release VMs held by `commitAction: Wait`; scopes by `--wave` or `--vm` (**no `--folder`**), or commits everything waiting |
 | `retry` | return failed VMs to the queue |
+| `reset` | archive the campaign and start afresh; `--keep-discovery` keeps the vCenter inventory |
 | `rollback` | hand failed imports back to vCenter: set `rollbackAction`, wait for the revert, optionally delete |
-| `cleanup` | delete batch objects the cluster no longer needs: confirmed rollbacks and finished prechecks |
+| `cleanup` | delete batch objects the cluster no longer needs: every batch of a finished wave, confirmed rollbacks and finished prechecks; `--wave N` scopes it |
 | `abandon` | discard a batch without rollback (precheck-only, or nothing in flight); VMs return to `pending` |
 | `vms` | list VMs and their states (`--json` for scripting) |
 | `skip` | exclude or re-include VMs |
@@ -899,6 +900,56 @@ it fires even when the circuit breaker halts the run, so a wave that went badly
 does not leave VMs half-owned overnight.
 
 ---
+
+## Cleaning up finished waves
+
+Every precheck and every import leaves an `ImportOperationBatch` (and an `ImportOperation`
+per VM) in the namespace. Over a campaign that is hundreds of objects. What the tool cleans up:
+
+| batch | when | how |
+|---|---|---|
+| precheck | as soon as every VM's verdict is recorded | automatically (each child holds a storage reservation until then) |
+| import, rolled back | once the operator confirms the rollback | `rollback --delete`, `cleanup`, Triage |
+| **every batch of a finished wave** | once **every VM in the wave is committed or skipped** | **Execute → *Clean up finished waves***, or `cleanup` |
+
+```bash
+vcfa-import cleanup              # every finished wave, plus confirmed rollbacks and finished prechecks
+vcfa-import cleanup --wave 3     # just wave 3
+```
+
+A wave with anything still open (pending, failed, rolled back, held at the commit gate) is not
+finished: it is listed with what is open, and nothing of it is deleted. Each batch is checked again
+just before it is deleted.
+
+Deleting a committed batch does not touch its VMs: they carry no reference to the batch or its
+children, and stay in their namespaces (observed 2026-10-01). Every result stays in the tool: each
+VM's history, the ledger and the Batches page, where cleaned-up batches are hidden behind *Show
+cleaned up*.
+
+## Resetting a campaign
+
+To start afresh in the same workspace (before a demo, after a rehearsal, between lab runs), an
+admin uses **Settings → *Reset campaign*** (type `RESET` to confirm), or the CLI:
+
+```bash
+vcfa-import reset                    # shows what it clears, keeps and deletes, then asks
+vcfa-import reset --keep-discovery   # keep the discovered vCenter inventory (selection cleared)
+```
+
+| | what happens |
+|---|---|
+| archived first | `state.db`, the ledger and the console's job logs, to `<workdir>/archive/campaign-<time>/` with a `reset.json` summary |
+| deleted from the cluster | every batch object the campaign still has there; if one cannot be deleted, nothing is reset |
+| cleared | the queue, every VM's history, waves and their names, events, change windows, approvals, verifications, and the discovered inventory (unless kept) |
+| kept | settings, people and their links, the maps, the config file and the vCenter server name |
+
+A reset is refused while any VM is in flight (precheck, import, rollback) or awaiting commit: the
+operator owns those VMs until they are committed or rolled back. Commit or roll back first.
+
+**Committed VMs stay in their namespaces.** An import cannot be undone; to import the same VMs again
+in a lab, delete them in VCFA and recreate them in vCenter, then discover again. A ledger configured
+with `ledger_path` (a file share) is never moved: it gets a `campaign_reset` line instead. To look at
+an archived campaign, point a config's `workdir` at its archive folder.
 
 ## The tracker
 
