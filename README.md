@@ -84,7 +84,7 @@ closed state is remembered per browser.
 | **Overview** (Monitor) | Campaign totals, progress by wave, namespace and application (with time left per wave), live batches, recent failures, requests waiting for approval, the next change window, and a *next step* prompt that tells you what to do now |
 | **1 Discover** | Connect to vCenter (server/user pre-filled from `VCFA_VC_*`; the password is used once and never stored) and read the inventory, with a live progress bar |
 | **2 Select VMs** | Folder tree with tri-state checkboxes (a folder takes its whole subtree), then the VM list with search and facet filters (including **readiness**, vCenter **tag** and **application**), shift-click ranges and saved views. An optional, folded-away bar sets a namespace, wave or application on the selection by hand |
-| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A folded *What you can map to* panel (its summary counts them; open it when you need the list, and filter it by name) lists the Supervisor's namespaces, its Subnets and SubnetSets (each with the namespace it lives in, VPC ones included) and every vCenter portgroup from the last discovery; each is suggested as you type in the matching field, a click fills the field you are in (or adds an unmapped portgroup to the map), and names that do not exist are flagged; if two maps name different namespaces for a VM, the preview says which one won. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Staging saves the maps to the same CSVs the CLI uses |
+| **3 Map & Stage** | Edit the folder and portgroup maps in place. Each folder and network of the selection shows what it resolves to, or **unmapped**, with one-click *+ Map*. A folded *What you can map to* panel (its summary counts them; open it when you need the list, and filter it by name) lists the Supervisor's namespaces, its Subnets and SubnetSets (each with the namespace it lives in, VPC ones included) and every vCenter portgroup from the last discovery; each is suggested as you type in the matching field, a click fills the field you are in (or adds an unmapped portgroup to the map), and names that do not exist are flagged; if two maps name different namespaces for a VM, the preview says which one won. An optional **tag map** places VMs by vCenter tag. A live preview shows exactly which VMs stage, into which namespace and wave, and which can't be placed. Entries that match no discovered VM (a folder renamed or moved in vCenter, a tag removed) are flagged, with a button to remove them. Staging saves the maps to the same CSVs the CLI uses |
 | **4 Waves** | One row per wave, top to bottom, with its folders and its estimated time. Drag a VM or a whole folder between waves, drop onto *New wave*, and reorder waves with ← →. The pencil names a wave and keeps notes on it, typically the tenant it moves (see [Naming waves](#naming-waves)). With *Move whole apps* an application moves as one; apps split across waves are flagged, with *Pull into wave N*. VMs already in a batch are locked and cannot move |
 | **5 Execute** | Preflight checklist, then precheck or import per wave, with an optional folder scope, batch size, parallelism, dry run and *roll back failures after the run*. You review the batch plan before anything is applied; an import under `commitAction: Auto` makes you type `IMPORT`. When a precheck passes for every VM it ran, the page switches to Import for the same waves and folder, ready to review; it never starts the import for you, and a precheck with failures stays on Precheck. Includes a commit gate, a *Watch* for batches left over from an earlier session, an ETA per wave, what is held back and why, post-import verification, and *Schedule…* to run it in a change window instead |
 | **Import queue** (Monitor) | Every VM with state, application and verification filters and saved views; bulk retry / skip / move wave / verify / roll back / abandon |
@@ -474,13 +474,28 @@ VLAN197-Prod,,subnet-vlan197,1,,,
 VLAN2*,,subnet-vlan2xx,2,,,
 ```
 
-`init` writes both map files with every column present.
+`init` writes both map files with the header row only: every column present, no rows.
 
 Namespace precedence: picker / `select --namespace` → folder map → portgroup
 map → `--default-namespace`. Wave follows the same order, unless staging puts new
 VMs in the next wave (below). **A VM with no namespace is reported, never
 guessed** — `stage` lists it with its folder and leaves it out; folders with no
 rule are listed too.
+
+### Where the maps live
+
+The maps are the CSV files themselves; nothing about them is kept in `state.db`. The console's
+**Map & Stage** edits them in place: it loads `folder-map.csv`, `portgroup-map.csv` and
+`tag-map.csv` from the config file's folder (or the paths given to `serve --folder-map`, `--map`
+and `--tag-map`), and *Save maps* and *Stage* write them back. `stage --folder-map …` reads the
+same files, so the CLI and the console always agree, and a campaign reset leaves them alone.
+
+**Stale entries.** An entry outlives the vCenter object it names. Rename or move a folder, or
+remove a tag, and its entry matches no VM any more: it places nothing, but still reads like a
+mapping. Map & Stage flags such entries -- judged against every discovered VM, not only the
+selection, as of the last discovery -- and offers to remove them; `stage` lists them. Map the
+folder under its new name with *+ Map*. A folder that holds no VMs is flagged too: there is
+nothing for its entry to place.
 
 ### Waves for newly staged VMs
 

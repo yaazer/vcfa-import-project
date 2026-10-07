@@ -408,6 +408,24 @@ const SCENARIOS = {
       type('#n-' + ni + '-namespace', '');
       check('clearing it clears the warning', await waitFor(() => !(S.view.preview.ns_conflicts || []).length, 8000));
     }
+
+    // a folder renamed in vCenter leaves its entry behind (lab, 2026-10-07): flagged, and removable
+    const live = S.view.fr.length;
+    check('the saved folder entries match discovered folders', !document.querySelector('#stale-note-f') &&
+      ![...document.querySelectorAll('.maptable input[data-col="folder"]')].some((x) => x.classList.contains('unknown')));
+    click('[data-act="addRow"][data-m="f"]:not([data-key])');
+    await waitFor(() => document.getElementById('f-' + live + '-folder'), 3000);
+    type('#f-' + live + '-folder', 'migration-wave3');
+    type('#f-' + live + '-namespace', 'prod-web-ns1');
+    const staleIn = () => document.getElementById('f-' + live + '-folder');
+    check('an entry matching no discovered folder is flagged', await waitFor(() => staleIn() && staleIn().classList.contains('unknown'), 8000));
+    check('with a reason', staleIn() && /renamed or moved/.test(staleIn().title), staleIn() && staleIn().title);
+    const note = await waitFor(() => document.querySelector('#stale-note-f'), 3000);
+    check('and named in a note above the map', note && /1 entry matches no folder/.test(note.textContent) && /migration-wave3/.test(note.textContent), note && note.textContent.slice(0, 200));
+    check('the folders section asks for attention', await waitFor(() => document.querySelector('#sec-folders').classList.contains('warn'), 3000), document.querySelector('#sec-folders').className);
+    click('#stale-note-f [data-act="dropStale"]');
+    check('Remove takes out that entry only', await waitFor(() => S.view.fr.length === live && !S.view.fr.some((r) => r.folder === 'migration-wave3'), 3000), S.view.fr.map((r) => r.folder).join(','));
+    check('and the note goes', await waitFor(() => !document.querySelector('#stale-note-f'), 8000));
     check('stage view never broke', !brokeView());
   },
 

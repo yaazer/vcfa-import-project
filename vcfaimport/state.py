@@ -12,7 +12,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .folders import folder_matches
 from .inventory import VmRecord
@@ -1157,6 +1157,20 @@ class Store:
                     nets.add(name)
         out["network"] = sorted(nets)
         return out
+
+    def discovered_folders_tags(self) -> Tuple[int, Set[str], Set[str]]:
+        """Discovered VM count, the distinct folders holding them and every tag they carry."""
+        folders: Set[str] = set()
+        tags: Set[str] = set()
+        total = 0
+        for row in self.conn.execute("SELECT folder, tags_json FROM discovered").fetchall():
+            total += 1
+            folders.add(row["folder"] or "")
+            try:
+                tags.update(str(t) for t in json.loads(row["tags_json"] or "[]") or [])
+            except (TypeError, ValueError):
+                pass
+        return total, folders, tags
 
     def folder_tree(self) -> List[Dict[str, Any]]:
         """Distinct folder paths with direct and subtree VM counts, sorted for display."""

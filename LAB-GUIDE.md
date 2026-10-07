@@ -142,11 +142,11 @@ Do step 3 above first, then this.
    export VCFA_VC_SERVER=vcenter.lab.local                  # bash
    export VCFA_VC_USER=administrator@vsphere.local
    ```
-3. **Remove the sample rows `init` wrote** into `folder-map.csv` and
-   `portgroup-map.csv` (keep each file's first line, the header). The console
-   loads both files on Map & Stage and would otherwise apply the sample
-   `redbull-*` namespaces -- `VLAN2*`, for one, can match a lab portgroup. You
-   can also delete them on that page, with the **x** next to each row.
+3. `init` writes `folder-map.csv` and `portgroup-map.csv` with their header
+   row only; Map & Stage edits these two files in place. A workspace made by an
+   older `init` has sample rows in them (`redbull-*` namespaces, `VLAN2*`, which
+   can match a lab portgroup): delete those rows, keeping the header, or remove
+   them on Map & Stage with the **x** next to each row.
 
 **b. Start the console** in the workspace folder.
 
@@ -553,6 +553,7 @@ exact rather than heuristic.
 | `precheck running` with `Operations are not ready` for many minutes | operator still working, or it is stalled on something in its logs | `kubectl describe importoperationbatch -n <ns>`; the message column in `vms` now shows the reason |
 | `importing` for minutes, message `VirtualMachineReadyForImport: waiting for placement results from importoperationbatch` | the namespace is **out of storage quota**. Every `ImportOperation`, precheck ones included, reserves its VM's disk size until its batch is deleted. Seen in the lab: 17 old precheck reservations held 426 GiB of a 250 GiB limit | `vcfa-import cleanup` deletes finished precheck batches; the import continues by itself once the reservation is granted. Otherwise raise the namespace's storage limit in VCF Automation. The operator's log names it: `Insufficient storage quota for StorageClass …` |
 | **A VM deleted before its import completed**: `failed` with *the VirtualMachine was deleted before the import completed*, and `rollback` says *rollbackAction is immutable* | the VM's `VirtualMachine` object in the namespace was deleted before the batch finished. Its child reports `VirtualMachineCreated: False (VMCRNotFoundPostCreation)`; the operator retries for ever. Once the batch is committed the operator refuses `rollbackAction`, so the VM cannot be handed back | `vcfa-import abandon --batch <batch>` deletes the batch (its committed VMs are not owned by it and stay put; seen 2026-10-01). The vCenter VM is left in the namespace's folder with nothing tracking it: delete it in vCenter, then `skip --vm <moref>`. Before a commit, `rollback` still works and is the better fix |
+| **Map & Stage keeps a folder you renamed**: an entry flagged *matches no folder of any discovered VM*, and the renamed folder's VMs read **unmapped** | the maps are the CSV files next to the config, not a copy of vCenter: an entry stays until you remove it, and after a rename or move it matches nothing (seen 2026-10-07, `migration-wave3` renamed) | **Remove it** on the flagged note (or the **x** on its row), **+ Map** the folder under its new name, then **Save maps**. `stage` on the CLI lists the same entries |
 | a VM imported that you did not mean to | it was queued in an earlier session; deselecting does not unqueue | the plan now lists every VM and flags those not in your current selection; `vcfa-import vms` shows the whole queue; `skip --vm` keeps one out |
 | VM stuck in `precheck_running` / `importing` with a phase the tool does not name | unrecognised phase word | inspect `.status`, extend `phase_patterns`, `status --refresh` |
 | a precheck passed but the manifest named a wrong subnet | precheck does **not** validate the subnet reference (observed) | the subnet is only exercised by a real import: keep `commit_action = "Wait"` so the first import can be rolled back |

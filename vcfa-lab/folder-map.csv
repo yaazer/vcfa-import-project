@@ -1,2 +1,4 @@
 folder,namespace,wave,group
-migration-wave3,migration-testing-ns-kcvm5,2,
+migration,migration-testing-ns-kcvm5,,
+migration/Wave1,migration-testing-ns-kcvm5,,
+migration/Wave2,migration-testing-ns-kcvm5,,
