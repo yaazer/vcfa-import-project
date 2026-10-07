@@ -114,7 +114,25 @@ def setup(workdir: Path, port: int, scenario: str, batch_size: int) -> dict:
     )
 
 
+
+def require_terms() -> bool:
+    """The demos run vcfa-import, so whoever runs them accepts its terms of use first."""
+    sys.path.insert(0, str(ROOT))
+    from vcfaimport import legal
+    try:
+        if legal.valid_record():
+            return True
+    except legal.NotAccepted as exc:
+        print(exc)
+        return False
+    if sys.stdin.isatty():
+        return legal.prompt() is not None
+    print(legal.not_accepted_message())
+    return False
+
 def main() -> int:
+    if not require_terms():
+        return 8
     ap = argparse.ArgumentParser()
     ap.add_argument("--vms", type=int, default=60)
     ap.add_argument("--scenario", default="import-flaky",

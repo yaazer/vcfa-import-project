@@ -30,6 +30,7 @@ from .inventory import InventoryError, load_inventory, write_template
 from .kube import KubectlError
 from .planner import summarize
 from . import access
+from . import legal
 from . import report
 from . import service
 from . import state as st
@@ -1393,6 +1394,77 @@ def cmd_serve(args) -> int:
 
 
 # -------------------------------------------------------------------- parser
+# ------------------------------------------------------------------ terms of use
+# These two commands are the only ones that run before the terms are accepted.
+UNGATED = ("accept", "disclaimer")
+
+
+def cmd_disclaimer(args) -> int:
+    t = legal.terms()
+    if not args.status:
+        print(t["text"])
+    rec = legal.valid_record()
+    if rec:
+        log("Accepted by {} ({}) on {}, terms version {} [{}].".format(
+            rec["name"], rec.get("os_user", "?"), rec["accepted_at"], rec["version"], rec["sha256"][:12]))
+        log("Recorded in {}".format(legal.acceptance_path()))
+        return 0
+    log("Not accepted on this account yet. Run `vcfa-import accept`.")
+    return legal.EXIT_NOT_ACCEPTED
+
+
+def cmd_accept(args) -> int:
+    if args.revoke:
+        gone = legal.revoke()
+        log("Acceptance withdrawn; vcfa-import will not run on this account until the terms are accepted "
+            "again." if gone else "Nothing to withdraw: the terms were not accepted on this account.")
+        return 0
+    if args.i_accept:
+        # unattended provisioning (a scheduled task's account): explicit, and still named
+        if not args.name:
+            log("error: --i-accept needs --name (the person accepting on behalf of this account)")
+            return 2
+        print(legal.banner(legal.terms()))
+        try:
+            rec = legal.record(args.name, legal.ACCEPT_PHRASE, via="cli --i-accept")
+        except ValueError as exc:
+            log("error: {}".format(exc))
+            return 2
+    else:
+        if not sys.stdin.isatty():
+            log("error: accepting needs an interactive terminal. For an unattended account use "
+                '`vcfa-import accept --name "Full Name" --i-accept`.')
+            return legal.EXIT_NOT_ACCEPTED
+        rec = legal.prompt()
+        if rec is None:
+            log("\nNot accepted. vcfa-import cannot be used without accepting its terms of use.")
+            return legal.EXIT_NOT_ACCEPTED
+    log("\nAccepted by {} on {} (terms version {}). Recorded in {}".format(
+        rec["name"], rec["accepted_at"], rec["version"], legal.acceptance_path()))
+    return 0
+
+
+def terms_gate(args) -> Optional[int]:
+    """None to go ahead; an exit code when the terms are not (and will not be) accepted."""
+    if args.command in UNGATED:
+        return None
+    try:
+        if legal.valid_record():
+            return None
+    except legal.NotAccepted as exc:            # the terms are not bundled: nothing can run
+        log("refused: {}".format(exc))
+        return legal.EXIT_NOT_ACCEPTED
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        rec = legal.prompt()
+        if rec is not None:
+            log("\nAccepted by {} on {}. Continuing.\n".format(rec["name"], rec["accepted_at"]))
+            return None
+        log("\nNot accepted. vcfa-import cannot be used without accepting its terms of use.")
+        return legal.EXIT_NOT_ACCEPTED
+    log("refused: " + legal.not_accepted_message())
+    return legal.EXIT_NOT_ACCEPTED
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="vcfa-import",
@@ -1411,6 +1483,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=help_text, description=help_text, **kwargs)
         sp.set_defaults(func=func)
         return sp
+
+    sp = add("disclaimer", cmd_disclaimer, "show the terms of use and whether this account has accepted them")
+    sp.add_argument("--status", action="store_true", help="only say whether they are accepted")
+
+    sp = add("accept", cmd_accept, "accept the terms of use (required once per account before anything else runs)")
+    sp.add_argument("--name", help="your full name, recorded with the acceptance")
+    sp.add_argument("--i-accept", action="store_true",
+                    help="accept without the prompt, for a scheduled task or service account (needs --name)")
+    sp.add_argument("--revoke", action="store_true", help="withdraw this account's acceptance")
 
     sp = add("init", cmd_init, "write a starter config and inventory template")
     sp.add_argument("--dir", default=".", help="directory to write into (default: .)")
@@ -1734,6 +1815,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pass
     parser = build_parser()
     args = parser.parse_args(argv)
+    gate = terms_gate(args)
+    if gate is not None:
+        return gate
     try:
         return args.func(args)
     except (ConfigError, InventoryError, SelectionError) as exc:
@@ -1751,6 +1835,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except access.AccessError as exc:
         log("refused: {}".format(exc))
         return 2
+    except legal.NotAccepted as exc:
+        log("refused: {}".format(exc))
+        return legal.EXIT_NOT_ACCEPTED
     except Exception as exc:  # noqa: BLE001 -- schedule/settings user errors
         if type(exc).__name__ in ("ScheduleError",):
             log("error: {}".format(exc))

@@ -392,8 +392,13 @@ function mdHref(u, doc) {
   if (/^https?:\/\//i.test(u)) return { url: u, ext: true };
   let m = u.match(/^#(.+)$/);
   if (m) return { url: '#/help?doc=' + doc + '&h=' + encodeURIComponent(m[1]) };
-  m = u.match(/^(?:\.\/)?(README|LAB-GUIDE)\.md(?:#(.+))?$/i);
-  if (m) return { url: '#/help?doc=' + (m[1].toUpperCase() === 'README' ? 'readme' : 'lab') + (m[2] ? '&h=' + encodeURIComponent(m[2]) : '') };
+  m = u.match(/^(?:\.\/)?(README|LAB-GUIDE|DISCLAIMER|THIRD-PARTY-NOTICES)\.md(?:#(.+))?$/i)
+    || u.match(/^(?:\.\/)?(LICENSE|NOTICE)()$/i);
+  if (m) {
+    const k = { README: 'readme', 'LAB-GUIDE': 'lab', DISCLAIMER: 'disclaimer', 'THIRD-PARTY-NOTICES': 'thirdparty',
+      LICENSE: 'license', NOTICE: 'notice' }[m[1].toUpperCase()];
+    return { url: '#/help?doc=' + k + (m[2] ? '&h=' + encodeURIComponent(m[2]) : '') };
+  }
   return null;
 }
 function mdInline(text, doc) {
@@ -507,25 +512,29 @@ function mdBlocks(src, doc) {
 
 // =============================================================== HELP page
 const HELP = { docs: {}, rendered: {} };
+const HELP_DOCS = ['lab', 'readme', 'disclaimer', 'license', 'thirdparty', 'notice'];
 async function loadDoc(name) {
   if (!HELP.rendered[name]) {
     const d = await GET('/api/docs/' + name);
     HELP.docs[name] = d;
-    HELP.rendered[name] = mdBlocks(d.markdown, name);
+    // LICENSE and NOTICE are plain text: shown as written, not parsed as markdown
+    HELP.rendered[name] = d.file.endsWith('.md') ? mdBlocks(d.markdown, name)
+      : { html: '<pre class="tg-pre">' + esc(d.markdown) + '</pre>', toc: [] };
   }
   return HELP.rendered[name];
 }
 VIEWS.help = view({
   title: 'Help & guides', sub: 'The tour, the lab guide, the README and a glossary — all offline',
-  init(v, p) { v.tab = ['lab', 'readme'].includes(p.doc) ? p.doc : (p.tab === 'glossary' ? 'glossary' : 'start'); v.h = p.h || null; v.q = v.q || ''; v.docErr = null; },
+  init(v, p) { v.tab = HELP_DOCS.includes(p.doc) ? p.doc : (p.tab === 'glossary' ? 'glossary' : 'start'); v.h = p.h || null; v.q = v.q || ''; v.docErr = null; },
   async load(v) {
     v.docErr = null;
-    if (v.tab === 'lab' || v.tab === 'readme') {
+    if (HELP_DOCS.includes(v.tab)) {
       try { v.doc = await loadDoc(v.tab); } catch (e) { v.doc = null; v.docErr = e.message; }
     }
   },
   paint(v) {
-    const tabs = [['start', 'Getting started'], ['lab', 'Lab guide'], ['readme', 'README'], ['glossary', 'Glossary']];
+    const tabs = [['start', 'Getting started'], ['lab', 'Lab guide'], ['readme', 'README'], ['glossary', 'Glossary'],
+      ['disclaimer', 'Terms of use'], ['license', 'Licence'], ['thirdparty', 'Third-party notices']];
     return html`<div class="tabs">${tabs.map(([k, l]) => html`<button class="${v.tab === k ? 'on' : ''}" data-act="helpTab" data-k="${k}">${l}</button>`)}</div>
       ${v.tab === 'start' ? helpStart() : v.tab === 'glossary' ? helpGlossary(v) : helpDoc(v)}`;
   },
@@ -580,7 +589,14 @@ function helpStart() {
       <dt>State</dt><dd>state.db — the queue, batches and every transition</dd>
       <dt>Ledger ${tip('ledger')}</dt><dd>ledger.jsonl — append-only, every state change</dd>
       <dt>Job logs</dt><dd>jobs/ — every console job’s full log</dd></dl></div></div>
-  </div>`;
+  </div>
+  ${S.legal && S.legal.record ? html`<div class="card mt"><div class="card-h"><h3>Terms of use</h3><span class="sub">accepted</span></div>
+    <div class="card-b"><dl class="facts">
+      <dt>Accepted by</dt><dd>${S.legal.record.name} <span class="muted">as console user ${S.legal.record.identity}</span></dd>
+      <dt>When</dt><dd>${fmtTime(S.legal.record.accepted_at)}</dd>
+      <dt>Version</dt><dd class="mono small">${S.legal.record.version} · ${S.legal.record.sha256.slice(0, 16)}</dd>
+      <dt>Read them</dt><dd><a href="#/help?doc=disclaimer">Terms of use</a> · <a href="#/help?doc=license">Licence (Apache 2.0)</a> · <a href="#/help?doc=thirdparty">Third-party notices</a></dd>
+    </dl></div></div>` : ''}`;
 }
 function helpDoc(v) {
   if (v.docErr) return html`<div class="note bad">${v.docErr}</div>`;

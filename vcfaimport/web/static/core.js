@@ -243,6 +243,7 @@ async function api(method, path, body) {
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
   if (res.status === 401) { tokenGate(); throw new ApiErr('The access token is missing or out of date.', 401); }
+  if (res.status === 451) { termsGate(); throw new ApiErr('Accept the terms of use first.', 451); }
   if (!res.ok) throw new ApiErr((data && data.error) || res.status + ' ' + res.statusText, res.status);
   return data;
 }
@@ -272,6 +273,149 @@ function tokenGate() {
       <div><button class="btn primary" data-act="setToken">${icon('key')} Continue</button></div>
     </div></div>`);
   $('#topbar').innerHTML = '';
+}
+
+// ------------------------------------------------------------ terms of use
+/* Nobody uses the console before accepting DISCLAIMER.md. The server refuses every other
+ * call with 451 until this person has accepted; this is the screen in front of everything. */
+const TG = { d: null, tab: 'terms', read: false, docs: {} };
+async function termsGate(d) {
+  S.gated = true;
+  if (!d) {
+    try { d = await GET('/api/legal'); } catch (e) { if (e.status === 503) termsUnavailable(e.message); return; }
+    if (d.accepted) { termsClose(); return; }
+  }
+  if (TG.d && $('#terms-gate')) return;            // already showing
+  TG.d = d; TG.tab = 'terms'; TG.read = false;
+  document.body.classList.add('terms-gated');
+  $('#app').setAttribute('inert', '');
+  let el = $('#terms-gate');
+  if (!el) { el = document.createElement('div'); el.id = 'terms-gate'; document.body.appendChild(el); }
+  termsPaint();
+}
+function termsClose() {
+  TG.d = null;
+  document.body.classList.remove('terms-gated');
+  const app = $('#app');
+  if (app) app.removeAttribute('inert');
+  const el = $('#terms-gate');
+  if (el) el.remove();
+}
+function termsUnavailable(msg) {
+  TG.d = { unavailable: msg };
+  document.body.classList.add('terms-gated');
+  $('#app').setAttribute('inert', '');
+  let el = $('#terms-gate');
+  if (!el) { el = document.createElement('div'); el.id = 'terms-gate'; document.body.appendChild(el); }
+  el.innerHTML = fmt(html`<div class="tg-card" role="alertdialog" aria-modal="true" aria-labelledby="tg-title">
+    <div class="tg-head"><span class="gate-mark">${appIcon()}</span><div><h2 id="tg-title">This build cannot be used</h2>
+    <p class="muted">${msg}</p></div></div></div>`);
+}
+function termsBody() {
+  const d = TG.d;
+  if (TG.tab === 'terms') return raw(mdBlocks(d.markdown, 'disclaimer').html);
+  const doc = TG.docs[TG.tab];
+  if (!doc) return html`<p class="muted">Loading…</p>`;
+  return doc.file.endsWith('.md') ? raw(mdBlocks(doc.markdown, TG.tab).html) : html`<pre class="tg-pre">${doc.markdown}</pre>`;
+}
+function termsPaint() {
+  const d = TG.d, el = $('#terms-gate');
+  if (!d || !el) return;
+  const tabs = [['terms', 'Terms of use'], ['license', 'Licence (Apache 2.0)'], ['thirdparty', 'Third-party notices']];
+  el.innerHTML = fmt(html`<div class="tg-card" role="dialog" aria-modal="true" aria-labelledby="tg-title">
+    <div class="tg-head"><span class="gate-mark">${appIcon()}</span>
+      <div class="grow"><h2 id="tg-title">Before you use vcfa-import</h2>
+        <p class="muted">Everyone who uses this tool must read and accept its terms of use first. Nothing else in the console works until you do.</p></div>
+      <span class="tg-ver mono tiny" title="SHA-256 of the terms you are accepting">version ${d.version} · ${d.sha256.slice(0, 12)}</span></div>
+    <div class="tg-short"><b>In short</b><ul>${d.summary.map((s) => html`<li>${s}</li>`)}</ul></div>
+    <div class="tabs tg-tabs" role="tablist">${tabs.map(([k, l]) => html`<button role="tab" class="${TG.tab === k ? 'on' : ''}" aria-selected="${TG.tab === k}" data-tg-tab="${k}">${l}</button>`)}</div>
+    <div class="tg-scroll doc" id="tg-scroll" tabindex="0" aria-label="Full text">${termsBody()}</div>
+    <div class="tg-progress" id="tg-progress">${TG.read ? html`${icon('check')} You have reached the end of the terms.` : 'Scroll to the end of the terms of use to continue.'}</div>
+    <form class="tg-form" id="tg-form" autocomplete="off">
+      ${d.confirmations.map((c, i) => html`<label class="check tg-check"><input type="checkbox" data-tg-c="${i}" ${attr(!TG.read, 'disabled')}> <span>${c}</span></label>`)}
+      <div class="tg-row">
+        <label class="tg-field"><span>Your full name</span><input class="input" id="tg-name" maxlength="120" ${attr(!TG.read, 'disabled')}></label>
+        <label class="tg-field"><span>Type <b class="mono">${d.phrase}</b> to accept</span><input class="input mono" id="tg-phrase" ${attr(!TG.read, 'disabled')} placeholder="${d.phrase}"></label>
+      </div>
+      <div class="tg-who small muted">You are signed in to this console as <b>${d.user.name}</b> (${d.user.role}). Your acceptance is recorded with your name, the time and the exact version of the terms.</div>
+      <div class="tg-actions"><button type="button" class="btn" data-tg-decline>Decline</button>
+        <button type="submit" class="btn primary" id="tg-accept" disabled>${icon('check')} Accept and continue</button></div>
+      <div class="tg-err note bad" id="tg-err" hidden></div>
+    </form></div>`);
+  const sc = $('#tg-scroll');
+  sc.addEventListener('scroll', termsScrolled);
+  el.querySelectorAll('[data-tg-tab]').forEach((b) => (b.onclick = () => termsTab(b.dataset.tgTab)));
+  el.querySelector('[data-tg-decline]').onclick = termsDecline;
+  el.querySelectorAll('#tg-form input').forEach((i) => (i.oninput = i.onchange = termsValidate));
+  $('#tg-form').onsubmit = termsAccept;
+  termsScrolled();
+  termsValidate();
+}
+async function termsTab(k) {
+  TG.tab = k;
+  if (k !== 'terms' && !TG.docs[k]) {
+    termsPaint();
+    try { TG.docs[k] = await GET('/api/docs/' + k); } catch (e) { TG.docs[k] = { file: 'x.md', markdown: e.message }; }
+  }
+  const keep = termsFormState();
+  termsPaint();
+  termsFormRestore(keep);
+}
+function termsFormState() {
+  return { c: Array.from(document.querySelectorAll('[data-tg-c]')).map((x) => x.checked),
+    name: ($('#tg-name') || {}).value || '', phrase: ($('#tg-phrase') || {}).value || '' };
+}
+function termsFormRestore(k) {
+  document.querySelectorAll('[data-tg-c]').forEach((x, i) => { x.checked = !!k.c[i]; });
+  if ($('#tg-name')) $('#tg-name').value = k.name;
+  if ($('#tg-phrase')) $('#tg-phrase').value = k.phrase;
+  termsValidate();
+}
+function termsScrolled() {
+  const sc = $('#tg-scroll');
+  if (!sc || TG.read || TG.tab !== 'terms') return;
+  if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 12) {
+    TG.read = true;
+    const keep = termsFormState();
+    const top = sc.scrollTop;
+    termsPaint();
+    termsFormRestore(keep);
+    $('#tg-scroll').scrollTop = top;
+  }
+}
+function termsValidate() {
+  const d = TG.d, btn = $('#tg-accept');
+  if (!d || !btn) return;
+  const all = Array.from(document.querySelectorAll('[data-tg-c]')).every((x) => x.checked);
+  const name = ($('#tg-name').value || '').trim(), phrase = ($('#tg-phrase').value || '').trim();
+  btn.disabled = !(TG.read && all && name.length >= 2 && phrase === d.phrase);
+}
+async function termsAccept(e) {
+  e.preventDefault();
+  const d = TG.d, btn = $('#tg-accept'), err = $('#tg-err');
+  btn.disabled = true;
+  try {
+    const r = await POST('/api/legal/accept', { name: $('#tg-name').value.trim(), phrase: $('#tg-phrase').value.trim(),
+      confirmations: Array.from(document.querySelectorAll('[data-tg-c]')).map((x) => x.checked), sha256: d.sha256 });
+    S.legal = r;
+    termsClose();
+    S.gated = false;
+    toast('Terms of use accepted', 'Recorded for ' + r.record.name + ' (' + r.user.name + '), version ' + r.version + '.', 'ok', 5000);
+    boot();
+  } catch (ex) {
+    err.hidden = false;
+    err.textContent = ex.message;
+    termsValidate();
+  }
+}
+function termsDecline() {
+  const el = $('#terms-gate');
+  el.innerHTML = fmt(html`<div class="tg-card" role="alertdialog" aria-modal="true" aria-labelledby="tg-title">
+    <div class="tg-head"><span class="gate-mark">${appIcon()}</span><div class="grow"><h2 id="tg-title">Terms not accepted</h2>
+      <p class="muted">vcfa-import cannot be used without accepting its terms of use. Nothing has been changed and nothing was recorded.
+      You can close this tab, or read the terms again.</p></div></div>
+    <div class="tg-actions"><button class="btn primary" data-tg-again>Read the terms again</button></div></div>`);
+  el.querySelector('[data-tg-again]').onclick = () => { TG.read = false; TG.tab = 'terms'; termsPaint(); };
 }
 
 // ------------------------------------------------------------------ toast
@@ -988,7 +1132,7 @@ async function pulse() {
       refreshView();
     }
   } catch (e) {
-    if (e.status === 401) return;   // gated; boot() restarts the pulse
+    if (e.status === 401 || e.status === 451) return;   // gated; boot() restarts the pulse
     wait = 5000;
     if (e.status === 0 && !S.offline) {
       // Say so: silently frozen counters in the middle of an import mislead.
@@ -1028,6 +1172,15 @@ function jobSummary(j) {
 async function boot() {
   if (window.FX && !S.fxReady) { S.fxReady = true; FX.init(); }
   if (!S.token) { tokenGate(); return; }
+  try {
+    S.legal = await GET('/api/legal');
+  } catch (e) {
+    if (e.status === 503) termsUnavailable(e.message);
+    else if (e.status !== 401) mount($('#view'), errorBox(e));
+    return;
+  }
+  if (!S.legal.accepted) { termsGate(S.legal); return; }
+  termsClose();
   try {
     S.info = await GET('/api/info');
     S.pulse = await GET('/api/pulse');

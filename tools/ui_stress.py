@@ -630,6 +630,50 @@ const SCENARIOS = {
     check('and everything works afterwards', await open('overview'));
   },
 
+  async terms() {
+    check('the terms of use come first, in front of everything', await waitFor(() => document.querySelector('#terms-gate .tg-card'), 15000));
+    check('the console behind is hidden and inert', document.body.classList.contains('terms-gated') && document.getElementById('app').hasAttribute('inert'));
+    check('nothing else was loaded', !S.info);
+    if (HP.get('narrow')) {
+      const r = document.querySelector('.tg-card').getBoundingClientRect();
+      check('the terms fit a phone screen', r.left >= -1 && r.right <= innerWidth + 2, Math.round(r.left) + '..' + Math.round(r.right) + ' in ' + innerWidth);
+    }
+    const refused = await fetch('/api/pulse', { headers: { 'X-VCFA-Token': HP.get('t') } });
+    check('the server refuses every other call (451)', refused.status === 451, refused.status);
+    check('the short version is listed', document.querySelectorAll('#terms-gate .tg-short li').length >= 4);
+    check('Accept starts disabled', document.querySelector('#tg-accept').disabled);
+    check('the statements wait until the terms are read', document.querySelector('[data-tg-c]').disabled);
+    click('[data-tg-decline]');
+    check('Decline leaves the console unusable', await waitFor(() => /Terms not accepted/.test(document.querySelector('#terms-gate').textContent), 5000) && !S.info);
+    click('[data-tg-again]');
+    check('and the terms can be read again', await waitFor(() => document.querySelector('#tg-scroll'), 5000));
+    click('[data-tg-tab="license"]');
+    check('the licence can be read in the gate', await waitFor(() => /Apache License/.test(document.querySelector('#tg-scroll').textContent), 10000));
+    click('[data-tg-tab="thirdparty"]');
+    check('so can the third-party notices', await waitFor(() => /PyInstaller/.test(document.querySelector('#tg-scroll').textContent), 10000));
+    click('[data-tg-tab="terms"]');
+    await waitFor(() => /Limitation of liability/.test(document.querySelector('#tg-scroll').textContent), 5000);
+    const sc = document.querySelector('#tg-scroll');
+    sc.scrollTop = sc.scrollHeight;
+    sc.dispatchEvent(new Event('scroll'));
+    check('reading to the end unlocks the statements', await waitFor(() => !document.querySelector('[data-tg-c]').disabled, 5000));
+    document.querySelectorAll('[data-tg-c]').forEach((x) => { x.checked = true; x.dispatchEvent(new Event('change', { bubbles: true })); });
+    type('#tg-name', 'Harness Person');
+    type('#tg-phrase', 'i accept');
+    check('the phrase must be typed exactly', document.querySelector('#tg-accept').disabled);
+    type('#tg-phrase', 'I ACCEPT');
+    check('everything filled in: Accept is enabled', !document.querySelector('#tg-accept').disabled);
+    click('#tg-accept');
+    check('accepting opens the console', await waitFor(() => S.info && S.view && S.view.loaded && !document.querySelector('#terms-gate'), 20000));
+    check('the console is usable again', !document.body.classList.contains('terms-gated') && !document.getElementById('app').hasAttribute('inert'));
+    const st = await GET('/api/legal');
+    check('the acceptance is recorded with the name', st.accepted && st.record.name === 'Harness Person', JSON.stringify(st.record));
+    await open('help');
+    check('Help shows who accepted the terms', /Harness Person/.test(document.querySelector('#view').textContent));
+    await open('help', 'doc=license');
+    check('the licence is in Help', /Apache License/.test(document.querySelector('#view').textContent));
+  },
+
   async token() {
     check('a wrong token shows the gate', await waitFor(() => document.querySelector('#token-in'), 10000));
     type('#token-in', 'http://127.0.0.1:1/#t=' + HP.get('t'));
@@ -973,6 +1017,13 @@ const SCENARIOS = {
     check('the requester sees it without an Approve button', await waitFor(() => document.querySelector('.approval')) && !document.querySelector('.approval [data-act="approve"]'));
     check('the nav badges the waiting request', await waitFor(() => document.querySelector('.nav-item[href="#/schedule"] .nav-badge')));
     const otto = (await POST('/api/users', { name: 'otto', role: 'operator' })).token;
+    const ottoHdr = { 'X-VCFA-Token': otto, 'Content-Type': 'application/json' };
+    check('a new colleague cannot act before accepting the terms of use',
+      (await fetch('/api/approvals', { headers: ottoHdr })).status === 451);
+    const legal = await (await fetch('/api/legal', { headers: ottoHdr })).json();
+    const acc = await fetch('/api/legal/accept', { method: 'POST', headers: ottoHdr, body: JSON.stringify({
+      name: 'Otto Operator', phrase: legal.phrase, confirmations: legal.confirmations.map(() => true), sha256: legal.sha256 }) });
+    check('the colleague accepts the terms for themselves', acc.status === 200, acc.status);
     since = await jobIds();
     const dec = await fetch('/api/approvals/' + pending[0].id + '/decide', { method: 'POST', headers: { 'X-VCFA-Token': otto, 'Content-Type': 'application/json' }, body: '{"approve":true,"note":"CAB ok"}' });
     check('a colleague approves it', dec.status === 200, dec.status);
@@ -1280,7 +1331,7 @@ def wait_job(app, job, timeout=600):
     return job
 
 
-def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_action=None):
+def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_action=None, accept=True):
     import demo
     vc_server, vc_port = fake_vcenter.serve(count=vms)
     env = demo.setup(tmp, vc_port, scenario, batch_size=8 if vms < 1000 else 25)
@@ -1296,6 +1347,14 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
         app = WebApp(cfg, config_path=str(cfg_path))
     finally:
         os.chdir(cwd)
+    if accept:
+        # every scenario but `terms` is about something else: the owner has accepted already
+        from vcfaimport import legal
+        t = legal.terms()
+        app.store.conn.execute(
+            "INSERT INTO acceptances(identity, name, version, sha256, accepted_at, via) VALUES(?,?,?,?,?,?)",
+            ("owner", "ui_stress harness", t["version"], t["sha256"], "2026-01-01T00:00:00Z", "harness"))
+        app.store.conn.commit()
     if seed:
         wait_job(app, app._job_discover({}))
         rows = app.store.query_discovered()
@@ -1344,7 +1403,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme", "palette", "stream", "govern", "help", "flow", "reset"]
+             "resilience", "token", "theme", "palette", "stream", "govern", "help", "flow", "reset", "terms"]
 
 
 def main():
@@ -1379,9 +1438,11 @@ def main():
         if s in SCENARIOS:
             # govern turns on the two-person rule and reset wipes its campaign: each gets its
             # own workspace, so no other scenario sees it
-            plan.append((s, s if s in ("govern", "reset") else "main", s, "", (1440, 900)))
+            plan.append((s, s if s in ("govern", "reset", "terms") else "main", s, "", (1440, 900)))
     if not args.only or "narrow" in (args.only or []):
         plan.append(("pages @ 390px", "main", "pages", "&narrow=1", (390, 844)))
+    if not args.only or "terms" in (args.only or []):
+        plan.append(("terms @ 390px", "terms-narrow", "terms", "&narrow=1", (390, 844)))
     if not args.only or "empty" in (args.only or []):
         plan.append(("pages on an empty workspace", "empty", "pages", "", (1440, 900)))
     if not args.only or "full" in (args.only or []):
@@ -1410,6 +1471,8 @@ def main():
                 os.environ.update(saved_env)
                 if kind == "empty":
                     app, vc = build(ws, 10, seed=False, hostile=False)
+                elif kind in ("terms", "terms-narrow"):
+                    app, vc = build(ws, 10, seed=False, hostile=False, accept=False)
                 elif kind == "reset":
                     app, vc = build(ws, args.vms, hostile=False, scenario="wait", commit_action="Wait")
                 elif kind == "scale":

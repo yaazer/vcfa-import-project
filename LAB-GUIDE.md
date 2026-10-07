@@ -63,6 +63,15 @@ kubectl api-resources --api-group mobility-operator.vmware.com
 Below, `vcfa-import` means whichever of the two you are using (with the alias
 above, it is literally that on Linux).
 
+**Accept the terms of use first.** The first command you run asks you to read
+and accept them; nothing runs until you do. Anyone who opens the web console
+accepts them there, for themselves. To accept up front:
+
+```bash
+vcfa-import disclaimer      # read them
+vcfa-import accept          # accept them (asks for your name and "I ACCEPT")
+```
+
 ---
 
 ## 2. Optional: rehearse offline first

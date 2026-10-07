@@ -31,6 +31,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC_FILES = ("README.md", "LAB-GUIDE.md")
+# Terms of use and licences: shipped in every build. The tool refuses to run without
+# DISCLAIMER.md (nobody can accept terms they cannot read), so a build missing it is useless.
+LEGAL_FILES = ("DISCLAIMER.md", "LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md")
 # The .pyz runs with whatever `python3` the machine has; say plainly when it is too old.
 PYZ_VERSION_CHECK = """# Checked before importing the package, so an old interpreter gets a clear
 # message instead of a traceback. (On Ubuntu 22.04, python3 is 3.10.)
@@ -53,7 +56,7 @@ def build_pyz() -> Path:
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     # The console's Help page shows these guides; they ship as package data.
     (staging / "vcfaimport" / "web" / "docs").mkdir()
-    for name in DOC_FILES:
+    for name in DOC_FILES + LEGAL_FILES:
         shutil.copy2(ROOT / name, staging / "vcfaimport" / "web" / "docs" / name)
     (staging / "__main__.py").write_text(
         "import sys\n\n" + PYZ_VERSION_CHECK + "\nfrom vcfaimport.cli import main\nsys.exit(main())\n",
@@ -102,8 +105,10 @@ def build_exe() -> Path | None:
         "--hidden-import", "vcfaimport.web.server",
         "--add-data", "{}{}{}".format(ROOT / "vcfaimport" / "web" / "static", os.pathsep,
                                       "vcfaimport/web/static"),
-        *[arg for name in DOC_FILES for arg in
+        *[arg for name in DOC_FILES + LEGAL_FILES for arg in
           ("--add-data", "{}{}{}".format(ROOT / name, os.pathsep, "vcfaimport/web/docs"))],
+        # the third-party licences of what PyInstaller embeds (THIRD-PARTY-NOTICES.md)
+        "--add-data", "{}{}{}".format(ROOT / "licenses", os.pathsep, "vcfaimport/web/docs/licenses"),
         str(ROOT / "vcfa-import.py"),
     ]
     print("  running PyInstaller...")
@@ -123,10 +128,10 @@ def build_bundle(pyz: Path, exe: Path | None) -> Path:
         zf.write(pyz, pyz.name)
         if exe:
             zf.write(exe, exe.name)
-        for name in ("README.md", "LAB-GUIDE.md", "vcfa-import.py"):
+        for name in ("README.md", "LAB-GUIDE.md", "vcfa-import.py") + LEGAL_FILES:
             if (ROOT / name).exists():
                 zf.write(ROOT / name, name)
-        for folder in ("vcfaimport", "examples", "tools", "tests"):
+        for folder in ("vcfaimport", "examples", "tools", "tests", "licenses"):
             for path in sorted((ROOT / folder).rglob("*")):
                 if path.is_file() and "__pycache__" not in path.parts:
                     zf.write(path, str(path.relative_to(ROOT)))
@@ -140,7 +145,7 @@ def smoke(pyz: Path, exe: Path | None) -> None:
     missing = [f for f in ("index.html", "core.js", "skins.js", "fx.js", "views.js", "gov.js", "help.js", "app.css",
                            "favicon.svg", "appicon.svg")
                if "vcfaimport/web/static/" + f not in names]
-    missing += [f for f in DOC_FILES if "vcfaimport/web/docs/" + f not in names]
+    missing += [f for f in DOC_FILES + LEGAL_FILES if "vcfaimport/web/docs/" + f not in names]
     if missing:
         raise SystemExit("web console assets missing from the .pyz: " + ", ".join(missing))
     print("  smoke web  ok   console assets present")

@@ -1,0 +1,14 @@
+vcfa-import
+Copyright 2026 The vcfa-import authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Use of this software is also subject to DISCLAIMER.md, which every user must
+accept before the software will run.
+
+This is not a VMware or Broadcom product. VMware, vSphere, vCenter, VMware
+Cloud Foundation, VCF and NSX are trademarks of Broadcom Inc. or its
+subsidiaries, used here only to describe what the software works with.
+
+The Windows executable (vcfa-import.exe) also contains third-party software
+under its own licences. See THIRD-PARTY-NOTICES.md and the licenses/ folder.

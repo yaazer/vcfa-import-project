@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .. import __version__
 from .. import access
 from .. import estimate as est
+from .. import legal
 from .. import notify as notify_mod
 from .. import readiness
 from .. import report
@@ -54,7 +55,9 @@ from .jobs import FAILED, STOPPED, WARNING, Job, JobManager
 
 # The guides the console shows under Help. Bundled into the .pyz/.exe as package
 # data (tools/build.py); read from the source tree when running from a checkout.
-DOCS = {"lab": ("LAB-GUIDE.md", "Lab guide"), "readme": ("README.md", "README")}
+DOCS = {"lab": ("LAB-GUIDE.md", "Lab guide"), "readme": ("README.md", "README"),
+        "disclaimer": ("DISCLAIMER.md", "Terms of use"), "license": ("LICENSE", "Licence (Apache 2.0)"),
+        "notice": ("NOTICE", "Notice"), "thirdparty": ("THIRD-PARTY-NOTICES.md", "Third-party notices")}
 
 
 def doc_text(name: str) -> Optional[str]:
@@ -155,6 +158,7 @@ class WebApp:
         self._vc_creds: Optional[Dict[str, Any]] = None
         self._scheduler: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
+        self._accepted: set = set()             # (console user, terms sha256) known to have accepted
 
     def _effective_cfg(self) -> Config:
         """The TOML baseline with the workspace settings layered on."""
@@ -1187,6 +1191,59 @@ class WebApp:
     def me(self, q, body) -> Dict[str, Any]:
         return {"user": current_user()}
 
+    # -------------------------------------------------------------- terms of use
+    def terms_accepted(self, user: Dict[str, Any]) -> bool:
+        """Has this console user accepted the terms as they read now? Fails closed."""
+        try:
+            sha = legal.terms()["sha256"]
+        except legal.NotAccepted:
+            return False
+        key = (user["name"], sha)
+        if key in self._accepted:
+            return True
+        with self.lock:
+            row = self.store.conn.execute("SELECT 1 FROM acceptances WHERE identity=? AND sha256=? LIMIT 1",
+                                          (user["name"], sha)).fetchone()
+        if row:
+            self._accepted.add(key)
+        return bool(row)
+
+    def _acceptance(self, identity: str, sha: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.store.conn.execute(
+                "SELECT identity, name, version, sha256, accepted_at, via FROM acceptances"
+                " WHERE identity=? AND sha256=? ORDER BY id DESC LIMIT 1", (identity, sha)).fetchone()
+        return dict(row) if row else None
+
+    def legal_status(self, q, body) -> Dict[str, Any]:
+        try:
+            t = legal.terms()
+        except legal.NotAccepted as exc:
+            raise ApiError(503, str(exc))
+        user = current_user()
+        rec = self._acceptance(user["name"], t["sha256"])
+        return {"accepted": rec is not None, "record": rec, "user": user, "version": t["version"],
+                "sha256": t["sha256"], "markdown": t["text"], "summary": t["summary"],
+                "confirmations": list(legal.CONFIRMATIONS), "phrase": legal.ACCEPT_PHRASE,
+                "license": legal.LICENSE_NAME}
+
+    def legal_accept(self, q, body) -> Dict[str, Any]:
+        """A console user accepts the terms (each person for themselves; any role may)."""
+        user = current_user()
+        rec = legal.check_and_build(body.get("name"), body.get("phrase"), body.get("confirmations"),
+                                    via="console", sha256=body.get("sha256"))
+        with self.lock:
+            self.store.conn.execute(
+                "INSERT INTO acceptances(identity, name, version, sha256, accepted_at, via, client, user_agent)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (user["name"], rec["name"], rec["version"], rec["sha256"], rec["accepted_at"], "console",
+                 getattr(CTX, "client", None), (getattr(CTX, "user_agent", None) or "")[:300]))
+            self.store.conn.commit()
+            self.store.log_event("terms of use accepted by {} as console user {} (terms version {}, {})".format(
+                rec["name"], user["name"], rec["version"], rec["sha256"][:12]), actor=user["name"])
+        self._accepted.add((user["name"], rec["sha256"]))
+        return self.legal_status(q, body)
+
     def _on_job_finish(self, job: Job) -> None:
         kinds = ("execute", "rollback", "commit", "schedule", "abandon", "cleanup")
         if job.kind not in kinds and job.status != "failed":
@@ -1519,6 +1576,8 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/reset", "reset_preview"),
         ("POST", r"/api/reset", "reset_run"),
         ("GET", r"/api/me", "me"),
+        ("GET", r"/api/legal", "legal_status"),
+        ("POST", r"/api/legal/accept", "legal_accept"),
         ("GET", r"/api/docs/(?P<name>[a-z]+)", "docs"),
         ("GET", r"/api/cluster/namespaces", "cluster_namespaces"),
         ("GET", r"/api/cluster/subnets", "cluster_subnets"),
@@ -1549,5 +1608,9 @@ USER_ERRORS = (SelectionError, ValueError, VCenterError, sch.ScheduleError)
 ADMIN_HANDLERS = {"settings_put", "notify_test", "users_list", "users_add", "users_toggle",
                   "reset_preview", "reset_run"}
 FORBIDDEN_ERRORS = (access.AccessError,)
+# The only calls allowed before a console user has accepted the terms of use (the rest get 451),
+# and the one change any role may make: accepting them.
+LEGAL_OPEN = {"legal_status", "legal_accept", "docs", "me"}
+ANY_ROLE_HANDLERS = {"legal_accept"}
 # Errors meaning "not now": reported as 409 Conflict.
 BUSY_ERRORS = (service.WorkspaceBusy,)
