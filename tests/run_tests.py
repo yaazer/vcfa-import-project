@@ -1419,7 +1419,7 @@ def t_e2e_abandon_refuses_live_import():
         assert cluster["batches"], "nothing may be deleted"
 
 
-@test("e2e: init writes both maps, and the portgroup map's wave column is honoured")
+@test("e2e: init writes both maps (header only), the portgroup map's wave is honoured, stale entries listed")
 def t_e2e_init_maps():
     sys.path.insert(0, str(ROOT / "tools"))
     import fake_vcenter
@@ -1434,10 +1434,11 @@ def t_e2e_init_maps():
             for name in ("vcfa-import.toml", "inventory.csv", "portgroup-map.csv", "folder-map.csv"):
                 assert Path(tmp, name).is_file(), name
                 assert name in out, out
-            header = Path(tmp, "portgroup-map.csv").read_text(encoding="utf-8").splitlines()[0]
-            eq(header, "portgroup,namespace,subnet,wave,device_key,subnet_kind,subnet_api_group")
-            header = Path(tmp, "folder-map.csv").read_text(encoding="utf-8").splitlines()[0]
-            eq(header, "folder,namespace,wave,group")
+            # Header only: Map & Stage edits these files, and a sample row there reads as a real mapping.
+            eq(Path(tmp, "portgroup-map.csv").read_text(encoding="utf-8").splitlines(),
+               ["portgroup,namespace,subnet,wave,device_key,subnet_kind,subnet_api_group"])
+            eq(Path(tmp, "folder-map.csv").read_text(encoding="utf-8").splitlines(),
+               ["folder,namespace,wave,group"])
 
             # A portgroup map alone (no folder map, nothing set in the picker) sets the wave.
             _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-a", "ns-a/sub-b"])
@@ -1448,7 +1449,13 @@ def t_e2e_init_maps():
                 ["VLAN197-Prod", "ns-a", "sub-a", "3", "", "", ""],
                 ["*", "ns-a", "sub-b", "7", "", "", ""],
             ], ["portgroup", "namespace", "subnet", "wave", "device_key", "subnet_kind", "subnet_api_group"])
-            _run_cli(["-c", cfg, "stage", "--map", str(Path(tmp, "portgroup-map.csv"))], env, tmp)
+            # A folder renamed in vCenter leaves its entry behind: it places nothing, and stage says so.
+            write_csv(str(Path(tmp, "folder-map.csv")), [["migration-wave3", "ns-a", "", ""]],
+                      ["folder", "namespace", "wave", "group"])
+            out = _run_cli(["-c", cfg, "stage", "--map", str(Path(tmp, "portgroup-map.csv")),
+                            "--folder-map", str(Path(tmp, "folder-map.csv"))], env, tmp).stdout
+            assert "folder map entries that match no discovered VM" in out, out
+            assert "  ? migration-wave3" in out, out
             vms = json.loads(_run_cli(["-c", cfg, "vms", "--json", "--limit", "100"], env, tmp).stdout)
             waves = {v["wave"] for v in vms}
             assert waves <= {3, 7} and 3 in waves, waves
@@ -3105,6 +3112,55 @@ def t_web_map_edges():
             eq(load_folder_map(os.path.join(tmp, "folder-map.csv"))["Prod"].namespace, "ns-dup",
                "a duplicate key: the last row wins, as in the CLI")
             assert not list(Path(tmp).glob("*.tmp")), "no temp files left behind"
+        finally:
+            c.close()
+
+
+@test("map entries matching no discovered VM are stale: renamed folders, removed tags")
+def t_stale_map_entries():
+    from vcfaimport import service
+    from vcfaimport.discovery import FolderMapping
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        m = lambda *keys: {k: FolderMapping(namespace="ns-a") for k in keys}  # noqa: E731
+        eq(service.stale_map_entries(store, m("Anything"), m("App:Web")), {"folders": [], "tags": []},
+           "nothing discovered: nothing to judge by")
+        store.upsert_discovered([
+            {"moref": "vm-1", "name": "web-01", "folder": "Migration/Wave1"},
+            {"moref": "vm-2", "name": "db-01", "folder": "migratio/child-a"},   # renamed from migration-wave3
+            {"moref": "vm-3", "name": "root-01", "folder": ""}])
+        store.set_selected(["vm-1"], True)
+        stale = service.stale_map_entries(
+            store, m("migration-wave3", "Migration", "MIGRATION/wave1", "migratio", "migratio/child-a",
+                     "migr*", "Gone/*", "Migration/Wave2"), m("App:Web"))
+        eq(stale["folders"], ["migration-wave3", "Gone/*", "Migration/Wave2"],
+           "a folder covers its subtree, case-insensitively; globs; unselected VMs count too")
+        eq(stale["tags"], [], "no VM carries a tag: tags are not judged")
+
+        store.upsert_discovered([{"moref": "vm-1", "name": "web-01", "folder": "Migration/Wave1",
+                                  "tags": ["App:Web", "Env:Prod"]}])
+        stale = service.stale_map_entries(store, {}, m("App:Web", "app:web", "App:Gone", "Env:*", "Owner:*"))
+        eq(stale["tags"], ["App:Gone", "Owner:*"])
+        store.close()
+
+
+@test("console: /api/maps and the live preview list stale map entries")
+def t_web_stale_map_entries():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            eq(c.ok("GET", "/api/maps")["coverage"]["stale"], {"folders": [], "tags": []})
+            _seed_store_with_vms(c.app.store, 6)                      # Prod/Web, Prod/DB, DMZ
+            c.ok("PUT", "/api/maps", {"folder_rows": [{"folder": "migration-wave3", "namespace": "ns-a"},
+                                                      {"folder": "Prod", "namespace": "ns-a"}]})
+            eq(c.ok("GET", "/api/maps")["coverage"]["stale"]["folders"], ["migration-wave3"])
+            # Unsaved rows from the browser are judged as typed.
+            p = c.ok("POST", "/api/stage/preview",
+                     {"folder_rows": [{"folder": "Prod", "namespace": "ns-a"}, {"folder": "DMZ", "namespace": "ns-a"},
+                                      {"folder": "migratio", "namespace": "ns-a"}],
+                      "tag_rows": [{"tag": "App:Gone", "namespace": "ns-a"}]})
+            eq(p["coverage"]["stale"], {"folders": ["migratio"], "tags": []}, "no VM carries a tag")
+            eq(p["problems"], [], "a stale entry changes nothing else")
         finally:
             c.close()
 
@@ -5831,7 +5887,7 @@ UNIT = [
     t_skip_semantics, t_web_security, t_web_jobs,
     t_http_keepalive_desync, t_http_body_limits, t_http_fuzz, t_http_host_and_paths,
     t_http_non_loopback, t_http_concurrent_edits, t_workspace_lock, t_web_lock_conflict,
-    t_jobs_edge_cases, t_web_map_edges, t_web_stage_edges, t_web_hostile_names,
+    t_jobs_edge_cases, t_web_map_edges, t_stale_map_entries, t_web_stale_map_entries, t_web_stage_edges, t_web_hostile_names,
     t_triage_normalisation, t_web_missing_things,
 ]
 

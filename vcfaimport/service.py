@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import Config
-from .discovery import SelectionError, match_folder_map, _match_mapping  # noqa: F401  (re-exported for web)
+from .discovery import SelectionError, match_folder_map, match_tag_map, _match_mapping  # noqa: F401  (re-exported for web)
 from .engine import STAGE_IMPORT, SETTLED_STATES, AbortRun, Engine, cleanup_candidates, cleanup_plan, wave_finished
 from .kube import Kubectl, KubectlError
 from .folders import folder_matches, norm_folder
@@ -1053,6 +1053,22 @@ def mapping_coverage(rows: Sequence[sqlite3.Row], folder_mapping: Dict[str, Any]
         "folders": sorted(folders.values(), key=lambda f: f["folder"].lower()),
         "networks": sorted(networks.values(), key=lambda n: n["network"].lower()),
     }
+
+
+def stale_map_entries(store: st.Store, folder_mapping: Dict[str, Any],
+                      tag_mapping: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Folder and tag map entries that match no discovered VM: the folder was renamed or
+    moved, or the tag removed, since the entry was written. They place nothing, but read as
+    if they did. Judged against the whole discovery cache, not the selection; with nothing
+    discovered (or, for tags, no VM carrying one) there is nothing to judge by."""
+    total, folders, tags = store.discovered_folders_tags()
+    out: Dict[str, List[str]] = {"folders": [], "tags": []}
+    if not total:
+        return out
+    out["folders"] = [p for p in folder_mapping if not any(folder_matches(f, [p]) for f in folders)]
+    if tags:
+        out["tags"] = [p for p in tag_mapping if match_tag_map(sorted(tags), {p: None}) is None]
+    return out
 
 
 # ------------------------------------------------------------------ waves & apps

@@ -364,10 +364,12 @@ class WebApp:
         folder_rows, network_rows = self._map_rows()
         with self.lock:
             selected = self.store.query_discovered(selected=True)
-        coverage = service.mapping_coverage(
-            selected, folder_map_from_rows(folder_rows), network_map_from_rows(network_rows))
-        tag_rows = self._tag_rows()
-        coverage["tags"] = self._tag_coverage(selected, tag_map_from_rows(tag_rows))
+        folder_mapping, tag_rows = folder_map_from_rows(folder_rows), self._tag_rows()
+        tag_mapping = tag_map_from_rows(tag_rows)
+        coverage = service.mapping_coverage(selected, folder_mapping, network_map_from_rows(network_rows))
+        coverage["tags"] = self._tag_coverage(selected, tag_mapping)
+        with self.lock:
+            coverage["stale"] = service.stale_map_entries(self.store, folder_mapping, tag_mapping)
         return {
             "tag": {"path": self.tag_map_path, "exists": Path(self.tag_map_path).is_file(),
                     "columns": TAG_MAP_COLUMNS, "rows": tag_rows},
@@ -420,8 +422,10 @@ class WebApp:
                            default_wave=default_wave, tag_mapping=tag_mapping)
             result.wave_choice = service.place_new_vms(self.store, self.cfg, selected, result.records,
                                                        wave_mode, wave_no)
+            stale = service.stale_map_entries(self.store, folder_mapping, tag_mapping)
         coverage = service.mapping_coverage(selected, folder_mapping, network_mapping)
         coverage["tags"] = self._tag_coverage(selected, tag_mapping)
+        coverage["stale"] = stale
         return selected, result, coverage
 
     def stage_preview(self, q, body) -> Dict[str, Any]:

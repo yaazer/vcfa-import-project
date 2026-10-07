@@ -130,8 +130,10 @@ def cmd_init(args) -> int:
         write_template(str(inv_path))
         log("wrote {}".format(inv_path))
 
-    # The two maps used by `stage`, with every supported column present so the
-    # optional ones (wave, device_key, group) are discoverable without the docs.
+    # The two maps used by `stage`: the header only, with every supported column present
+    # so the optional ones (wave, device_key, group) are discoverable without the docs.
+    # No sample rows: Map & Stage edits these files, and a sample row there reads as a
+    # real mapping (README has the examples).
     for name, text in (("portgroup-map.csv", PORTGROUP_MAP_TEMPLATE),
                        ("folder-map.csv", FOLDER_MAP_TEMPLATE)):
         path = target / name
@@ -159,20 +161,9 @@ def cmd_init(args) -> int:
 # Every column each map accepts. Blank cells are fine; only portgroup/namespace
 # (or folder/namespace) are required. `wave` here is used when neither the
 # picker nor the folder map set one.
-PORTGROUP_MAP_TEMPLATE = """\
-portgroup,namespace,subnet,wave,device_key,subnet_kind,subnet_api_group
-VLAN197-Prod,redbull-ns1-r95mc,subnet-vlan197,1,,,
-VLAN200-DB,redbull-ns2-k22ab,subnet-vlan200,2,,,
-VLAN2*,redbull-ns2-k22ab,subnet-vlan2xx,2,,Subnet,crd.nsx.vmware.com
-"""
+PORTGROUP_MAP_TEMPLATE = "portgroup,namespace,subnet,wave,device_key,subnet_kind,subnet_api_group\n"
 
-FOLDER_MAP_TEMPLATE = """\
-folder,namespace,wave,group
-Production,redbull-ns1-r95mc,2,
-Production/Web,redbull-ns1-r95mc,1,web
-Databases,redbull-ns2-k22ab,1,
-Legacy/*,redbull-ns3-legacy,3,
-"""
+FOLDER_MAP_TEMPLATE = "folder,namespace,wave,group\n"
 
 
 def cmd_validate(args) -> int:
@@ -506,6 +497,14 @@ def cmd_stage(args) -> int:
         for net, count in sorted(result.unmapped_networks.items(), key=lambda kv: -kv[1]):
             log("  {:<40} {} VM(s)".format(net or "(none)", count))
         log("")
+    stale = service.stale_map_entries(store, folder_mapping, tag_mapping)
+    for what, key in (("folder map", "folders"), ("tag map", "tags")):
+        if stale[key]:
+            log("{} entries that match no discovered VM (renamed or moved in vCenter?) -- "
+                "they place nothing; remove or correct them:".format(what))
+            for pattern in stale[key]:
+                log("  ? " + pattern)
+            log("")
     if result.problems:
         log("{} VM(s) cannot be staged:".format(len(result.problems)))
         for problem in result.problems[:25]:

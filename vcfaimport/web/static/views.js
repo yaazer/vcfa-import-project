@@ -562,7 +562,13 @@ function subnetKnown(name) {
   if (!name || !d || !d.complete || !d.subnets.length) return null;
   return d.subnets.some((x) => x.name === name);
 }
+// Folder and tag map entries that match no discovered VM, as the last preview judged them
+// (service.stale_map_entries): renamed or moved folders, removed tags.
+const STALE = { folders: new Set(), tags: new Set() };
+const staleKnown = (kind) => (key) => (STALE[kind].has((key || '').trim()) ? false : null);
 const FIELD_CHECK = {
+  folder: [staleKnown('folders'), () => 'Matches no folder of any discovered VM (as of the last discovery) — renamed or moved in vCenter? It places nothing'],
+  tag: [staleKnown('tags'), () => 'No discovered VM carries this tag (as of the last discovery) — renamed or removed in vCenter? It places nothing'],
   namespace: [nsKnown, nsMissingText],
   portgroup: [pgKnown, () => 'Matches no portgroup in vCenter (as of the last discovery) — check the spelling'],
   subnet: [subnetKnown, () => 'Not a Subnet or SubnetSet on the Supervisor — check the spelling. A VPC’s subnets are named as in the VPC’s own namespace'],
@@ -688,6 +694,7 @@ VIEWS.stage = view({
     v.tr = m.tag.rows.map((r) => Object.assign({}, r));
     v.saved = mapsSig(v);
     v.preview = await POST('/api/stage/preview', stageBody(v));
+    setStale(v.preview);
     const redraw = () => { if (S.view === v && v.loaded) v.render(); };
     loadClusterNs().then(redraw);
     loadSubnets().then(redraw);
@@ -711,6 +718,7 @@ VIEWS.stage = view({
       <div class="flow mt">
       ${flowSec(1, html`<div class="card"><div class="card-h"><h3>Folders → namespace${mapsDecideWaves(p.wave_choice) ? html` &amp; wave` : ''} ${tip('folder_map')}</h3><span class="sub mono tiny" title="${v.maps.folder.path}">${v.maps.folder.path.split(/[\\/]/).pop()}</span></div>
           <div class="card-b"><div class="small muted mb">Folders of the selected VMs</div><div id="cov-folders" class="cov">${covFolders(p.coverage, p.wave_choice)}</div></div>
+          <div id="stale-f">${staleNote(v, 'f')}</div>
           <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 'f')}</div>
           <div class="card-f"><button class="btn sm" data-act="addRow" data-m="f">${icon('plus')} Add entry</button><span class="small muted">Globs allowed, e.g. <code>Legacy/*</code>. A folder covers its whole subtree.</span>${tip('batch_group')}</div></div>`, st.folders, 'sec-folders')}
       ${flowSec(2, html`<div class="card"><div class="card-h"><h3>Networks → subnet ${tip('portgroup_map')}</h3><span class="sub mono tiny" title="${v.maps.network.path}">${v.maps.network.path.split(/[\\/]/).pop()}</span>
@@ -721,6 +729,7 @@ VIEWS.stage = view({
       ${flowSec(3, html`<details class="card tagmap" ${attr(v.tr.length || (p.coverage.tags || []).length && v.tagOpen !== false, 'open')} data-toggle="tagOpen">
         <summary class="card-h"><h3>${icon('tag')} vCenter tags → namespace${mapsDecideWaves(p.wave_choice) ? html` &amp; wave` : ''} ${tip('tag_map')}</h3><span class="sub">optional · beats the folder map · <span class="mono tiny">${v.maps.tag.path.split(/[\\/]/).pop()}</span></span></summary>
         <div class="card-b"><div class="small muted mb">Tags on the selected VMs</div><div id="cov-tags" class="cov">${covTags(p.coverage, p.wave_choice)}</div></div>
+        <div id="stale-t">${staleNote(v, 't')}</div>
         <div class="card-b flush" style="border-top:1px solid var(--line)">${mapTable(v, 't')}</div>
         <div class="card-f"><button class="btn sm" data-act="addRow" data-m="t">${icon('plus')} Add entry</button><span class="small muted">Tags are <code>Category:Tag</code>; globs allowed, e.g. <code>Application:*</code>. An exact tag beats a glob.</span></div></details>`, 'opt')}
       ${flowSec(4, html`<div class="card"><div class="card-h"><h3>Review the result</h3><span class="sub">live preview — nothing is staged until you click Stage</span>
@@ -788,6 +797,18 @@ VIEWS.stage = view({
       schedulePreview(v);
     },
     delRow(t, e, v) { rowsOf(v, t.dataset.m).splice(+t.dataset.i, 1); v.render(); schedulePreview(v); },
+    // Drop every entry the last preview found matching nothing; the file changes on Save maps / Stage.
+    dropStale(t, e, v) {
+      const m = t.dataset.m, kind = m === 'f' ? 'folders' : 'tags', col = m === 'f' ? 'folder' : 'tag';
+      const rows = rowsOf(v, m), keep = rows.filter((r) => !STALE[kind].has((r[col] || '').trim()));
+      const gone = rows.length - keep.length;
+      rows.splice(0, rows.length, ...keep);
+      STALE[kind].clear();
+      v.preview.coverage.stale[kind] = [];
+      v.render();
+      schedulePreview(v);
+      toast('Removed ' + plural(gone, 'entry', 'entries'), 'Save maps (or Stage) to write ' + (m === 'f' ? v.maps.folder.path : v.maps.tag.path) + '.', 'ok');
+    },
     tagOpen(t, e, v) { v.tagOpen = t.open; },
     howOpen(t, e, v) { v.howOpen = t.open; },
     adv(t, e, v) { v.adv = t.checked; v.render(); },
@@ -835,7 +856,8 @@ VIEWS.stage = view({
 // Section states on Map & Stage: done when every folder / network of the selection is covered.
 function stageStates(v) {
   const p = v.preview, cov = p.coverage;
-  const missF = cov.folders.filter((f) => f.pattern === null && f.explicit_namespace < f.vms).length;
+  const missF = cov.folders.filter((f) => f.pattern === null && f.explicit_namespace < f.vms).length +
+    ((cov.stale || {}).folders || []).length;
   const missN = cov.networks.filter((x) => !x.mapped).length;
   return { folders: missF ? 'warn' : 'done', networks: missN ? 'warn' : 'done',
     result: v.previewErr || p.problems.length ? 'warn' : p.records.length ? 'now' : '' };
@@ -879,6 +901,10 @@ async function runPreview(v) {
     v.previewErr = null;
   } catch (e) { v.previewErr = e.message; }
   if (S.view !== v) return;
+  setStale(v.preview);
+  mount($('#stale-f'), staleNote(v, 'f'));
+  mount($('#stale-t'), staleNote(v, 't'));
+  $$('.maptable input[data-col="folder"], .maptable input[data-col="tag"]').forEach((el) => markField(el, el.dataset.col));
   mount($('#stage-preview'), stagePreview(v));
   if (!v.previewErr) mount($('#stage-wave'), waveChoiceControl(v));
   mount($('#cov-folders'), covFolders(v.preview.coverage, v.preview.wave_choice));
@@ -894,6 +920,22 @@ async function runPreview(v) {
   if (d) mount(d, mapsSig(v) !== v.saved ? html`<span class="warn-text">The maps have unsaved edits — staging saves them.</span> Staging again later is safe.` : 'Maps saved. Staging again later is safe: VMs already in flight are never changed.');
 }
 const schedulePreview = debounce((v) => runPreview(v), 400);
+function setStale(p) {
+  const st = (p && p.coverage && p.coverage.stale) || {};
+  STALE.folders = new Set(st.folders || []);
+  STALE.tags = new Set(st.tags || []);
+}
+// Entries that match no discovered VM: a folder renamed or moved, a tag removed. Nothing tells
+// them apart from live entries otherwise -- they just place nothing.
+function staleNote(v, m) {
+  const st = (v.preview && v.preview.coverage && v.preview.coverage.stale) || {};
+  const list = (m === 'f' ? st.folders : st.tags) || [];
+  if (!list.length) return '';
+  const what = m === 'f' ? 'folder' : 'tag', one = list.length === 1;
+  return html`<div class="card-b"><div class="note warn" id="stale-note-${m}"><b>${plural(list.length, 'entry', 'entries')} ${one ? 'matches' : 'match'} no ${what} of any discovered VM:</b>
+    <span class="mono">${list.join(', ')}</span>. ${m === 'f' ? 'Renamed or moved in vCenter?' : 'Renamed or removed in vCenter?'} ${one ? 'It places' : 'They place'} nothing; map the new ${what} instead. ${tip('stale_map_entry')}
+    <button class="btn xs" data-act="dropStale" data-m="${m}">${icon('x')} Remove ${one ? 'it' : 'them'}</button></div></div>`;
+}
 function mapTable(v, m) {
   const rows = rowsOf(v, m);
   // A map's wave only applies while Wave for new VMs follows the maps; otherwise the column is
