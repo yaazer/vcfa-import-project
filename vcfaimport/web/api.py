@@ -120,6 +120,9 @@ def _stage(value) -> str:
     return value
 
 
+RESET_PHRASE = "RESET"
+
+
 def _require_confirm(body: Dict[str, Any]) -> None:
     # The browser asks the human; this stops a stray script from skipping that.
     if body.get("confirm") is not True:
@@ -1066,29 +1069,63 @@ class WebApp:
 
         return self._start("abandon", "Abandon batches", sel, run, lock=self._lock_for("abandon"))
 
-    def _job_cleanup(self, body: Dict[str, Any]) -> Job:
+    # ================================================================ reset
+    def reset_preview(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            return service.reset_preview(self.store, self.cfg)
+
+    def reset_run(self, q, body) -> Dict[str, Any]:
         _require_confirm(body)
-        wanted = set(_list(body.get("batches")) or [])
+        # Nothing else is this final: "confirm": true alone (a stray script, a replayed
+        # request) must not wipe a campaign. The word the person typed must come too.
+        if body.get("confirm_phrase") != RESET_PHRASE:
+            raise ApiError(400, "a reset also needs \"confirm_phrase\": \"{}\"".format(RESET_PHRASE))
+        keep = bool(body.get("keep_discovered"))
 
         def run(job: Job) -> Dict[str, Any]:
             with self._job_workspace(job) as ws:
-                candidates = ws.engine.cleanup_candidates()
+                result = service.reset_campaign(ws, keep_discovered=keep, keep_jobs=[job.id])
+            # Their files went to the archive with the rest of the campaign.
+            self.jobs.forget_others(job.id)
+            job.log("campaign reset; {} VM(s) and their history archived to {}".format(
+                result["vms"], result["archive"]))
+            if result["committed"]:
+                job.log("{} committed VM(s) stay in their namespaces: the tool cannot return them to vCenter"
+                        .format(result["committed"]))
+            return result
+
+        job = self._start("reset", "Reset campaign", {"keep_discovered": keep}, run,
+                          lock=self._lock_for("campaign reset"))
+        return {"job": job.summary()}
+
+    def _job_cleanup(self, body: Dict[str, Any]) -> Job:
+        _require_confirm(body)
+        wanted = set(_list(body.get("batches")) or [])
+        waves = _list(body.get("waves"), int) or None
+
+        def run(job: Job) -> Dict[str, Any]:
+            with self._job_workspace(job) as ws:
+                candidates = service.cleanup_plan(ws.store, waves)
                 if wanted:
                     candidates = [b for b in candidates if b["name"] in wanted]
                     for name in sorted(wanted - {b["name"] for b in candidates}):
-                        job.log("  ! {}: not a confirmed rollback or a finished precheck; refusing to delete"
-                                .format(name))
+                        job.log("  ! {}: not a confirmed rollback, a finished precheck or part of a finished "
+                                "wave; refusing to delete".format(name))
                 if not candidates:
-                    job.log("no batches to clean up (no confirmed rollbacks or finished prechecks on the cluster)")
+                    job.log("no batches to clean up (no finished waves, confirmed rollbacks or finished "
+                            "prechecks on the cluster)")
                     return {"deleted": []}
+                job.log("deleting {} batch object(s){}; committed VMs are not affected".format(
+                    len(candidates), " of wave " + ", ".join(str(w) for w in waves) if waves else ""))
                 result = ws.engine.delete_batches(candidates)
             job.log("deleted {} batch(es)".format(len(result["deleted"])))
             for err in result["errors"]:
                 job.log("  ! " + err)
             return dict(result, status=WARNING if result["errors"] else None)
 
-        return self._start("cleanup", "Delete finished batches",
-                               {"batches": sorted(wanted)}, run, lock=self._lock_for("cleanup"))
+        title = ("Clean up wave " + ", ".join(str(w) for w in waves)) if waves else "Delete finished batches"
+        return self._start("cleanup", title, {"batches": sorted(wanted), "waves": waves or []}, run,
+                           lock=self._lock_for("cleanup"))
 
     # ================================================================ identity
     def identify(self, token: str) -> Optional[Dict[str, Any]]:
@@ -1475,6 +1512,8 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("POST", r"/api/jobs/(?P<job_id>[\w.-]+)/stop", "job_stop"),
         ("POST", r"/api/run/(?P<kind>discover|preflight|execute|refresh|watch|commit|rollback|"
                  r"abandon|cleanup|verify)", "run_job"),
+        ("GET", r"/api/reset", "reset_preview"),
+        ("POST", r"/api/reset", "reset_run"),
         ("GET", r"/api/me", "me"),
         ("GET", r"/api/docs/(?P<name>[a-z]+)", "docs"),
         ("GET", r"/api/cluster/namespaces", "cluster_namespaces"),
@@ -1503,7 +1542,8 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
 # Errors that are the user's to fix, reported as 400 rather than 500.
 USER_ERRORS = (SelectionError, ValueError, VCenterError, sch.ScheduleError)
 # Who may call what: GETs need a viewer, other calls an operator, these an admin.
-ADMIN_HANDLERS = {"settings_put", "notify_test", "users_list", "users_add", "users_toggle"}
+ADMIN_HANDLERS = {"settings_put", "notify_test", "users_list", "users_add", "users_toggle",
+                  "reset_preview", "reset_run"}
 FORBIDDEN_ERRORS = (access.AccessError,)
 # Errors meaning "not now": reported as 409 Conflict.
 BUSY_ERRORS = (service.WorkspaceBusy,)

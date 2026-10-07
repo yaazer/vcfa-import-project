@@ -305,8 +305,8 @@ VIEWS.settings = view({
   title: 'Settings', sub: 'Guardrails, notifications and people — shared by the console and the CLI',
   init(v) { v.changes = {}; v.newCh = v.newCh || { type: 'teams', name: '', url: '', events: new Set() }; },
   async load(v) {
-    const [s, u] = await Promise.all([GET('/api/settings'), can('admin') ? GET('/api/users') : null]);
-    v.s = s; v.users = u ? u.users : null; v.roles = u ? u.roles : [];
+    const [s, u, r] = await Promise.all([GET('/api/settings'), can('admin') ? GET('/api/users') : null, can('admin') ? GET('/api/reset') : null]);
+    v.s = s; v.users = u ? u.users : null; v.roles = u ? u.roles : []; v.reset = r;
     v.notify = JSON.parse(JSON.stringify(s.notify || []));
     v.notifySaved = JSON.stringify(v.notify);
     v.changes = {};
@@ -323,11 +323,15 @@ VIEWS.settings = view({
         <div class="card-b stack" style="gap:14px">${rows.map((r) => settingField(v, r, admin))}</div></div>`)}</div>
       ${notifyCard(v, admin)}
       ${admin ? usersCard(v) : ''}
+      ${admin && v.reset ? resetCard(v.reset) : ''}
       ${admin && dirty ? html`<div class="callout stickybar" style="background:var(--panel)"><div class="ic">${icon('gear')}</div>
         <div class="grow"><h3>${plural(dirty, 'unsaved change')}</h3><p>Saved changes apply to the next run; a run in progress keeps its settings.</p></div>
         <button class="btn" data-act="discard">Discard</button><button class="btn primary" data-act="save">Save</button></div>` : ''}`;
   },
+  // A reset leaves nothing on this page to show: start the fresh campaign where every campaign starts.
+  onJobDone(v, j) { if (j.kind === 'reset' && j.status === 'succeeded') go('overview'); else v.refresh(); },
   act: {
+    resetCampaign: (t, e, v) => doResetCampaign(v.reset),
     set(t, e, v) {
       const k = t.dataset.k, r = v.s.settings.find((x) => x.key === k);
       let val = t.type === 'checkbox' ? t.checked : t.value;
@@ -492,6 +496,35 @@ function usersCard(v) {
       <select class="select" id="u-role">${v.roles.map((r) => html`<option ${attr(r === 'operator', 'selected')}>${r}</option>`)}</select>
       <button class="btn" data-act="userAdd">${icon('user')} Create link</button>
       <span class="small muted">Re-creating a name issues a fresh link and retires the old one.</span></div></div>`;
+}
+function resetCard(r) {
+  const blocked = r.blockers.length > 0;
+  return html`<div class="card mt" id="reset-card"><div class="card-h"><h3>Reset campaign ${tip('campaign_reset')}</h3><span class="sub">start afresh, e.g. before a demo or after a rehearsal; the old campaign is archived</span></div>
+    <div class="card-b stack" style="gap:10px">
+      ${blocked ? html`<div class="note warn">${icon('triage')} <b>Not now.</b> ${r.blockers.map((b) => html`<div>${b}</div>`)}</div>` : ''}
+      <ul class="plain small">
+        <li><b>Cleared:</b> ${plural(r.vms, 'VM')} in the queue${r.waves ? ' across ' + plural(r.waves, 'wave') : ''}, their history and ${plural(r.events, 'event')}, wave names, change windows and approvals${r.discovered ? ', and the ' + plural(r.discovered, 'discovered VM') + ' (unless you keep them)' : ''}.</li>
+        <li><b>Deleted from the cluster:</b> ${r.batches_on_cluster.length ? plural(r.batches_on_cluster.length, 'batch object') + ' this campaign left behind' : 'nothing; no batch objects are left'}.</li>
+        <li><b>Kept:</b> settings, people and their links, the maps and the config file.</li>
+        <li><b>Archived</b> before anything is cleared: the database${r.ledger_shared ? '' : ', the ledger'} and the job logs, to <span class="mono">${r.archive_root}</span>.${r.ledger_shared ? ' The shared ledger stays where it is and gets a reset line.' : ''}</li>
+        ${r.committed ? html`<li><b>${plural(r.committed, 'committed VM')} stay in their namespaces.</b> <span class="muted">An import cannot be undone; to run them again, delete them in VCFA and recreate them in vCenter.</span></li>` : ''}
+      </ul></div>
+    <div class="card-f"><button class="btn danger-ghost" data-act="resetCampaign" ${attr(blocked || !!(S.pulse && S.pulse.job), 'disabled')}>${icon('refresh')} Reset campaign…</button>
+      <span class="small muted">Admins only. Refused while VMs are in flight or awaiting commit.</span></div></div>`;
+}
+async function doResetCampaign(r) {
+  const out = await modal({
+    title: 'Reset the campaign?', danger: true, ic: 'refresh', confirm: 'Reset campaign', typeWord: 'RESET',
+    body: html`<p>Clears ${plural(r.vms, 'VM')}${r.waves ? ' in ' + plural(r.waves, 'wave') : ''} and their history${r.batches_on_cluster.length ? ', and deletes ' + plural(r.batches_on_cluster.length, 'batch object') + ' from the cluster' : ''}. Everything is archived first, to <span class="mono">${r.archive_root}</span>.</p>
+      ${r.committed ? html`<p class="small"><b>${plural(r.committed, 'committed VM')} stay in VCFA.</b> The tool cannot return them to vCenter.</p>` : ''}
+      ${r.discovered ? html`<label class="check"><input type="checkbox" data-field="keep_discovered"> Keep the ${plural(r.discovered, 'discovered VM')} (their selection is cleared); otherwise the next campaign starts with Discover</label>` : ''}`,
+  });
+  if (!out) return;
+  try {
+    const res = await POST('/api/reset', { confirm: true, confirm_phrase: 'RESET', keep_discovered: !!out.keep_discovered });
+    followJob(res.job.id, true);
+    S.lastActive = res.job.id;
+  } catch (e) { fail(e); }
 }
 
 // ================================================================ palette

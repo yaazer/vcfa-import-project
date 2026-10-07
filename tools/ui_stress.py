@@ -530,6 +530,16 @@ const SCENARIOS = {
     go.click();
     const imp = await waitJob('execute', since);
     check('import job finished', imp && ['succeeded', 'warning'].includes(imp.status), imp && imp.status);
+    // Step 6: one row per wave, finished or not; only a finished wave offers Clean up.
+    await open('execute');
+    const sec = await waitFor(() => document.querySelector('#sec-cleanup'), 8000);
+    check('Execute ends with a clean-up step', sec && /Clean up finished waves/.test(sec.textContent));
+    if (sec) {
+      const rows = [...sec.querySelectorAll('tbody tr')];
+      const wc = (await GET('/api/overview')).wave_cleanup;
+      check('it lists every wave', rows.length === wc.length, rows.length + ' vs ' + wc.length);
+      check('only finished waves offer Clean up', wc.every((w, i) => !!rows[i].querySelector('[data-act="cleanWave"]') === (w.finished && w.cleanable > 0)), JSON.stringify(wc));
+    }
     check('execute view never broke', !brokeView());
 
     // Activity: a batch's VMs read as one timeline entry; a job's row scopes the timeline to it.
@@ -557,6 +567,12 @@ const SCENARIOS = {
     check('batch drawer shows the manifest', await waitFor(() => [...document.querySelectorAll('.drawer pre')].some((p) => p.textContent.includes('ImportOperationBatch'))));
     click('.overlay');
     check('clicking outside closes', await waitFor(() => !document.querySelector('.drawer')));
+    const showDel = document.querySelector('#b-showdel');
+    if (showDel) {
+      const before = document.querySelectorAll('#view tbody tr[data-act="batch"]').length;
+      showDel.click();
+      check('cleaned-up batches are hidden until asked for', await waitFor(() => document.querySelectorAll('#view tbody tr[data-act="batch"]').length > before, 5000));
+    }
     await open('triage');
     const retry = document.querySelector('[data-act="gRetry"]');
     if (retry) {
@@ -774,6 +790,41 @@ const SCENARIOS = {
     FX.set({ motion: 'full' });
   },
 
+  async reset() {
+    // Its workspace imported wave 1 under commitAction Wait: held at the commit gate, the
+    // reset must say why it cannot run yet.
+    check('wave 1 waits at the commit gate', ((await counts()).awaiting_commit || 0) > 0, JSON.stringify(await counts()));
+    await open('settings');
+    let card = await waitFor(() => document.querySelector('#reset-card'), 8000);
+    check('settings show the reset card to an admin', !!card);
+    check('it says what is cleared, kept and archived', card && ['Cleared:', 'Kept:', 'Archived'].every((w) => card.textContent.includes(w)), card && card.textContent.slice(0, 200));
+    check('held at the commit gate: refused, with the reason', card && /awaiting commit: commit or roll them back first/.test(card.textContent)
+      && card.querySelector('[data-act="resetCampaign"]').disabled, card && card.querySelector('.note') ? card.querySelector('.note').textContent : 'no note');
+    const known = await jobIds();
+    await POST('/api/run/commit', { confirm: true });
+    check('commit finishes', (await waitJob('commit', known) || {}).status === 'succeeded');
+    await open('settings');
+    card = await waitFor(() => { const c = document.querySelector('#reset-card'); return c && !c.querySelector('[data-act="resetCampaign"]').disabled && c; }, 15000);
+    check('committed: the reset is offered', !!card);
+    check('it warns that committed VMs stay in VCFA', card && /committed VMs? stay in their namespaces/.test(card.textContent));
+    click('[data-act="resetCampaign"]');
+    const typed = await waitFor(() => document.querySelector('#modal-type'), 5000);
+    const yes = document.querySelector('.modal [data-m="yes"]');
+    check('the dialog waits for RESET', typed && yes && yes.disabled);
+    check('it offers to keep the discovered inventory', !!document.querySelector('.modal [data-field="keep_discovered"]'));
+    type(typed, 'reset');
+    check('the wrong word keeps it disabled', yes.disabled);
+    type(typed, 'RESET');
+    check('RESET enables it', !yes.disabled);
+    document.querySelector('.modal [data-field="keep_discovered"]').click();
+    yes.click();
+    check('the fresh campaign opens on Overview', await waitFor(() => S.route === 'overview' && S.view && S.view.loaded, 90000));
+    const p = await GET('/api/pulse');
+    check('the queue is empty', p.total === 0, String(p.total));
+    check('the discovered inventory was kept, unselected', p.discovered.total > 0 && p.discovered.selected === 0, JSON.stringify(p.discovered));
+    check('only the reset job is left', (await GET('/api/jobs')).jobs.map((j) => j.kind).join() === 'reset');
+    check('view never broke', !brokeView());
+  },
   async govern() {
     const setting = async (k) => (await GET('/api/settings')).settings.find((x) => x.key === k).value;
     const toastWith = (cls, re) => waitFor(() => [...document.querySelectorAll('.toast' + cls)].find((x) => re.test(x.textContent)), 30000);
@@ -1211,7 +1262,7 @@ def wait_job(app, job, timeout=600):
     return job
 
 
-def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky"):
+def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_action=None):
     import demo
     vc_server, vc_port = fake_vcenter.serve(count=vms)
     env = demo.setup(tmp, vc_port, scenario, batch_size=8 if vms < 1000 else 25)
@@ -1223,6 +1274,7 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky"):
         cfg = Config.load("cfg.toml")
         cfg.workdir = str(tmp / "run")
         cfg.max_parallel_batches = 8 if vms >= 1000 else cfg.max_parallel_batches
+        cfg.commit_action = commit_action or cfg.commit_action
         app = WebApp(cfg, config_path=str(cfg_path))
     finally:
         os.chdir(cwd)
@@ -1274,7 +1326,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme", "palette", "stream", "govern", "help", "flow"]
+             "resilience", "token", "theme", "palette", "stream", "govern", "help", "flow", "reset"]
 
 
 def main():
@@ -1307,8 +1359,9 @@ def main():
     wanted = args.only or SCENARIOS
     for s in wanted:
         if s in SCENARIOS:
-            # govern turns on the two-person rule: its own workspace, so no other scenario sees it
-            plan.append((s, "govern" if s == "govern" else "main", s, "", (1440, 900)))
+            # govern turns on the two-person rule and reset wipes its campaign: each gets its
+            # own workspace, so no other scenario sees it
+            plan.append((s, s if s in ("govern", "reset") else "main", s, "", (1440, 900)))
     if not args.only or "narrow" in (args.only or []):
         plan.append(("pages @ 390px", "main", "pages", "&narrow=1", (390, 844)))
     if not args.only or "empty" in (args.only or []):
@@ -1339,6 +1392,8 @@ def main():
                 os.environ.update(saved_env)
                 if kind == "empty":
                     app, vc = build(ws, 10, seed=False, hostile=False)
+                elif kind == "reset":
+                    app, vc = build(ws, args.vms, hostile=False, scenario="wait", commit_action="Wait")
                 elif kind == "scale":
                     app, vc = build(ws, 1800, hostile=False, scenario="happy")
                 else:

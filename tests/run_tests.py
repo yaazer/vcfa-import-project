@@ -5629,7 +5629,171 @@ def t_web_activity():
             c.close()
 
 
+@test("e2e: a finished wave's batch objects are cleaned up; an unfinished wave is left alone")
+def t_e2e_wave_cleanup():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "happy", settle="1")
+        _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-ns-a"])
+        cfg = _write_config(tmp, commit_action="Auto")
+        _run_cli(["-c", cfg, "load", "-i", _inventory(tmp, 8, namespaces=("ns-a",), waves=(1, 2))], env, tmp)
+        _run_cli(["-c", cfg, "precheck", "-y"], env, tmp)
+        _run_cli(["-c", cfg, "run", "--wave", "2", "-y"], env, tmp)
+        flaky = dict(env, FAKE_KUBECTL_SCENARIO="import-flaky")             # fails vm-1005, in wave 1
+        _run_cli(["-c", cfg, "run", "--wave", "1", "-y"], flaky, tmp, expect=None)
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({v["state"] for v in vms if v["wave"] == 2}, {"committed"})
+        assert "failed" in {v["state"] for v in vms if v["wave"] == 1}, "import-flaky fails vm-1005"
+
+        def on_cluster(wave):
+            names = [k.split("/", 1)[1] for k in json.loads(Path(tmp, "cluster.json").read_text())["batches"]]
+            return [n for n in names if "-w{}-".format(wave) in n]
+        assert on_cluster(1) and on_cluster(2), "import batches stay after the import"
+        eq([n for n in on_cluster(1) + on_cluster(2) if n.startswith("pre-")], [], "prechecks clean themselves up")
+
+        out = _run_cli(["-c", cfg, "cleanup", "--wave", "1", "-y"], env, tmp).stdout
+        assert "no batches to clean up" in out and "wave 1 is not finished: 1 failed" in out.lower(), out
+        wave2 = len(on_cluster(2))
+        out = _run_cli(["-c", cfg, "cleanup", "-y"], env, tmp).stdout
+        assert "deleted {} batch".format(wave2) in out and "committed VMs are not affected" in out, out
+        eq(on_cluster(2), [], "wave 2 finished: its batch objects are gone")
+        assert on_cluster(1), "wave 1 is not finished: untouched"
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({v["state"] for v in vms if v["wave"] == 2}, {"committed"}, "committed VMs are not affected")
+        events = _run_cli(["-c", cfg, "events", "--limit", "50"], env, tmp).stdout
+        assert "wave 2 finished" in events, events
+
+
+@test("console: Execute's clean-up step lists each wave and cleans up a finished one")
+def t_web_wave_cleanup():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "happy", count=8, namespaces=("ns-a",), waves=(1, 2))
+        try:
+            c.app.cfg.commit_action = "Auto"
+            _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "succeeded")
+            _run_job(c, "execute", {"stage": "import", "waves": [1], "confirm": True}, "succeeded")
+            rows = {w["wave"]: w for w in c.ok("GET", "/api/overview")["wave_cleanup"]}
+            assert rows[1]["finished"] and rows[1]["cleanable"] >= 1 and rows[1]["on_cluster"] == rows[1]["cleanable"], rows[1]
+            assert not rows[2]["finished"] and rows[2]["open"], rows[2]
+            snap = _run_job(c, "cleanup", {"waves": [2], "confirm": True}, "succeeded")
+            eq(snap["result"]["deleted"], [], "an unfinished wave: nothing to delete")
+            snap = _run_job(c, "cleanup", {"waves": [1], "confirm": True}, "succeeded")
+            eq(len(snap["result"]["deleted"]), rows[1]["cleanable"])
+            eq(snap["title"], "Clean up wave 1")
+            rows = {w["wave"]: w for w in c.ok("GET", "/api/overview")["wave_cleanup"]}
+            eq((rows[1]["on_cluster"], rows[1]["cleanable"]), (0, 0))
+            states = {b["state"] for b in c.ok("GET", "/api/batches")["batches"] if b["wave"] == 1}
+            eq(states, {"deleted"}, "the store keeps them, as cleaned up")
+            eq(c.call("POST", "/api/run/cleanup", {"waves": [1]})[0], 400, "cleanup needs confirm")
+        finally:
+            c.close()
+            env.__exit__()
+
+@test("store: a campaign reset empties the campaign tables and keeps people, settings and (if asked) discovery")
+def t_store_clear_campaign():
+    from vcfaimport.state import Store
+    with tempfile.TemporaryDirectory() as tmp:
+        s = _store(tmp)
+        _record(s, wave=3)
+        s.log_event("something happened")
+        s.set_wave_info(3, name="Acme")
+        s.set_meta("settings", {"batch_size": 7})
+        s.set_meta("run_id", "r-1")
+        s.set_meta("discovered_at", "yesterday")
+        s.conn.execute("INSERT INTO users(name, role, token_hash, created_at) VALUES('ada', 'admin', 'x', 'now')")
+        s.conn.execute("INSERT INTO discovered(moref, name, selected, namespace, wave, notes, app, discovered_at)"
+                       " VALUES('vm-1', 'a', 1, 'ns-a', 3, 'n', 'erp', 'now')")
+        s.conn.commit()
+        s.backup_to(str(Path(tmp, "arch", "state.db")))
+        s.clear_campaign(keep_discovered=True)
+        eq(s.counts(), {}, "the queue is empty")
+        eq(s.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+        eq(s.wave_info(), {})
+        eq((s.get_meta("settings"), s.get_meta("run_id"), s.get_meta("discovered_at")),
+           ({"batch_size": 7}, None, "yesterday"), "settings kept, campaign meta gone")
+        eq(s.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], 1, "people stay")
+        eq(tuple(s.conn.execute("SELECT selected, namespace, wave, notes, app FROM discovered").fetchone()),
+           (0, "", 0, "", ""), "discovery kept, every choice made on it cleared")
+        s.clear_campaign()
+        eq((s.discovered_counts()["total"], s.get_meta("discovered_at")), (0, None))
+        with Store(str(Path(tmp, "arch", "state.db"))) as old:
+            eq(old.counts(), {"pending": 1}, "the archive holds the campaign as it was")
+        s.close()
+
+
+@test("e2e: reset is refused at the commit gate, then archives the campaign and deletes its batches")
+def t_e2e_reset_campaign():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "wait")
+        _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-ns-a"])
+        cfg = _write_config(tmp, commit_action="Wait")
+        _run_cli(["-c", cfg, "load", "-i", _inventory(tmp, 4, namespaces=("ns-a",), waves=(1, 2))], env, tmp)
+        _run_cli(["-c", cfg, "settings", "set", "batch_size=3"], env, tmp)
+        _run_cli(["-c", cfg, "precheck", "-y"], env, tmp)
+        _run_cli(["-c", cfg, "run", "--wave", "1", "-y"], env, tmp)
+        out = _run_cli(["-c", cfg, "reset", "-y"], env, tmp, expect=7).stdout
+        assert "awaiting commit: commit or roll them back first" in out, out
+        cluster = lambda: json.loads(Path(tmp, "cluster.json").read_text())["batches"]
+        assert cluster(), "a refused reset deletes nothing"
+        _run_cli(["-c", cfg, "commit", "-y"], env, tmp)
+        out = _run_cli(["-c", cfg, "reset", "-y"], dict(env, FAKE_KUBECTL_DELETE_FAILS="1"), tmp, expect=4).stdout
+        assert "could not be deleted" in out and "nothing was reset" in out, out
+        assert not Path(tmp, "run", "archive").exists(), "nothing archived"
+        eq(len(json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)), 4, "nothing cleared")
+        out = _run_cli(["-c", cfg, "reset", "-y"], env, tmp).stdout
+        assert "committed VM(s) stay in their namespaces" in out and "campaign reset" in out, out
+        eq(cluster(), {}, "every batch object of the campaign is deleted")
+        eq(json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout), [], "the queue is empty")
+        archives = list(Path(tmp, "run", "archive").iterdir())
+        eq(len(archives), 1)
+        eq(sorted(f.name for f in archives[0].iterdir()), ["ledger.jsonl", "reset.json", "state.db"])
+        summary = json.loads((archives[0] / "reset.json").read_text())
+        eq((summary["vms"], summary["counts"]), (4, {"committed": 2, "precheck_passed": 2}))
+        from vcfaimport.state import Store
+        with Store(str(archives[0] / "state.db")) as old:
+            eq(sum(old.counts().values()), 4, "the archive keeps the old campaign")
+        assert not Path(tmp, "run", "ledger.jsonl").exists(), "the local ledger went to the archive"
+        import re
+        shown = _run_cli(["-c", cfg, "settings", "show"], env, tmp).stdout
+        assert re.search(r"batch_size\W+3\b", shown), "settings are kept: " + shown
+        assert "campaign reset" in _run_cli(["-c", cfg, "events"], env, tmp).stdout
+        # The fresh campaign works: a new load starts at wave 1 again.
+        _run_cli(["-c", cfg, "load", "-i", _inventory(tmp, 2, namespaces=("ns-a",), waves=(1,))], env, tmp)
+        _run_cli(["-c", cfg, "precheck", "-y"], env, tmp)
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq({(v["wave"], v["state"]) for v in vms}, {(1, "precheck_passed")})
+
+
+@test("console: Reset campaign is admin-only, needs confirm, and leaves people and only its own job")
+def t_web_reset_campaign():
+    with tempfile.TemporaryDirectory() as tmp:
+        c, env, _ = _queue_console(tmp, "happy", count=4, namespaces=("ns-a",))
+        try:
+            olga = c.ok("POST", "/api/users", {"name": "olga", "role": "operator"})["token"]
+            _run_job(c, "execute", {"stage": "precheck", "confirm": True}, "succeeded")
+            eq(c.call("GET", "/api/reset", token=olga)[0], 403, "an operator cannot reset")
+            eq(c.call("POST", "/api/reset", {"confirm": True, "confirm_phrase": "RESET"}, token=olga)[0], 403)
+            eq(c.call("POST", "/api/reset", {})[0], 400, "reset needs confirm")
+            eq(c.call("POST", "/api/reset", {"confirm": True})[0], 400, "and the typed word")
+            eq(c.call("POST", "/api/reset", {"confirm": True, "confirm_phrase": "reset"})[0], 400)
+            plan = c.ok("GET", "/api/reset")
+            eq((plan["vms"], plan["blockers"], plan["ledger_shared"]), (4, [], False))
+            snap = c.wait(c.ok("POST", "/api/reset", {"confirm": True, "confirm_phrase": "RESET"})["job"])
+            eq(snap["status"], "succeeded", snap.get("error"))
+            eq(snap["kind"], "reset")
+            eq(c.ok("GET", "/api/pulse")["total"], 0)
+            eq([j["kind"] for j in c.ok("GET", "/api/jobs")["jobs"]], ["reset"], "older jobs went to the archive")
+            eq([u["name"] for u in c.ok("GET", "/api/users")["users"]], ["olga"], "people stay")
+            arch = Path(snap["result"]["archive"])
+            assert (arch / "jobs").is_dir() and any((arch / "jobs").glob("*.log")), "job logs archived"
+            assert Path(tmp, "run", "jobs", snap["id"] + ".json").exists(), "the reset job's own log stays"
+            eq(c.ok("GET", "/api/reset")["vms"], 0)
+        finally:
+            c.close()
+            env.__exit__()
+
+
 UNIT = [
+    t_store_clear_campaign,
     t_activity_now, t_activity_timeline, t_web_activity,
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,
     t_app_icon, t_status_child_blocking_condition, t_discovery_drift, t_precheck_max_age,
@@ -5672,7 +5836,8 @@ UNIT = [
 ]
 
 E2E = [
-    t_e2e_precheck_storage_release, t_e2e_vm_deleted_before_commit,
+    t_e2e_reset_campaign, t_web_reset_campaign,
+    t_e2e_wave_cleanup, t_web_wave_cleanup, t_e2e_precheck_storage_release, t_e2e_vm_deleted_before_commit,
     t_e2e_portgroups_subnets,
     t_e2e_cluster_namespaces,
     t_e2e_web_governance, t_e2e_cli_governance,

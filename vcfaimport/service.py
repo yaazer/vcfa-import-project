@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import Config
 from .discovery import SelectionError, match_folder_map, _match_mapping  # noqa: F401  (re-exported for web)
-from .engine import STAGE_IMPORT, AbortRun, Engine, cleanup_candidates
+from .engine import STAGE_IMPORT, SETTLED_STATES, AbortRun, Engine, cleanup_candidates, cleanup_plan, wave_finished
 from .kube import Kubectl, KubectlError
 from .folders import folder_matches, norm_folder
 from . import state as st
@@ -466,6 +466,148 @@ def wave_summaries(store: st.Store) -> List[Dict[str, Any]]:
     return out
 
 
+def wave_cleanup(store: st.Store) -> List[Dict[str, Any]]:
+    """Per wave: is it finished, what is still open in it, and how many of its batch
+    objects are on the cluster and could be cleaned up now."""
+    info = store.wave_info()
+    plan: Dict[int, int] = {}
+    for b in cleanup_plan(store):
+        plan[b["wave"]] = plan.get(b["wave"], 0) + 1
+    on_cluster: Dict[int, int] = {}
+    for b in store.query_batches():
+        if b["state"] != st.B_DELETED:
+            on_cluster[b["wave"]] = on_cluster.get(b["wave"], 0) + 1
+    out = []
+    for wave in store.waves():
+        counts = store.counts(wave=wave)
+        out.append({
+            "wave": wave, "name": (info.get(wave) or {}).get("name", ""),
+            "vms": sum(counts.values()), "committed": counts.get(st.S_COMMITTED, 0),
+            "finished": wave_finished(store, wave),
+            "open": {s: n for s, n in counts.items() if s not in SETTLED_STATES},
+            "on_cluster": on_cluster.get(wave, 0), "cleanable": plan.get(wave, 0),
+        })
+    return out
+
+
+# ------------------------------------------------------------------ reset
+class ResetRefused(ValueError):
+    """The campaign cannot be reset now; nothing was changed."""
+
+
+# The operator owns these VMs until they are committed or rolled back: forgetting
+# them would strand the import on the cluster with nothing left to finish it.
+RESET_BLOCKING_STATES = IN_FLIGHT_STATES + (st.S_AWAITING_COMMIT,)
+LIVE_BATCH_STATES = (st.B_APPLIED, st.B_RUNNING, st.B_ROLLING_BACK)
+
+
+def reset_preview(store: st.Store, cfg: Config) -> Dict[str, Any]:
+    """What a reset would clear, keep and delete from the cluster, and what stops it."""
+    from . import access, report, schedule as sch
+    counts = store.counts()
+    blocking = {s: counts[s] for s in RESET_BLOCKING_STATES if counts.get(s)}
+    live = store.query_batches(states=list(LIVE_BATCH_STATES))
+    blockers = []
+    if blocking:
+        blockers.append("{}: commit or roll them back first".format(", ".join(
+            "{} {}".format(n, report.STATE_LABEL.get(s, s)) for s, n in blocking.items())))
+    elif live:
+        # Batches holding in-flight or gated VMs are already explained by the line above.
+        blockers.append("{} still running on the cluster: wait for {} to finish, or roll {} back".format(
+            _plural(len(live), "batch", "batches"), *(("it", "it") if len(live) == 1 else ("them", "them"))))
+    q = store.conn.execute
+    return {
+        "vms": sum(counts.values()), "counts": counts, "committed": counts.get(st.S_COMMITTED, 0),
+        "waves": len(store.waves()),
+        "batches_on_cluster": [{"name": b["name"], "namespace": b["namespace"], "stage": b["stage"],
+                                "state": b["state"]}
+                               for b in store.query_batches() if b["state"] != st.B_DELETED],
+        "discovered": store.discovered_counts()["total"],
+        "events": q("SELECT COUNT(*) FROM events").fetchone()[0],
+        "schedules_open": q("SELECT COUNT(*) FROM schedules WHERE state IN (?, ?)", sch.OPEN_STATES).fetchone()[0],
+        "approvals_pending": q("SELECT COUNT(*) FROM approvals WHERE state=?", (access.PENDING,)).fetchone()[0],
+        "blockers": blockers,
+        "ledger_path": store.ledger_path,
+        # A ledger configured elsewhere (a file share) is shared with others: never moved.
+        "ledger_shared": bool(cfg.ledger_path),
+        "archive_root": str(Path(cfg.workdir).expanduser().resolve() / "archive"),
+    }
+
+
+def _plural(n: int, one: str, many: str) -> str:
+    return "{} {}".format(n, one if n == 1 else many)
+
+
+def reset_campaign(ws: "Workspace", keep_discovered: bool = False,
+                   keep_jobs: Sequence[str] = ()) -> Dict[str, Any]:
+    """Archive this campaign and start the workspace afresh.
+
+    Refused while any VM is in flight or held at the commit gate. Otherwise every
+    batch object the campaign still has on the cluster is deleted first -- if one
+    cannot be, nothing is reset -- then the database, the local ledger and the
+    console's job history go to <workdir>/archive/campaign-<time>/, and the
+    campaign tables are emptied. People, settings, maps and the config stay.
+    Committed VMs stay in their namespaces: there is no way back to vCenter.
+    The caller holds the WorkspaceLock.
+    """
+    import shutil
+    store, cfg, log = ws.store, ws.cfg, ws.log
+    plan = reset_preview(store, cfg)
+    if plan["blockers"]:
+        raise ResetRefused("cannot reset the campaign: " + "; ".join(plan["blockers"]))
+
+    deleted, errors = [], []
+    for b in plan["batches_on_cluster"]:
+        try:
+            ws.kube.delete(cfg.batch_resource, b["name"], b["namespace"])
+        except KubectlError as exc:
+            errors.append("{}/{}: {}".format(b["namespace"], b["name"], str(exc)[:300]))
+            continue
+        deleted.append(b["name"])
+        log("  x  deleted {}/{}".format(b["namespace"], b["name"]))
+    if errors:
+        for err in errors:
+            log("  ! " + err)
+        raise ResetRefused("cannot reset the campaign: {} could not be deleted from the cluster "
+                           "(see above); nothing was reset. Fix that and reset again."
+                           .format(_plural(len(errors), "batch object", "batch objects")))
+
+    work = Path(cfg.workdir).expanduser().resolve()
+    stamp = time.strftime("campaign-%Y%m%d-%H%M%S")
+    archive, n = Path(plan["archive_root"]) / stamp, 1
+    while archive.exists():
+        n += 1
+        archive = Path(plan["archive_root"]) / "{}-{}".format(stamp, n)
+    store.backup_to(str(archive / "state.db"))
+    ledger = Path(store.ledger_path)
+    if not plan["ledger_shared"] and ledger.is_file():
+        shutil.move(str(ledger), str(archive / "ledger.jsonl"))
+    jobs = work / "jobs"
+    if jobs.is_dir():
+        keep = set(keep_jobs)
+        for f in list(jobs.iterdir()):
+            if f.is_file() and f.stem not in keep:
+                (archive / "jobs").mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(archive / "jobs" / f.name))
+    summary = {
+        "reset_at": time.strftime("%Y-%m-%d %H:%M:%S"), "by": store.actor,
+        "vms": plan["vms"], "counts": plan["counts"], "waves": plan["waves"],
+        "batches_deleted": deleted, "kept_discovered": keep_discovered,
+        "ledger": str(archive / "ledger.jsonl") if (archive / "ledger.jsonl").exists() else plan["ledger_path"],
+    }
+    (archive / "reset.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
+
+    store.clear_campaign(keep_discovered=keep_discovered)
+    msg = "campaign reset: {} VMs in {} archived to {}; {} deleted from the cluster".format(
+        plan["vms"], _plural(plan["waves"], "wave", "waves"), archive,
+        _plural(len(deleted), "batch object", "batch objects"))
+    store.log_event(msg, "warn")
+    if plan["ledger_shared"]:
+        store.note_in_ledger("campaign_reset", msg, archive=str(archive))
+    log("archived the campaign to {}".format(archive))
+    return dict(summary, archive=str(archive), committed=plan["committed"])
+
+
 def wave_label(wave: int, name: str = "") -> str:
     """'Wave 2', or 'Wave 2 · Acme' once it is named."""
     return "Wave {}{}".format(wave, " · " + name if name else "")
@@ -493,6 +635,7 @@ def overview(store: st.Store, cfg: Config) -> Dict[str, Any]:
         "namespaces": [{"namespace": n, "total": sum(c.values()), "counts": c}
                        for n, c in sorted(by_ns.items())],
         "live_batches": [dict(b) for b in live],
+        "wave_cleanup": wave_cleanup(store),
         "recent_failures": [vm_summary(v) for v in failures],
         "discovered": store.discovered_counts(),
         "meta": {

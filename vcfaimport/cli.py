@@ -894,21 +894,27 @@ def cmd_abandon(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    cfg, _store, _kube, engine = _open(args)
-    candidates = engine.cleanup_candidates()
+    cfg, store, _kube, engine = _open(args)
+    candidates = service.cleanup_plan(store, args.wave or None)
     if args.batch:
         wanted = set(args.batch)
         candidates = [b for b in candidates if b["name"] in wanted]
         missing = wanted - {b["name"] for b in candidates}
         for name in sorted(missing):
-            log("  ! {}: not a confirmed rollback or a finished precheck; refusing to delete".format(name))
+            log("  ! {}: not a confirmed rollback, a finished precheck or part of a finished wave; "
+                "refusing to delete".format(name))
     if not candidates:
-        log("no batches to clean up (no confirmed rollbacks or finished prechecks on the cluster)")
+        log("no batches to clean up (no finished waves, confirmed rollbacks or finished prechecks on the cluster)")
+        for w in service.wave_cleanup(store):
+            if not w["finished"] and (not args.wave or w["wave"] in args.wave):
+                log("  wave {} is not finished: {}".format(w["wave"], ", ".join(
+                    "{} {}".format(n, report.STATE_LABEL.get(s, s)) for s, n in sorted(w["open"].items()))))
         return 0
-    log("confirmed rollbacks and finished prechecks still on the cluster:")
-    log(report.table(["batch", "namespace", "stage", "vms", "note"],
-                     [[b["name"], b["namespace"], b["stage"], b["vm_count"], (b["message"] or "")[:50]]
+    log("batch objects the cluster no longer needs (finished waves, confirmed rollbacks, finished prechecks):")
+    log(report.table(["wave", "batch", "namespace", "stage", "vms", "note"],
+                     [[b["wave"], b["name"], b["namespace"], b["stage"], b["vm_count"], (b["message"] or "")[:50]]
                       for b in candidates], indent="  "))
+    log("  committed VMs are not affected: they stay in their namespaces, and every result stays in the ledger")
     if not _confirm("Delete {} batch object(s) from the cluster?".format(len(candidates)),
                     args.yes):
         log("aborted")
@@ -919,6 +925,39 @@ def cmd_cleanup(args) -> int:
     for err in result["errors"]:
         log("  ! " + err)
     return 0 if not result["errors"] else 4
+
+
+def cmd_reset(args) -> int:
+    ws = _open_ws(args)
+    plan = service.reset_preview(ws.store, ws.cfg)
+    if plan["blockers"]:
+        for b in plan["blockers"]:
+            log("  ! " + b)
+        log("refused: the campaign cannot be reset while VMs are in flight or held at the commit gate")
+        return 7
+    log("reset the campaign -- archived first, to {}/campaign-<time>/:".format(plan["archive_root"]))
+    log("  cleared : {} VM(s) in {} wave(s), their history, {} event(s), change windows and approvals".format(
+        plan["vms"], plan["waves"], plan["events"]))
+    log("  cluster : {} batch object(s) deleted".format(len(plan["batches_on_cluster"])))
+    log("  vCenter : {} discovered VM(s) {}".format(
+        plan["discovered"], "kept, selection cleared" if args.keep_discovery else "cleared (run discover again)"))
+    log("  ledger  : {}".format("stays at {} (shared); a reset line is added".format(plan["ledger_path"])
+                                if plan["ledger_shared"] else "archived; a new one starts"))
+    log("  kept    : settings, users, maps and the config file")
+    if plan["committed"]:
+        log("  {} committed VM(s) stay in their namespaces: the tool cannot return them to vCenter".format(
+            plan["committed"]))
+    if not _confirm("Reset the campaign?", args.yes):
+        log("aborted")
+        return 1
+    try:
+        with service.WorkspaceLock(ws.cfg, "`reset` from the CLI"):
+            result = service.reset_campaign(ws, keep_discovered=args.keep_discovery)
+    except service.ResetRefused as exc:
+        log("refused: {}".format(exc))
+        return 4
+    log("campaign reset; the old one is in {}".format(result["archive"]))
+    return 0
 
 
 def cmd_retry(args) -> int:
@@ -1559,8 +1598,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-y", "--yes", action="store_true")
 
     sp = add("cleanup", cmd_cleanup,
-             "delete batch objects the cluster no longer needs: confirmed rollbacks and finished prechecks")
+             "delete batch objects the cluster no longer needs: those of finished waves, confirmed "
+             "rollbacks and finished prechecks")
     sp.add_argument("--batch", action="append", metavar="NAME", help="restrict to these; repeatable")
+    sp.add_argument("--wave", action="append", type=int, metavar="N", help="restrict to these waves; repeatable")
+    sp.add_argument("-y", "--yes", action="store_true")
+
+    sp = add("reset", cmd_reset,
+             "archive the campaign and start afresh (refused while VMs are in flight or awaiting commit)")
+    sp.add_argument("--keep-discovery", action="store_true",
+                    help="keep the discovered vCenter inventory (its selection is cleared)")
     sp.add_argument("-y", "--yes", action="store_true")
 
     sp = add("retry", cmd_retry, "return failed VMs to the queue")

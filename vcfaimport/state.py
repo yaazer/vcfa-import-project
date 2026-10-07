@@ -334,6 +334,39 @@ class Store:
             # The ledger is a convenience mirror; never fail a migration over it.
             pass
 
+    # ------------------------------------------------------------ reset
+    # What one campaign leaves behind. People, workspace settings and the vCenter
+    # server belong to the workspace and survive a reset; so does the discovered
+    # inventory when asked (its per-VM choices are cleared either way).
+    CAMPAIGN_TABLES = ("vms", "batches", "transitions", "wave_info", "events", "schedules",
+                       "approvals", "verifications")
+    CAMPAIGN_META = ("run_id", "inventory_path")
+    DISCOVERY_META = ("discovered_at", "vc_networks")
+
+    def backup_to(self, path: str) -> None:
+        """A consistent copy of the whole database, taken while other connections stay open."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(path)) as dst:
+            self.conn.backup(dst)
+
+    def clear_campaign(self, keep_discovered: bool = False) -> None:
+        """Empty every campaign table in one transaction. Callers archive first
+        (`backup_to`) and check that nothing is in flight: this bypasses
+        set_vm_state on purpose, as there is no VM left to have a transition."""
+        with self.conn:
+            for table in self.CAMPAIGN_TABLES:
+                self.conn.execute("DELETE FROM {}".format(table))
+            meta = self.CAMPAIGN_META + (() if keep_discovered else self.DISCOVERY_META)
+            self.conn.execute("DELETE FROM meta WHERE key IN ({})".format(",".join("?" * len(meta))), meta)
+            if keep_discovered:
+                self.conn.execute("UPDATE discovered SET selected=0, namespace='', wave=0, notes='', app=''")
+            else:
+                self.conn.execute("DELETE FROM discovered")
+
+    def note_in_ledger(self, event: str, message: str, **extra: Any) -> None:
+        """A line in the ledger that is not a VM transition, e.g. a campaign reset."""
+        self._append_ledger(dict(extra, ts=_now(), event=event, message=message, actor=self.actor))
+
     def close(self) -> None:
         self.conn.close()
 
