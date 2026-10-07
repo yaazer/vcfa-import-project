@@ -68,6 +68,11 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - The app icon's colours are brand constants (`.appicon` in app.css), not theme tokens; a theme
   only picks the colourway. Its geometry lives in `tools/make_icons.py` and is repeated inline in
   `appIcon()` (core.js) and index.html -- `t_app_icon` fails if they drift.
+- **Nobody runs the tool without accepting DISCLAIMER.md** (`vcfaimport/legal.py`). The CLI gate
+  (`cli.terms_gate`) lets only `disclaimer` and `accept` through (exit 8 otherwise); the console
+  answers 451 to everything outside `LEGAL_OPEN` until that console user has accepted. Acceptances are
+  bound to the SHA-256 of the text and fail closed. Never add a bypass: tests accept through
+  `VCFA_ACCEPTANCE_FILE` and `_accept_terms()`, the UI harness through its `accept` flag.
 - Animation is time-based, never per-frame, and every effect must degrade to a
   complete static render under Motion: Off (the OS reduce-motion default). `fx.js`
   hooks fail soft: the console must work if the look breaks.

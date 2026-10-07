@@ -1250,3 +1250,35 @@ html[data-skin="clarity"] .flow-step.active .fs-t small { color: #d2dbe1; }
   .flow-sec { grid-template-columns: minmax(0, 1fr); }
   .flow-sec > .flow-n, .flow-sec::before { display: none; }
 }
+
+/* ------------------------------------------------ terms of use gate (front and centre) */
+body.terms-gated .app, body.terms-gated .dock, body.terms-gated #drawer-root { visibility: hidden; }
+#terms-gate { position: fixed; inset: 0; z-index: 200; overflow-y: auto; overflow-x: hidden; display: block; padding: 4vh 16px;
+  background: oklch(0.1 0.02 var(--hb) / .86); backdrop-filter: blur(8px); }
+.tg-card { width: min(900px, 100%); box-sizing: border-box; min-width: 0; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; padding: 26px 28px; border-radius: 20px;
+  background: var(--glass-strong); border: 1px solid var(--line); box-shadow: 0 30px 90px -20px oklch(0 0 0 / .7); }
+.tg-head { display: flex; gap: 16px; align-items: flex-start; }
+.tg-head h2 { margin: 0 0 4px; font-size: 22px; }
+.tg-head p { margin: 0; font-size: 13.5px; }
+.tg-head .gate-mark { width: 48px; height: 48px; }
+.tg-ver { color: var(--faint); white-space: nowrap; }
+.tg-short { padding: 14px 18px; border-radius: 14px; border: 1px solid color-mix(in oklab, var(--warn) 45%, transparent);
+  background: color-mix(in oklab, var(--warn) 9%, transparent); font-size: 13.5px; }
+.tg-short ul { margin: 8px 0 0; padding-left: 20px; display: grid; gap: 5px; }
+.tg-tabs { margin: 0; }
+.tg-scroll { max-height: 38vh; overflow-y: auto; padding: 4px 20px 16px; border-radius: 14px; border: 1px solid var(--line); background: var(--panel-2); }
+.tg-scroll:focus-visible { outline: 2px solid var(--accent); }
+.tg-pre { white-space: pre-wrap; font-size: 12px; line-height: 1.5; margin: 12px 0; }
+.tg-progress { font-size: 12.5px; color: var(--muted); display: flex; gap: 6px; align-items: center; margin-top: -8px; }
+.tg-progress svg { width: 14px; height: 14px; color: var(--ok); }
+.tg-form { display: grid; gap: 12px; }
+.tg-check { align-items: flex-start !important; font-size: 13.5px !important; line-height: 1.45; }
+.tg-check input { margin-top: 3px; flex: none; }
+.tg-check:has(input:disabled) { opacity: .55; cursor: not-allowed; }
+.tg-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.tg-field { display: grid; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.tg-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.tg-card > * { min-width: 0; }
+.tg-scroll { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .tg-card { padding: 18px 16px; } .tg-row { grid-template-columns: 1fr; } .tg-head { flex-wrap: wrap; }
+  .tg-ver { order: 3; width: 100%; } .tg-scroll { max-height: 46vh; padding: 4px 12px 12px; } .tg-tabs { width: 100%; } }

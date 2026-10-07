@@ -30,7 +30,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..config import ConfigError
 from .. import access
-from .api import ADMIN_HANDLERS, BUSY_ERRORS, CTX, FORBIDDEN_ERRORS, OWNER, ROUTES, USER_ERRORS, ApiError, WebApp
+from .api import (ADMIN_HANDLERS, ANY_ROLE_HANDLERS, BUSY_ERRORS, CTX, FORBIDDEN_ERRORS, LEGAL_OPEN, OWNER, ROUTES,
+                  USER_ERRORS, ApiError, WebApp)
 from .jobs import JobBusy
 
 MAX_BODY = 8 * 1024 * 1024
@@ -146,6 +147,8 @@ class Handler(BaseHTTPRequestHandler):
     def _needed_role(method: str, handler_name: str) -> str:
         if handler_name in ADMIN_HANDLERS:
             return "admin"
+        if handler_name in ANY_ROLE_HANDLERS:
+            return "viewer"
         return "viewer" if method == "GET" else "operator"
 
     def _drain(self) -> Optional[str]:
@@ -229,7 +232,13 @@ class Handler(BaseHTTPRequestHandler):
             if not access.allows(user["role"], needed):
                 self._error(403, "{} is a {}; this needs the {} role".format(user["name"], user["role"], needed))
                 return
+            # Terms of use: nothing else answers until this person has accepted them.
+            if handler_name not in LEGAL_OPEN and not self.app.terms_accepted(user):
+                self._error(451, "accept the terms of use (DISCLAIMER.md) before using vcfa-import")
+                return
             CTX.user = user
+            CTX.client = self.client_address[0] if self.client_address else None
+            CTX.user_agent = self.headers.get("User-Agent", "")
             try:
                 body = self._body() if method in ("POST", "PUT") else {}
                 result = getattr(self.app, handler_name)(query, body, **match.groupdict())

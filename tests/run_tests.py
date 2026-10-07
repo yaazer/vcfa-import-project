@@ -24,6 +24,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Every CLI call in the suite runs as an account that has accepted the terms of use,
+# recorded in a private file (subprocesses inherit VCFA_ACCEPTANCE_FILE). The gate itself
+# is tested on its own (t_terms_*), against other, fresh acceptance files.
+_ACCEPT_DIR = tempfile.mkdtemp(prefix="vcfa-accept-")
+os.environ["VCFA_ACCEPTANCE_FILE"] = os.path.join(_ACCEPT_DIR, "acceptance.json")
+from vcfaimport import legal as _legal  # noqa: E402
+_legal.record("vcfa-import test suite", _legal.ACCEPT_PHRASE, via="tests")
+
 from vcfaimport.config import Config  # noqa: E402
 from vcfaimport.inventory import InventoryError, load_inventory  # noqa: E402
 from vcfaimport.planner import plan_batches  # noqa: E402
@@ -1154,6 +1162,122 @@ def t_track_target_extraction():
     by = stat.by_moref()
     eq(by["vm-1"].target, "vm-a1b2c3d4")
     eq(by["vm-2"].target, None, "the operation's own name is never used as the target")
+
+
+# ------------------------------------------------------------------ terms of use
+def _fresh_terms_env(tmp):
+    env = dict(os.environ)
+    env["VCFA_ACCEPTANCE_FILE"] = str(Path(tmp, "acceptance.json"))
+    return env
+
+
+@test("terms: nothing runs from the CLI until the terms are accepted; acceptance is bound to the text")
+def t_terms_cli():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _fresh_terms_env(tmp)
+        proc = _run_cli(["init", "--dir", "starter"], env, tmp, expect=8)
+        assert "will not run until you accept" in proc.stderr + proc.stdout, proc.stderr
+        assert not Path(tmp, "starter").exists(), "a refused command does nothing"
+        eq(_run_cli(["disclaimer", "--status"], env, tmp, expect=8).returncode, 8)
+        out = _run_cli(["disclaimer"], env, tmp, expect=8).stdout
+        assert "Limitation of liability" in out, "the terms can be read before accepting"
+        _run_cli(["accept"], env, tmp, expect=8)                       # no terminal, no --i-accept
+        _run_cli(["accept", "--i-accept"], env, tmp, expect=2)         # unattended needs a name
+        _run_cli(["accept", "--name", "Jane Operator", "--i-accept"], env, tmp, expect=0)
+        rec = json.loads(Path(tmp, "acceptance.json").read_text(encoding="utf-8"))
+        eq(rec["name"], "Jane Operator")
+        eq(rec["sha256"], _legal.terms()["sha256"], "bound to the exact text")
+        eq(len(rec["confirmations"]), 3)
+        _run_cli(["init", "--dir", "starter"], env, tmp, expect=0)
+        assert Path(tmp, "starter").exists(), "accepted: it runs"
+        # a record naming other terms (the text changed since) is not an acceptance
+        rec["sha256"] = "0" * 64
+        Path(tmp, "acceptance.json").write_text(json.dumps(rec), encoding="utf-8")
+        _run_cli(["init", "--dir", "again"], env, tmp, expect=8)
+        _run_cli(["accept", "--name", "Jane Operator", "--i-accept"], env, tmp, expect=0)
+        _run_cli(["accept", "--revoke"], env, tmp, expect=0)
+        _run_cli(["init", "--dir", "again"], env, tmp, expect=8)
+        assert not Path(tmp, "again").exists()
+        Path(tmp, "acceptance.json").write_text("{not json", encoding="utf-8")
+        _run_cli(["init", "--dir", "again"], env, tmp, expect=8)       # unreadable: not accepted
+
+
+@test("terms: the interactive prompt, and a build without its terms refuses to run")
+def t_terms_prompt_and_missing():
+    from vcfaimport import cli
+    with tempfile.TemporaryDirectory() as tmp:
+        old = os.environ["VCFA_ACCEPTANCE_FILE"]
+        os.environ["VCFA_ACCEPTANCE_FILE"] = str(Path(tmp, "acc.json"))
+        try:
+            said = []
+            answers = iter(["v", "a", "Jane Doe", "I ACCEPT"])
+            rec = _legal.prompt(inp=lambda _p: next(answers), out=said.append)
+            eq(rec["name"], "Jane Doe")
+            assert any("Limitation of liability" in x for x in said), "V shows the full terms"
+            assert _legal.valid_record(), "recorded"
+            _legal.revoke()
+            for seq in (["q"], ["a", "Jane Doe", "i accept"], ["a", "J", "I ACCEPT"]):
+                answers = iter(seq)
+                eq(_legal.prompt(inp=lambda _p: next(answers), out=lambda *_: None), None, "declined: {}".format(seq))
+                assert not _legal.valid_record()
+            answers = iter(["a"])
+            def eof(_p):
+                v = next(answers, None)
+                if v is None:
+                    raise EOFError
+                return v
+            eq(_legal.prompt(inp=eof, out=lambda *_: None), None, "end of input is a refusal")
+            # the terms missing from a build: nothing can run, not even with an old acceptance
+            _legal.record("Jane Doe", _legal.ACCEPT_PHRASE)
+            orig = _legal._bundled
+            _legal._bundled = lambda name: None
+            try:
+                eq(cli.main(["init", "--dir", str(Path(tmp, "x"))]), 8)
+                assert not Path(tmp, "x").exists()
+            finally:
+                _legal._bundled = orig
+        finally:
+            os.environ["VCFA_ACCEPTANCE_FILE"] = old
+
+
+@test("terms: the console refuses every call (451) until that person accepts; each user accepts for themselves")
+def t_terms_console():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp, accept=False)
+        try:
+            eq(c.call("GET", "/api/pulse", _retry=False)[0], 451)
+            eq(c.call("GET", "/api/info", _retry=False)[0], 451)
+            eq(c.call("POST", "/api/select", {"all": True}, _retry=False)[0], 451)
+            code, d, _ = c.call("GET", "/api/legal", _retry=False)
+            eq(code, 200)
+            eq(d["accepted"], False)
+            assert "Limitation of liability" in d["markdown"] and d["summary"], "the terms come with the status"
+            eq(len(d["confirmations"]), 3)
+            eq(d["sha256"], _legal.terms()["sha256"])
+            code, lic, _ = c.call("GET", "/api/docs/license", _retry=False)
+            eq(code, 200, "the licence can be read before accepting")
+            assert "Apache License" in lic["markdown"]
+            for bad in (dict(_accept_body(), phrase="i accept"), dict(_accept_body(), name=" "),
+                        dict(_accept_body(), confirmations=[True, True, False]),
+                        dict(_accept_body(), sha256="0" * 64)):
+                eq(c.call("POST", "/api/legal/accept", bad, _retry=False)[0], 400, repr(bad)[:80])
+            eq(c.call("GET", "/api/pulse", _retry=False)[0], 451, "a refused acceptance records nothing")
+            code, d, _ = c.call("POST", "/api/legal/accept", _accept_body(), _retry=False)
+            eq(code, 200)
+            eq((d["accepted"], d["record"]["identity"], d["record"]["name"]), (True, "owner", "vcfa-import test suite"))
+            eq(c.call("GET", "/api/pulse", _retry=False)[0], 200, "accepted: the console works")
+            ev = [e["message"] for e in c.app.store.conn.execute("SELECT message FROM events")]
+            assert any("terms of use accepted by vcfa-import test suite as console user owner" in m for m in ev), ev[-3:]
+            # a new user (even a viewer) must accept for themselves, and may
+            tok = c.ok("POST", "/api/users", {"name": "vic", "role": "viewer"})["token"]
+            eq(c.call("GET", "/api/pulse", token=tok, _retry=False)[0], 451, "someone else's acceptance does not count")
+            eq(c.call("GET", "/api/export/tracker.csv?t=" + tok, token=False, raw=True, _retry=False)[0], 451)
+            eq(c.call("POST", "/api/legal/accept", dict(_accept_body(), name="Victor Viewer"), token=tok, _retry=False)[0], 200)
+            eq(c.call("GET", "/api/pulse", token=tok, _retry=False)[0], 200)
+            eq(c.call("POST", "/api/select", {"all": True}, token=tok, _retry=False)[0], 403,
+               "accepting the terms grants no role")
+        finally:
+            c.close()
 
 
 # -------------------------------------------------------------------- e2e
@@ -2357,11 +2481,27 @@ def t_skip_semantics():
         store.close()
 
 
+def _accept_terms(app, *identities):
+    """Record the terms of use as accepted for console users, for tests that are about something else."""
+    t = _legal.terms()
+    for who in identities or ("owner",):
+        app.store.conn.execute(
+            "INSERT INTO acceptances(identity, name, version, sha256, accepted_at, via) VALUES(?,?,?,?,?,?)",
+            (who, "vcfa-import test suite", t["version"], t["sha256"], "2026-01-01T00:00:00Z", "tests"))
+    app.store.conn.commit()
+
+
+def _accept_body(sha256=None):
+    return {"name": "vcfa-import test suite", "phrase": _legal.ACCEPT_PHRASE,
+            "confirmations": [True] * len(_legal.CONFIRMATIONS), "sha256": sha256 or _legal.terms()["sha256"]}
+
+
 class _Console:
     """An in-process web console on a free port, for tests."""
 
-    def __init__(self, tmp, cfg=None, token="t0ken"):
+    def __init__(self, tmp, cfg=None, token="t0ken", accept=True):
         from vcfaimport.web.api import WebApp
+        self.accept = accept
         from vcfaimport.web.server import make_server
         import threading
         if cfg is None:
@@ -2376,9 +2516,19 @@ class _Console:
         self.server = make_server(self.app, "127.0.0.1", 0, token=token)
         self.base = "http://127.0.0.1:{}".format(self.server.server_address[1])
         self.token = token
+        if accept:
+            _accept_terms(self.app, "owner")
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def call(self, method, path, body=None, token=None, headers=None, raw=False):
+    def call(self, method, path, body=None, token=None, headers=None, raw=False, _retry=True):
+        res = self._call(method, path, body, token, headers, raw)
+        # A named user a test just created has not accepted the terms yet: do it the real way.
+        if res[0] == 451 and _retry and token is not False and self.accept:
+            self._call("POST", "/api/legal/accept", _accept_body(), token, None, False)
+            res = self._call(method, path, body, token, headers, raw)
+        return res
+
+    def _call(self, method, path, body=None, token=None, headers=None, raw=False):
         import urllib.error
         import urllib.request
         h = {"Content-Type": "application/json"}
@@ -2888,6 +3038,7 @@ def t_http_non_loopback():
         cfg = Config()
         cfg.workdir = os.path.join(tmp, "run")
         app = WebApp(cfg)
+        _accept_terms(app)
         srv = make_server(app, "0.0.0.0", 0, token="abc")
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
@@ -3518,7 +3669,15 @@ def _spawn_console(tmp, cfg_path, env, token="tok"):
     raise AssertionError("console did not start")
 
 
-def _http(base, method, path, body=None, token="tok"):
+def _http(base, method, path, body=None, token="tok", _retry=True):
+    code, data = _http1(base, method, path, body, token)
+    if code == 451 and _retry:                     # first call as this user: accept the terms
+        _http1(base, "POST", "/api/legal/accept", _accept_body(), token)
+        code, data = _http1(base, method, path, body, token)
+    return code, data
+
+
+def _http1(base, method, path, body=None, token="tok"):
     import urllib.error
     import urllib.request
     req = urllib.request.Request(base + path, method=method,
@@ -5849,6 +6008,7 @@ def t_web_reset_campaign():
 
 
 UNIT = [
+    t_terms_cli, t_terms_prompt_and_missing, t_terms_console,
     t_store_clear_campaign,
     t_activity_now, t_activity_timeline, t_web_activity,
     t_rediscovery_removed, t_rediscovery_guards, t_rediscovery_renamed_moved,

@@ -2,6 +2,12 @@
 
 Bulk-import vCenter VMs into VCF Automation namespaces.
 
+> **Experimental and unsupported. Use entirely at your own risk.** This tool
+> changes production infrastructure, and some of those changes cannot be undone.
+> It is provided "as is", without warranty of any kind, and is not a VMware or
+> Broadcom product. Read [DISCLAIMER.md](DISCLAIMER.md) before using it. Using
+> the tool means you accept those terms.
+
 VCF 9.1's Mobility Operator imports VMs by applying an `ImportOperationBatch`
 to a Supervisor namespace ([Tomas Fojta's
 walkthrough](https://fojta.wordpress.com/2026/06/19/how-to-import-vms-into-vcf-automation/)).
@@ -222,6 +228,55 @@ vcfa-import.exe --help                # Windows, Python not required
 PyInstaller installed, the `.exe`, plus a zip bundling both with this README,
 the lab guide, examples and source. **[LAB-GUIDE.md](LAB-GUIDE.md)** walks
 through a first run against a real Supervisor.
+
+---
+
+## Terms of use and licence
+
+**Nobody uses vcfa-import without accepting its terms of use first**
+([DISCLAIMER.md](DISCLAIMER.md)).
+
+**From the command line,** the first run asks you to accept. It shows the terms
+in short, lets you read them in full, and records your acceptance once you give
+your name and type `I ACCEPT`. Until then, every command except `disclaimer` and
+`accept` refuses to run (exit code `8`).
+
+```bash
+vcfa-import disclaimer                 # read the terms; says whether this account accepted
+vcfa-import accept                     # accept them interactively
+vcfa-import accept --name "Jane Smith" --i-accept   # a scheduled task or service account
+vcfa-import accept --revoke            # withdraw this account's acceptance
+```
+
+The acceptance is kept per OS account, in `%APPDATA%\vcfa-import\acceptance.json`
+(Windows) or `~/.config/vcfa-import/acceptance.json` (Linux, macOS). It records
+the name, account, machine, time and the SHA-256 of the exact terms text.
+`VCFA_ACCEPTANCE_FILE` points it elsewhere, for example for a shared service
+account.
+
+**In the web console,** each person accepts for themselves. The terms fill the
+screen when someone opens the console, and nothing else works until that person
+has:
+
+1. read to the end of the terms;
+2. ticked the three statements;
+3. entered their name and typed `I ACCEPT`.
+
+The server enforces this too: until then it answers every other API call with
+`451`. Every acceptance is stored in the workspace with the console user, their
+name, the time, their address and the terms version, and it appears in the event
+log. **Help & guides** shows who accepted and has the full terms, the licence and
+the third-party notices.
+
+**When the terms change,** in a new release or by editing the file, everyone
+must accept again: an acceptance is tied to the exact text. A build that doesn't
+include its terms refuses to run at all.
+
+**Licence.** vcfa-import is licensed under the [Apache License 2.0](LICENSE);
+see [NOTICE](NOTICE). The Windows `.exe` also embeds the Python runtime and its
+libraries, under their own licences, which are listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) with full texts in `licenses/`.
+The `.pyz` contains only vcfa-import's own code.
 
 ---
 
@@ -682,6 +737,8 @@ it never touches batches it did not create.
 
 | command | what it does |
 |---|---|
+| `disclaimer` | show the terms of use and whether this account has accepted them (runs before accepting) |
+| `accept` | accept the terms of use; `--name ... --i-accept` for unattended accounts, `--revoke` to withdraw |
 | `init` | write a starter config and inventory template |
 | `discover` | pull the full VM inventory from vCenter into the local cache |
 | `browse` | the folder tree (`--folders`), facets, or a filtered list (`--json`, `--csv`) |
@@ -1087,7 +1144,7 @@ back to vCenter management. The tool is built around that fact:
 
 Exit codes: `0` ok · `1` aborted by the operator · `2` config/inventory/preflight
 problem · `3` circuit breaker · `4` finished with failures · `5` kubectl error ·
-`6` vCenter error · `7` workspace busy (another run holds it).
+`6` vCenter error · `7` workspace busy (another run holds it) · `8` terms of use not accepted.
 
 ---
 

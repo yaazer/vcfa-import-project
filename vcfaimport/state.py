@@ -210,6 +210,20 @@ CREATE TABLE IF NOT EXISTS users (
     last_seen  TEXT
 );
 
+-- who accepted the terms of use (DISCLAIMER.md) in the console, and exactly which text
+CREATE TABLE IF NOT EXISTS acceptances (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity    TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    via         TEXT,
+    client      TEXT,
+    user_agent  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_accept_identity ON acceptances(identity, sha256);
+
 -- post-import verification history (the latest result also sits on the VM)
 CREATE TABLE IF NOT EXISTS verifications (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
