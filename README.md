@@ -207,7 +207,7 @@ the `.pyz` and `.exe`.
 
 | | |
 |---|---|
-| Python | 3.11+ (standard library only — no pip install). Ubuntu 24.04 ships 3.12; on 22.04 (3.10) `sudo apt install python3.11` and run the tool with `python3.11`. The Windows `.exe` needs no Python |
+| Python | 3.11+ (standard library only — no pip install). Ubuntu 24.04 ships 3.12; on 22.04 (3.10) `sudo apt install python3.11` and run the tool with `python3.11`. The native binary and installer packages (below) need no Python at all |
 | `kubectl` | on `PATH`, logged in to the Supervisor |
 | VCF | 9.1 or later (Mobility Operator CRDs) |
 | Permissions | ability to create `importoperationbatches` in the target namespaces |
@@ -216,18 +216,45 @@ PyYAML is needed only to run the offline test suite, never by the tool itself.
 
 ## Install
 
-Three options, in order of least to most packaging:
+From least to most packaging:
 
 ```bash
 python vcfa-import.py --help          # from the source tree
 python vcfa-import.pyz --help         # single file, any OS with Python 3.11+
-vcfa-import.exe --help                # Windows, Python not required
+./vcfa-import --help                  # Linux, no Python required
+vcfa-import.exe --help                # Windows, no Python required
 ```
 
-`tools/build.py` produces the `.pyz` (no extra tooling) and, on Windows with
-PyInstaller installed, the `.exe`, plus a zip bundling both with this README,
-the lab guide, examples and source. **[LAB-GUIDE.md](LAB-GUIDE.md)** walks
-through a first run against a real Supervisor.
+`tools/build.py` produces the `.pyz` (no extra tooling needed) and, with
+PyInstaller installed, a single native binary with Python embedded -- plus a
+`.zip`/`.tar.gz` bundling that binary with this README, the lab guide, examples
+and source. PyInstaller doesn't cross-compile, so the native binary for a
+platform can only be built by running `tools/build.py` *on* that platform.
+
+**Installer packages**, for a jump box you want vcfa-import to just be "on",
+rather than a file you remember to run from somewhere:
+
+- **Windows:** `vcfa-import-<ver>-windows-amd64-setup.exe`, built with
+  [Inno Setup](https://jrsoftware.org/isinfo.php) (`winget install
+  JRSoftware.InnoSetup`, then `tools/build.py` finds `ISCC.exe` on its own).
+  Installs per-user (no admin rights needed), adds a Start Menu entry, and adds
+  itself to your `PATH`. The licence page is the Apache 2.0 licence above; the
+  terms-of-use page right after it is shown for reading only -- the installer
+  itself records no acceptance of it. `vcfa-import accept` (above) is the one
+  place acceptance is ever recorded, and it still runs at first use either way.
+- **Linux:** `vcfa-import-<ver>-linux-<arch>-installer.tar.gz` -- extract it and
+  run `./install.sh` (installs to `~/.local/share`, links into `~/.local/bin`)
+  or `sudo ./install.sh` (installs to `/opt`, links into `/usr/local/bin`).
+  `./uninstall.sh` removes it again. Built by
+  [`.github/workflows/build-linux.yml`](.github/workflows/build-linux.yml) on
+  an Ubuntu runner (PyInstaller can't cross-compile from Windows/macOS). Needs
+  glibc 2.35+ to run (Ubuntu 22.04+, Debian 12+) -- **not** RHEL 8 or 9, which
+  ship older glibc; rebuilding inside a `manylinux_2_28` container would be
+  needed for those.
+
+Either way, **[LAB-GUIDE.md](LAB-GUIDE.md)** walks through a first run against
+a real Supervisor, and `kubectl` on `PATH` and logged in is still required --
+no installer bundles it.
 
 ---
 
@@ -1409,6 +1436,31 @@ vcfa-import users disable jsmith
 
 Only a hash of each token is stored. Every job, event, state change and ledger
 line records who did it (the CLI records the OS user).
+
+**Signing in with a name and password.** Links are optional. Give a person a
+password and they sign in at the console's front page instead:
+
+```bash
+vcfa-import users add jsmith --role operator --password   # asks twice; no link is issued
+vcfa-import users passwd jsmith                           # set or reset (asks twice)
+```
+
+In the console an admin does the same from Settings -> People (*Add person* with
+a password, or *Set password* / *Reset password* on a row), and people change
+their own with *Password* in the top bar. Passwords are 8-256 characters, stored
+only as salted PBKDF2-SHA256 hashes, and never taken on the command line.
+
+- Signing in returns a session that lives in memory only: it ends after 8 idle
+  hours or 24 hours in all, on *Sign out*, when the person is disabled or has
+  their password reset, and whenever the console restarts. Role changes apply
+  immediately.
+- Five wrong passwords for a name pause sign-in for that name for five minutes
+  (so someone can lock a name out briefly); from a non-loopback address, twenty
+  wrong ones pause that address. Every failure is an event.
+- The links and the start-up token keep working next to passwords. The
+  start-up token is how the first admin is created, so keep it.
+- **Passwords cross the wire in clear text over plain HTTP.** Keep the console
+  on `127.0.0.1` and reach it through an SSH tunnel, as for the token.
 
 ### Workspace settings
 

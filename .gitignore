@@ -19,6 +19,7 @@ build/
 *.exe
 *.zip
 *.7z
+*.tar.gz
 
 # python
 __pycache__/

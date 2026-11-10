@@ -1,0 +1,38 @@
+name: build-linux
+
+# PyInstaller doesn't cross-compile, so the Linux native binary/installer has to be
+# built on Linux. ubuntu-22.04 is pinned on purpose, not ubuntu-latest: a PyInstaller
+# ELF binary only runs on a glibc at least as new as the machine that built it, and
+# 22.04's glibc 2.35 is already newer than RHEL 8 (2.28) or RHEL 9 (2.34) ship -- a
+# build here will NOT run on either RHEL. It covers Ubuntu 22.04+/Debian 12+ jump
+# boxes. If RHEL targets matter, build inside a manylinux_2_28 container instead.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyinstaller==6.22.2   # match the version the Windows build was verified with
+
+      - run: python tools/build.py
+
+      - run: python tests/run_tests.py --unit-only
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vcfa-import-linux
+          path: |
+            dist/vcfa-import.pyz
+            dist/vcfa-import
+            dist/vcfa-import-*-linux-*.tar.gz
+          if-no-files-found: error
