@@ -159,6 +159,7 @@ class WebApp:
         self._scheduler: Optional[threading.Thread] = None
         self._scheduler_stop = threading.Event()
         self._accepted: set = set()             # (console user, terms sha256) known to have accepted
+        self.sessions = access.Sessions()       # password sign-ins; memory only
 
     def _effective_cfg(self) -> Config:
         """The TOML baseline with the workspace settings layered on."""
@@ -1137,9 +1138,14 @@ class WebApp:
 
     # ================================================================ identity
     def identify(self, token: str) -> Optional[Dict[str, Any]]:
-        """A named user's token -> {name, role}; None when unknown or disabled."""
+        """A session or a named user's token -> {name, role}; None when unknown or disabled."""
         with self.lock:
-            user = access.authenticate(self.store, token)
+            session_user = self.sessions.lookup(token)
+            if session_user is not None:
+                row = access.user_row(self.store, session_user)      # role and disabled read fresh
+                user = {"name": row["name"], "role": row["role"]} if row else None
+            else:
+                user = access.authenticate(self.store, token)
             if user:
                 seen = getattr(self, "_seen", {})
                 self._seen = seen
@@ -1514,13 +1520,89 @@ class WebApp:
             return {"users": access.list_users(self.store), "roles": list(access.ROLES)}
 
     def users_add(self, q, body) -> Dict[str, Any]:
+        password = body.get("password")
+        if password is not None and not isinstance(password, str):
+            raise ApiError(400, "password must be text")
+        try:
+            pw_hash = access.hash_password(password) if password else None     # slow: before the lock
+        except access.AccessError as exc:
+            raise ApiError(400, str(exc))
         with self.lock:
             try:
                 token = access.create_user(self.store, str(body.get("name") or ""), str(body.get("role") or ""),
-                                           self._actor())
+                                           self._actor(), pw_hash=pw_hash)
             except access.AccessError as exc:
                 raise ApiError(400, str(exc))
+            if password:
+                self.sessions.end_user(str(body.get("name")).strip())
         return {"name": body.get("name"), "token": token}
+
+    def users_password(self, q, body, name: str) -> Dict[str, Any]:
+        """An admin sets (or resets) someone's password; that user is signed out everywhere."""
+        password = body.get("password")
+        if not isinstance(password, str):
+            raise ApiError(400, "password is required")
+        try:
+            pw_hash = access.hash_password(password)
+        except access.AccessError as exc:
+            raise ApiError(400, str(exc))
+        with self.lock:
+            try:
+                access.set_password(self.store, name, password, self._actor(), pw_hash=pw_hash)
+            except access.AccessError as exc:
+                raise ApiError(400 if "password" in str(exc) else 404, str(exc))
+            self.sessions.end_user(name)
+            return {"users": access.list_users(self.store)}
+
+    # ----------------------------------------------------------- sign-in
+    def login(self, q, body) -> Dict[str, Any]:
+        """Open to anyone: a name and password in, a session token out (sent as X-VCFA-Token)."""
+        name, password = body.get("name"), body.get("password")
+        if not isinstance(name, str) or not isinstance(password, str) or not name.strip() or not password:
+            raise ApiError(400, "name and password are required")
+        if len(name) > 64 or len(password) > access.PASSWORD_MAX:
+            raise ApiError(401, "wrong name or password")
+        client = getattr(CTX, "client", None) or "?"
+        try:
+            got = access.login(self.store, self.lock, self.sessions, name, password, client)
+        except access.LoginThrottled as exc:
+            raise ApiError(429, str(exc))
+        except access.LoginDenied as exc:
+            raise ApiError(401, str(exc))
+        return {"token": got["session"], "user": {"name": got["name"], "role": got["role"]}}
+
+    def logout(self, q, body) -> Dict[str, Any]:
+        token = getattr(CTX, "token", None)
+        if token:
+            self.sessions.end(token)
+        return {"ok": True}
+
+    def password_change(self, q, body) -> Dict[str, Any]:
+        """Change your own password. Needs the current one; other sign-ins of yours end."""
+        user = current_user()
+        current, new = body.get("current"), body.get("password")
+        if not isinstance(current, str) or not isinstance(new, str):
+            raise ApiError(400, "current and new password are required")
+        with self.lock:
+            row = access.user_row(self.store, user["name"])
+        if row is None or not row["password_hash"]:
+            raise ApiError(400, "this sign-in has no password; ask an admin to set one")
+        if self.sessions.throttled(user["name"], "?"):
+            raise ApiError(429, "too many failed attempts; wait a few minutes")
+        if not access.verify_password(row["password_hash"], current):
+            self.sessions.fail(user["name"], "?")
+            raise ApiError(401, "the current password is wrong")
+        try:
+            pw_hash = access.hash_password(new)
+        except access.AccessError as exc:
+            raise ApiError(400, str(exc))
+        with self.lock:
+            try:
+                access.set_password(self.store, user["name"], new, user["name"], pw_hash=pw_hash)
+            except access.AccessError as exc:
+                raise ApiError(400, str(exc))
+        self.sessions.end_user(user["name"], keep=getattr(CTX, "token", None))
+        return {"ok": True}
 
     def users_toggle(self, q, body, name: str, action: str) -> Dict[str, Any]:
         with self.lock:
@@ -1597,6 +1679,10 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/users", "users_list"),
         ("POST", r"/api/users", "users_add"),
         ("POST", r"/api/users/(?P<name>[\w.@-]+)/(?P<action>disable|enable)", "users_toggle"),
+        ("POST", r"/api/users/(?P<name>[\w.@-]+)/password", "users_password"),
+        ("POST", r"/api/login", "login"),
+        ("POST", r"/api/logout", "logout"),
+        ("POST", r"/api/password", "password_change"),
         ("GET", r"/api/export/(?P<name>tracker\.csv|transitions\.csv|ledger\.jsonl|report\.html)",
          "export"),
     ]
@@ -1605,12 +1691,14 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
 # Errors that are the user's to fix, reported as 400 rather than 500.
 USER_ERRORS = (SelectionError, ValueError, VCenterError, sch.ScheduleError)
 # Who may call what: GETs need a viewer, other calls an operator, these an admin.
-ADMIN_HANDLERS = {"settings_put", "notify_test", "users_list", "users_add", "users_toggle",
+ADMIN_HANDLERS = {"settings_put", "notify_test", "users_list", "users_add", "users_toggle", "users_password",
                   "reset_preview", "reset_run"}
+# The one call that needs no token: it is how a person gets one.
+PRE_AUTH = {"login"}
 FORBIDDEN_ERRORS = (access.AccessError,)
 # The only calls allowed before a console user has accepted the terms of use (the rest get 451),
 # and the one change any role may make: accepting them.
-LEGAL_OPEN = {"legal_status", "legal_accept", "docs", "me"}
-ANY_ROLE_HANDLERS = {"legal_accept"}
+LEGAL_OPEN = {"legal_status", "legal_accept", "docs", "me", "logout"}
+ANY_ROLE_HANDLERS = {"legal_accept", "logout", "password_change"}
 # Errors meaning "not now": reported as 409 Conflict.
 BUSY_ERRORS = (service.WorkspaceBusy,)

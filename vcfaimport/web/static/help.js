@@ -63,7 +63,7 @@ const GLOSSARY = {
   verification: { t: 'Post-import verification', d: 'Checks each committed VM: powered on, VMware Tools running, the same IP as before, ping, and any TCP ports from Settings. It never changes a VM’s state.', doc: RM('post-import-verification') },
   change_window: { t: 'Change window', d: 'Runs a precheck or import unattended between two times, and never starts a batch that could not finish before the end.', doc: RM('change-windows') },
   approval: { t: 'Two-person rule', d: 'A gated step becomes a request that someone other than the requester approves. It then runs once, on behalf of both.', doc: RM('the-two-person-rule') },
-  roles: { t: 'Roles', d: 'viewer looks and changes nothing; operator runs imports and approves other people’s requests; admin also changes settings and manages people.', doc: RM('people-roles-and-read-only-links') },
+  roles: { t: 'Roles', d: 'viewer looks and changes nothing; operator runs imports and approves other people’s requests; admin also changes settings and manages people. People sign in with a name and password, or with a personal link.', doc: RM('people-roles-and-read-only-links') },
   notify: { t: 'Notifications', d: 'Teams, Slack, a webhook or email when runs finish, fail, or need a decision. Delivery failures are logged and never stop a run.', doc: RM('notifications') },
   workspace_setting: { t: 'Workspace settings', d: 'Override the TOML file for this workspace, for the console and the CLI alike. ↺ returns a setting to the file’s value.', doc: RM('workspace-settings') },
   insecure: { t: 'Skip TLS verification', d: 'Accepts vCenter’s certificate without checking it. Fine for a lab with a self-signed certificate, not for production.', tone: 'warn' },

@@ -682,6 +682,25 @@ const SCENARIOS = {
     check('the gate is gone', !document.querySelector('#token-in'));
   },
 
+  async signin() {
+    await open('overview');
+    const made = await POST('/api/users', { name: 'sam', role: 'operator', password: 'sam has a password' });
+    check('a person with a password gets no link', made.token === '');
+    click('[data-act="signOut"]');
+    check('signing out shows the gate', await waitFor(() => document.querySelector('#login-name'), 10000));
+    check('the stored token is forgotten', !localStorage.getItem('vcfa-token'));
+    type('#login-name', 'sam');
+    type('#login-pw', 'not the password');
+    click('[data-act="signIn"]');
+    check('a wrong password is explained on the gate', await waitFor(() => /wrong name or password/.test(document.querySelector('#login-err').textContent), 10000));
+    check('the password box is cleared', document.querySelector('#login-pw').value === '');
+    type('#login-pw', 'sam has a password');
+    click('[data-act="signIn"]');
+    check('the right password signs in (the terms come first for a new person)',
+      await waitFor(() => document.querySelector('#terms-gate') && S.token && S.token !== HP.get('t'), 15000));
+    check('the session is not the start-up token', S.token !== HP.get('t'));
+  },
+
   async theme() {
     await open('overview');
     check('the sidebar carries the app icon', document.querySelector('.brand .logo svg.appicon .ai-vm'));
@@ -1403,7 +1422,7 @@ def run_chrome(chrome, url, profile, size, budget):
 
 
 SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
-             "resilience", "token", "theme", "palette", "stream", "govern", "help", "flow", "reset", "terms"]
+             "resilience", "token", "signin", "theme", "palette", "stream", "govern", "help", "flow", "reset", "terms"]
 
 
 def main():

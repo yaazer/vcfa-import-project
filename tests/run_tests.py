@@ -4674,6 +4674,138 @@ def t_readiness_exclusion():
         store.close()
 
 
+@test("web console: password sign-in -- sessions, throttle, expiry, disable, logout, password changes")
+def t_web_password_login():
+    from vcfaimport import access
+    saved = access.PBKDF2_ITERATIONS
+    access.PBKDF2_ITERATIONS = 1000                 # the real figure costs ~0.3 s a hash
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            c = _Console(tmp)
+            try:
+                login = lambda n, p: c.call("POST", "/api/login", {"name": n, "password": p}, token=False)
+                # an admin adds people with passwords; no link is handed out for them
+                r = c.ok("POST", "/api/users", {"name": "pam", "role": "operator", "password": "correct horse"})
+                eq(r["token"], "", "a password user gets no link")
+                c.ok("POST", "/api/users", {"name": "quin", "role": "viewer", "password": "battery staple"})
+                eq(c.call("POST", "/api/users", {"name": "bad", "role": "viewer", "password": "short"})[0], 400)
+                eq(c.call("POST", "/api/users", {"name": "bad", "role": "viewer", "password": 12345678})[0], 400)
+                link = c.ok("POST", "/api/users", {"name": "linda", "role": "viewer"})["token"]
+                users = {u["name"]: u for u in c.ok("GET", "/api/users")["users"]}
+                assert users["pam"]["has_password"] and not users["linda"]["has_password"], users
+                assert "correct horse" not in json.dumps([dict(x) for x in c.app.store.conn.execute("SELECT * FROM users")])
+                # sign in with no token at all; every other route still wants one
+                eq(c.call("GET", "/api/me", token=False)[0], 401)
+                status, body, _ = login("pam", "correct horse")
+                eq(status, 200)
+                eq(body["user"], {"name": "pam", "role": "operator"})
+                sess = body["token"]
+                eq(c.call("GET", "/api/me", token=sess)[1]["user"], {"name": "pam", "role": "operator"})
+                eq(c.call("GET", "/api/users", token=sess)[0], 403, "roles apply to a session")
+                # wrong password, unknown name and a link-only user are told apart by nobody
+                bad = [login("pam", "wrong password"), login("nobody", "whatever1"), login("linda", "whatever1")]
+                eq([b[0] for b in bad], [401, 401, 401])
+                eq(len({b[1]["error"] for b in bad}), 1, "one message for every failure")
+                eq(login("pam", None)[0], 400)
+                eq(login(["pam"], "x")[0], 400)
+                eq(c.call("POST", "/api/login", {"name": "pam"}, token=False)[0], 400)
+                eq(c.call("POST", "/api/login", None, token=False)[0], 400)
+                # a failed attempt is audited without letting the typed name pose as the actor
+                ev = c.app.store.conn.execute("SELECT * FROM events WHERE message LIKE 'failed sign-in%'").fetchall()
+                assert ev and all(e["actor"] != "pam" for e in ev), [dict(e) for e in ev]
+                # throttle: five wrong passwords lock the name, even for the right one
+                for _ in range(5):
+                    login("quin", "not the one")
+                eq(login("quin", "battery staple")[0], 429)
+                eq(login("pam", "correct horse")[0], 200, "another name is unaffected")
+                # idle expiry
+                clock = [1000.0]
+                c.app.sessions._clock = lambda: clock[0]
+                s2 = login("pam", "correct horse")[1]["token"]
+                eq(c.call("GET", "/api/me", token=s2)[0], 200)
+                clock[0] += access.Sessions.IDLE_SECONDS + 1
+                eq(c.call("GET", "/api/me", token=s2)[0], 401, "an idle session ends")
+                # disabling a person ends their session at once; enabling does not revive it
+                s3 = login("pam", "correct horse")[1]["token"]
+                c.ok("POST", "/api/users/pam/disable", {})
+                eq(c.call("GET", "/api/me", token=s3)[0], 401)
+                eq(login("pam", "correct horse")[0], 401, "a disabled user cannot sign in")
+                c.ok("POST", "/api/users/pam/enable", {})
+                eq(c.call("GET", "/api/me", token=s3)[0], 200, "the session was never dropped, only refused while disabled")
+                # logout
+                s4 = login("pam", "correct horse")[1]["token"]
+                eq(c.call("POST", "/api/logout", {}, token=s4)[0], 200)
+                eq(c.call("GET", "/api/me", token=s4)[0], 401)
+                # changing your own password
+                s5 = login("pam", "correct horse")[1]["token"]
+                s6 = login("pam", "correct horse")[1]["token"]
+                eq(c.call("POST", "/api/password", {"current": "nope nope", "password": "a new secret"}, token=s5)[0], 401)
+                eq(c.call("POST", "/api/password", {"current": "correct horse", "password": "short"}, token=s5)[0], 400)
+                eq(c.call("POST", "/api/password", {"current": "correct horse", "password": "a new secret"}, token=s5)[0], 200)
+                eq(c.call("GET", "/api/me", token=s5)[0], 200, "this session stays")
+                eq(c.call("GET", "/api/me", token=s6)[0], 401, "the others end")
+                eq(login("pam", "correct horse")[0], 401)
+                eq(login("pam", "a new secret")[0], 200)
+                eq(c.call("POST", "/api/password", {"current": "x", "password": "another one"}, token=link)[0], 400,
+                   "a link-only user has no password to change")
+                eq(c.call("POST", "/api/password", {"current": "x", "password": "another one"})[0], 400, "nor does the owner")
+                # an admin reset signs the person out everywhere; the link and password are separate
+                s7 = login("pam", "a new secret")[1]["token"]
+                eq(c.call("POST", "/api/users/pam/password", {"password": "reset by admin"}, token=s7)[0], 403)
+                c.ok("POST", "/api/users/pam/password", {"password": "reset by admin"})
+                eq(c.call("GET", "/api/me", token=s7)[0], 401)
+                eq(login("pam", "reset by admin")[0], 200)
+                eq(c.call("POST", "/api/users/nobody/password", {"password": "reset by admin"})[0], 404)
+                eq(c.call("POST", "/api/users/pam/password", {"password": 5})[0], 400)
+                c.ok("POST", "/api/users", {"name": "pam", "role": "operator"})      # re-issue a link
+                eq(login("pam", "reset by admin")[0], 200, "re-issuing a link keeps the password")
+                eq(c.call("GET", "/api/me", token=link)[0], 200, "link tokens still work")
+                eq(c.call("GET", "/api/me")[0], 200, "the start-up token still works")
+            finally:
+                c.close()
+    finally:
+        access.PBKDF2_ITERATIONS = saved
+
+
+@test("passwords: stored salted and hashed, malformed hashes fail closed, old databases gain the column")
+def t_password_storage():
+    from vcfaimport import access
+    from vcfaimport.state import Store
+    saved = access.PBKDF2_ITERATIONS
+    access.PBKDF2_ITERATIONS = 1000
+    try:
+        a, b = access.hash_password("same password"), access.hash_password("same password")
+        assert a != b and a.startswith("pbkdf2_sha256$1000$") and "same password" not in a
+        assert access.verify_password(a, "same password") and not access.verify_password(a, "Same password")
+        for junk in (None, "", "plain", "md5$1$aa$bb", "pbkdf2_sha256$x$aa$bb", "pbkdf2_sha256$1000$zz$zz",
+                     "pbkdf2_sha256$99999999999$aa$bb", "pbkdf2_sha256$1000$aa$"):
+            assert not access.verify_password(junk, "same password"), junk
+        for bad in (None, 5, "short", "x" * 257):
+            try:
+                access.hash_password(bad)
+            except access.AccessError:
+                continue
+            raise AssertionError("accepted {!r}".format(bad))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.db")
+            import sqlite3
+            old = sqlite3.connect(path)
+            old.execute("CREATE TABLE users (name TEXT PRIMARY KEY, role TEXT NOT NULL, token_hash TEXT NOT NULL,"
+                        " created_at TEXT NOT NULL, created_by TEXT, disabled INTEGER NOT NULL DEFAULT 0, last_seen TEXT)")
+            old.execute("INSERT INTO users(name, role, token_hash, created_at) VALUES('ada', 'admin', 'x', 'now')")
+            old.commit()
+            old.close()
+            s = Store(path)
+            try:
+                eq([u["has_password"] for u in access.list_users(s)], [False], "an old user row survives, link-only")
+                access.set_password(s, "ada", "a long password", "test")
+                assert access.list_users(s)[0]["has_password"]
+            finally:
+                s.conn.close()
+    finally:
+        access.PBKDF2_ITERATIONS = saved
+
+
 @test("web console: named users and roles; settings, apps, readiness and notify-test endpoints")
 def t_web_roles_settings():
     cap = _Capture()
@@ -6049,6 +6181,7 @@ UNIT = [
     t_http_non_loopback, t_http_concurrent_edits, t_workspace_lock, t_web_lock_conflict,
     t_jobs_edge_cases, t_web_map_edges, t_stale_map_entries, t_web_stale_map_entries, t_web_stage_edges, t_web_hostile_names,
     t_triage_normalisation, t_web_missing_things,
+    t_web_password_login, t_password_storage,
 ]
 
 E2E = [

@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..config import ConfigError
 from .. import access
-from .api import (ADMIN_HANDLERS, ANY_ROLE_HANDLERS, BUSY_ERRORS, CTX, FORBIDDEN_ERRORS, LEGAL_OPEN, OWNER, ROUTES,
+from .api import (ADMIN_HANDLERS, ANY_ROLE_HANDLERS, BUSY_ERRORS, CTX, FORBIDDEN_ERRORS, LEGAL_OPEN, OWNER, PRE_AUTH, ROUTES,
                   USER_ERRORS, ApiError, WebApp)
 from .jobs import JobBusy
 
@@ -224,19 +224,23 @@ class Handler(BaseHTTPRequestHandler):
             if not match or route_method != method:
                 continue
             is_export = handler_name == "export"
-            user = self._user(query, allow_query=is_export)
-            if user is None:
-                self._error(401, "missing or wrong access token")
-                return
-            needed = self._needed_role(method, handler_name)
-            if not access.allows(user["role"], needed):
-                self._error(403, "{} is a {}; this needs the {} role".format(user["name"], user["role"], needed))
-                return
-            # Terms of use: nothing else answers until this person has accepted them.
-            if handler_name not in LEGAL_OPEN and not self.app.terms_accepted(user):
-                self._error(451, "accept the terms of use (DISCLAIMER.md) before using vcfa-import")
-                return
+            if handler_name in PRE_AUTH:
+                user = None             # signing in: there is no token yet
+            else:
+                user = self._user(query, allow_query=is_export)
+                if user is None:
+                    self._error(401, "missing or wrong access token")
+                    return
+                needed = self._needed_role(method, handler_name)
+                if not access.allows(user["role"], needed):
+                    self._error(403, "{} is a {}; this needs the {} role".format(user["name"], user["role"], needed))
+                    return
+                # Terms of use: nothing else answers until this person has accepted them.
+                if handler_name not in LEGAL_OPEN and not self.app.terms_accepted(user):
+                    self._error(451, "accept the terms of use (DISCLAIMER.md) before using vcfa-import")
+                    return
             CTX.user = user
+            CTX.token = self.headers.get("X-VCFA-Token") or ""
             CTX.client = self.client_address[0] if self.client_address else None
             CTX.user_agent = self.headers.get("User-Agent", "")
             try:
@@ -260,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             finally:
                 CTX.user = None
+                CTX.token = None
             if is_export:
                 data, kind, name = result
                 self._send(200, data, kind + "; charset=utf-8",

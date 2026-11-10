@@ -1462,6 +1462,31 @@ only as salted PBKDF2-SHA256 hashes, and never taken on the command line.
 - **Passwords cross the wire in clear text over plain HTTP.** Keep the console
   on `127.0.0.1` and reach it through an SSH tunnel, as for the token.
 
+**Signing in with a name and password.** Links are optional. Give a person a
+password and they sign in at the console's front page instead:
+
+```bash
+vcfa-import users add jsmith --role operator --password   # asks twice; no link is issued
+vcfa-import users passwd jsmith                           # set or reset (asks twice)
+```
+
+In the console an admin does the same from Settings -> People (*Add person* with
+a password, or *Set password* / *Reset password* on a row), and people change
+their own with *Password* in the top bar. Passwords are 8-256 characters, stored
+only as salted PBKDF2-SHA256 hashes, and never taken on the command line.
+
+- Signing in returns a session that lives in memory only: it ends after 8 idle
+  hours or 24 hours in all, on *Sign out*, when the person is disabled or has
+  their password reset, and whenever the console restarts. Role changes apply
+  immediately.
+- Five wrong passwords for a name pause sign-in for that name for five minutes
+  (so someone can lock a name out briefly); from a non-loopback address, twenty
+  wrong ones pause that address. Every failure is an event.
+- The links and the start-up token keep working next to passwords. The
+  start-up token is how the first admin is created, so keep it.
+- **Passwords cross the wire in clear text over plain HTTP.** Keep the console
+  on `127.0.0.1` and reach it through an SSH tunnel, as for the token.
+
 ### Workspace settings
 
 Pacing, safety, governance, application and verification settings can be

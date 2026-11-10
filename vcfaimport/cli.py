@@ -1331,6 +1331,15 @@ def cmd_settings(args) -> int:
     return 0
 
 
+def _ask_password() -> str:
+    """Prompt twice; a password never travels on the command line."""
+    import getpass
+    first = getpass.getpass("password: ")
+    if first != getpass.getpass("again: "):
+        raise SystemExit("the two entries differ; nothing changed")
+    return first
+
+
 def cmd_users(args) -> int:
     _cfg, store, _kube, _engine = _open(args)
     if args.action == "list":
@@ -1339,8 +1348,16 @@ def cmd_users(args) -> int:
                          [[u["name"], u["role"], u["created_at"], u["created_by"] or "", "yes" if u["disabled"] else "",
                            u["last_seen"] or ""] for u in rows], indent="  ") if rows else "no users yet")
         return 0
+    if args.action == "passwd":
+        access.set_password(store, args.name, _ask_password(), store.actor)
+        log("password set for {}".format(args.name))
+        return 0
     if args.action == "add":
-        token = access.create_user(store, args.name, args.role, store.actor)
+        password = _ask_password() if args.password else None
+        token = access.create_user(store, args.name, args.role, store.actor, password=password)
+        if password:
+            log("{} ({}) -- signs in to the console with that name and password".format(args.name, args.role))
+            return 0
         log("{} ({}) -- personal console link (shown once; keep it private):".format(args.name, args.role))
         log("  http://127.0.0.1:<port>/#t={}".format(token))
         return 0
@@ -1772,9 +1789,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("pairs", nargs="*", help="set: key=value ...; reset: key ...")
 
     sp = add("users", cmd_users, "console users: viewer, operator, admin")
-    sp.add_argument("action", choices=["add", "list", "disable", "enable"])
+    sp.add_argument("action", choices=["add", "list", "disable", "enable", "passwd"])
     sp.add_argument("name", nargs="?")
     sp.add_argument("--role", choices=list(access.ROLES), default="operator")
+    sp.add_argument("--password", action="store_true",
+                    help="add: ask for a password (the user signs in by name) instead of issuing a link")
 
     sp = add("approvals", cmd_approvals, "the two-person rule for require_approval stages")
     sp.add_argument("action", choices=["list", "request", "approve", "reject"])

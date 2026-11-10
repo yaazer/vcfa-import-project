@@ -242,7 +242,7 @@ async function api(method, path, body) {
   }
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
-  if (res.status === 401) { tokenGate(); throw new ApiErr('The access token is missing or out of date.', 401); }
+  if (res.status === 401 && path !== '/api/login' && path !== '/api/password') { tokenGate(); throw new ApiErr('Your sign-in has ended or the access token is out of date.', 401); }
   if (res.status === 451) { termsGate(); throw new ApiErr('Accept the terms of use first.', 451); }
   if (!res.ok) throw new ApiErr((data && data.error) || res.status + ' ' + res.statusText, res.status);
   return data;
@@ -265,12 +265,18 @@ function initToken() {
 function tokenGate() {
   S.gated = true;
   mount($('#view'), html`<div class="card" style="max-width:520px;margin:8vh auto">
-    <div class="card-h"><span class="gate-mark">${appIcon()}</span><h3>Access token needed</h3></div>
+    <div class="card-h"><span class="gate-mark">${appIcon()}</span><h3>Sign in</h3></div>
     <div class="card-b stack">
-      <p class="muted" style="margin:0">Open the link printed by <code>vcfa-import serve</code>, or paste the token from it
-      (the part after <code>#t=</code>). A new token is issued each time the console starts unless <code>--token</code> is given.</p>
-      <input class="input mono" id="token-in" placeholder="token" autocomplete="off">
-      <div><button class="btn primary" data-act="setToken">${icon('key')} Continue</button></div>
+      <p class="muted" style="margin:0">Use the name and password an admin set up for you. Over plain HTTP the password travels
+      unencrypted: keep the console on <code>127.0.0.1</code> and reach it through an SSH tunnel.</p>
+      <input class="input" id="login-name" placeholder="name" autocomplete="username" maxlength="64" data-enter="signIn">
+      <input class="input" id="login-pw" type="password" placeholder="password" autocomplete="current-password" data-enter="signIn">
+      <div><button class="btn primary" data-act="signIn">${icon('key')} Sign in</button> <span class="small bad-text" id="login-err"></span></div>
+      <details><summary class="small muted">Use an access token instead</summary>
+        <div class="stack mt-s"><p class="muted small" style="margin:0">Open the link printed by <code>vcfa-import serve</code>, or paste the token from it
+        (the part after <code>#t=</code>). A new token is issued each time the console starts unless <code>--token</code> is given.</p>
+        <input class="input mono" id="token-in" placeholder="token" autocomplete="off" data-enter="setToken">
+        <div><button class="btn" data-act="setToken">Continue</button></div></div></details>
     </div></div>`);
   $('#topbar').innerHTML = '';
 }
@@ -965,8 +971,10 @@ function renderTopbar() {
     <button class="btn ghost sm" data-act="palette" title="Command palette (Ctrl+K)">${icon('search')}<span class="kbd">ctrl k</span></button>
     <button class="btn ghost icon" data-act="help" title="Help & guides: the tour, the lab guide, the glossary" aria-label="Help">${icon('help')}</button>
     <button class="btn ghost icon" data-act="theme" title="Theme Studio">${icon('palette')}</button>
-    ${userChip()}`);
-  const who = typeof me === 'function' ? me() : null;
+    ${userChip()}
+    ${typeof me === 'function' && me().name !== 'owner' ? html`<button class="btn ghost sm" data-act="changePassword" title="Change your password">Password</button>` : ''}
+    <button class="btn ghost sm" data-act="signOut" title="Sign out of this console">Sign out</button>`);
+  const who =typeof me === 'function' ? me() : null;
   if (who) document.body.dataset.role = who.role;
 }
 function userChip() {
@@ -1054,6 +1062,31 @@ const GLOBAL_ACT = {
   theme: () => FX.openStudio(),
   palette: () => FX.openPalette(),
   navGroup: (t) => { const g = t.dataset.g; NAVG[g] = !NAVG[g]; saveNavGroups(); renderNav(); },
+  signIn: async () => {
+    const name = ($('#login-name').value || '').trim(), password = $('#login-pw').value || '', err = $('#login-err');
+    if (!name || !password) { err.textContent = 'Enter a name and a password.'; return; }
+    err.textContent = '';
+    try {
+      const r = await POST('/api/login', { name, password });
+      S.token = r.token; store.set('vcfa-token', r.token); S.gated = false; S.pulse = null; S.info = null;
+      boot();
+    } catch (e) { err.textContent = e.message; $('#login-pw').value = ''; }
+  },
+  signOut: async () => {
+    try { await POST('/api/logout'); } catch (e) { /* the token may be gone already */ }
+    S.token = null; store.set('vcfa-token', null); S.pulse = null; S.info = null; tokenGate();
+  },
+  changePassword: async () => {
+    const r = await modal({ title: 'Change your password', ic: 'key', confirm: 'Change',
+      body: html`<div class="stack">
+        <input class="input" type="password" data-field="current" placeholder="current password" autocomplete="current-password">
+        <input class="input" type="password" data-field="password" placeholder="new password (8 characters or more)" autocomplete="new-password">
+        <input class="input" type="password" data-field="again" placeholder="new password again" autocomplete="new-password"></div>` });
+    if (!r || r === true) return;
+    if (r.password !== r.again) { toast('The two new passwords differ', '', 'warn'); return; }
+    try { await POST('/api/password', { current: r.current, password: r.password }); toast('Password changed', 'Your other sign-ins have ended.', 'ok', 4000); }
+    catch (e) { toast('Password not changed', e.message, 'bad'); }
+  },
   setToken: () => {
     const v = ($('#token-in').value || '').trim().replace(/^.*#t=/, '');
     if (!v) return;

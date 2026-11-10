@@ -24,7 +24,10 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 - **CLI and web console must not diverge.** Put behaviour in the engine, store or
   `service.py`; `cli.py` and `web/api.py` only parse input and format output.
 - Web console: no external assets (no CDN, no web fonts; the jump box may be air-gapped),
-  every `/api` call needs the `X-VCFA-Token` header, and cluster-changing endpoints
+  every `/api` call needs the `X-VCFA-Token` header (the one exception is `POST /api/login`,
+  `api.PRE_AUTH`, which trades a name + password for a session token sent in that same header;
+  sessions are in-memory, role/disabled are re-read per request, passwords are salted
+  PBKDF2 and never on argv or in logs), and cluster-changing endpoints
   require `"confirm": true` on the server side too. Only one job runs at a time.
 - **A finished wave** (every VM committed or skipped, `engine.wave_finished`) can have all its batch
   objects deleted (`engine.cleanup_plan` / `delete_batches`, Execute step "Clean up finished waves",

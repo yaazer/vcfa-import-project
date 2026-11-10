@@ -240,6 +240,9 @@ CREATE INDEX IF NOT EXISTS idx_verif_moref ON verifications(moref);
 # Columns added after the first release. CREATE TABLE IF NOT EXISTS will not add
 # them to a database that already exists, so _migrate() does it explicitly.
 ADDED_COLUMNS = {
+    "users": [
+        ("password_hash", "TEXT"),
+    ],
     "vms": [
         ("src_vcenter", "TEXT NOT NULL DEFAULT ''"),
         ("src_cluster", "TEXT NOT NULL DEFAULT ''"),

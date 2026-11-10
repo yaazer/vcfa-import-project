@@ -403,12 +403,24 @@ VIEWS.settings = view({
     async userAdd(t, e, v) {
       const name = ($('#u-name').value || '').trim(), role = $('#u-role').value;
       if (!name) { toast('Enter a user name', '', 'warn'); return; }
-      const r = await POST('/api/users', { name, role });
+      const password = $('#u-pw').value || '';
+      const r = await POST('/api/users', password ? { name, role, password } : { name, role });
+      if (password) { toast('Person added', name + ' signs in with that name and password.', 'ok', 4000); v.refresh(); return; }
       const link = location.origin + '/#t=' + encodeURIComponent(r.token);
       await modal({ title: 'Personal link for ' + name, ic: 'key', confirm: null, cancel: 'Done', wide: true,
         body: html`<p>Send this to <b>${name}</b> (${role}). It is shown <b>once</b>; issuing a new link for the same name retires this one.</p>
           <div class="linkbox"><input class="input mono" readonly value="${link}" id="u-link" onfocus="this.select()"><button class="btn" data-act="copyLink">Copy</button></div>
           <p class="small muted">${role === 'viewer' ? 'A viewer can look at everything and change nothing.' : role === 'operator' ? 'An operator runs discovery, prechecks and imports, and approves other people’s requests.' : 'An admin can also change settings and manage people.'}</p>` });
+      v.refresh();
+    },
+    async userPassword(t, e, v) {
+      const name = t.dataset.name;
+      const r = await modal({ title: 'Password for ' + name, ic: 'key', confirm: 'Set password',
+        body: html`<p>This signs ${name} out everywhere. Pass the new password on in person; they can change it themselves afterwards.</p>
+          <input class="input" type="password" data-field="password" placeholder="new password (8 characters or more)" autocomplete="new-password">` });
+      if (!r || r === true || !r.password) return;
+      await POST('/api/users/' + encodeURIComponent(name) + '/password', { password: r.password });
+      toast('Password set', name, 'ok', 3000);
       v.refresh();
     },
     async userToggle(t, e, v) {
@@ -486,16 +498,18 @@ function notifyCard(v, admin) {
 }
 function usersCard(v) {
   return html`<div class="card mt"><div class="card-h"><h3>People ${tip('roles')}</h3><span class="sub">personal links; everything they do is recorded under their name</span></div>
-    <div class="table-wrap"><table class="t compact"><thead><tr><th>User</th><th>Role</th><th>Created</th><th>Last seen</th><th></th></tr></thead><tbody>
-      <tr><td><b>owner</b> <span class="tiny faint">the link printed at start-up</span></td><td><span class="tag">admin</span></td><td></td><td></td><td></td></tr>
+    <div class="table-wrap"><table class="t compact"><thead><tr><th>User</th><th>Role</th><th>Created</th><th>Last seen</th><th>Sign-in</th><th></th></tr></thead><tbody>
+      <tr><td><b>owner</b> <span class="tiny faint">the link printed at start-up</span></td><td><span class="tag">admin</span></td><td></td><td></td><td class="small muted">link</td><td></td></tr>
       ${(v.users || []).map((u) => html`<tr class="${u.disabled ? 'off' : ''}"><td><b>${u.name}</b></td><td><span class="tag ${u.role === 'admin' ? 'warn' : u.role === 'viewer' ? '' : 'info'}">${u.role}</span></td>
         <td class="small muted">${fmtTime(u.created_at, true)} by ${u.created_by || '?'}</td><td class="small muted">${u.last_seen ? fmtAgo(u.last_seen) : 'never'}</td>
-        <td class="right">${u.disabled ? html`<button class="btn xs" data-act="userToggle" data-name="${u.name}" data-to="enable">Enable</button>`
+        <td class="small muted">${u.has_password ? 'password' : 'link'}</td>
+        <td class="right"><button class="btn xs" data-act="userPassword" data-name="${u.name}">${u.has_password ? 'Reset password' : 'Set password'}</button>${u.disabled ? html`<button class="btn xs" data-act="userToggle" data-name="${u.name}" data-to="enable">Enable</button>`
           : html`<button class="btn xs danger-ghost" data-act="userToggle" data-name="${u.name}" data-to="disable">Disable</button>`}</td></tr>`)}</tbody></table></div>
     <div class="card-f"><input class="input sm" id="u-name" placeholder="name, e.g. jsmith" style="width:200px" maxlength="64">
       <select class="select" id="u-role">${v.roles.map((r) => html`<option ${attr(r === 'operator', 'selected')}>${r}</option>`)}</select>
-      <button class="btn" data-act="userAdd">${icon('user')} Create link</button>
-      <span class="small muted">Re-creating a name issues a fresh link and retires the old one.</span></div></div>`;
+      <input class="input sm" id="u-pw" type="password" placeholder="password (optional)" autocomplete="new-password" style="width:200px">
+      <button class="btn" data-act="userAdd">${icon('user')} Add person</button>
+      <span class="small muted">With a password they sign in by name; without one they get a personal link. Re-adding a name replaces its link.</span></div></div>`;
 }
 function resetCard(r) {
   const blocked = r.blockers.length > 0;
