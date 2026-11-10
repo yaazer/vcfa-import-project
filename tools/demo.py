@@ -91,8 +91,12 @@ def setup(workdir: Path, port: int, scenario: str, batch_size: int) -> dict:
 
     (workdir / "cfg.toml").write_text("\n".join([
         '# Demo configuration -- kubectl and vCenter are both simulated.',
-        'kubectl = "{} {}"'.format(Path(sys.executable).as_posix(),
-                                   (ROOT / "tools" / "fake_kubectl.py").as_posix()),
+        # Quote each path as its own token: an unquoted path containing spaces
+        # (e.g. "...\Vibe Code Projects\...") would otherwise be shattered by
+        # the shlex.split() in kube.py._kubectl_argv().
+        'kubectl = {}'.format(json.dumps('"{}" "{}"'.format(
+            Path(sys.executable).as_posix(),
+            (ROOT / "tools" / "fake_kubectl.py").as_posix()))),
         'context = "supervisor-demo-01"',
         'poll_interval_seconds = 1',
         'settle_seconds = 0',
