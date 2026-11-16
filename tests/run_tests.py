@@ -1299,7 +1299,10 @@ def _seed_cluster(tmp, namespaces, subnets):
 def _write_config(tmp, **overrides):
     fake = (ROOT / "tools" / "fake_kubectl.py").as_posix()
     values = {
-        "kubectl": "{} {}".format(Path(sys.executable).as_posix(), fake),
+        # Each path quoted as its own token: an unquoted path containing spaces
+        # (e.g. this repo's own "Vibe Code Projects" parent folder) would
+        # otherwise be shattered by the shlex.split() in kube.py._kubectl_argv().
+        "kubectl": '"{}" "{}"'.format(Path(sys.executable).as_posix(), fake),
         "api_version": "mobility-operator.vmware.com/v1alpha3",
         "poll_interval_seconds": 1,
         "settle_seconds": 0,
@@ -1313,7 +1316,7 @@ def _write_config(tmp, **overrides):
         if isinstance(val, bool):
             lines.append("{} = {}".format(key, "true" if val else "false"))
         elif isinstance(val, str):
-            lines.append('{} = "{}"'.format(key, val))
+            lines.append("{} = {}".format(key, json.dumps(val)))
         else:
             lines.append("{} = {}".format(key, val))
     path = Path(tmp, "cfg.toml")
@@ -5291,6 +5294,178 @@ def t_e2e_portgroups_subnets():
         server.shutdown()
 
 
+@test("e2e: VCenterClient.namespace_list and namespace_subnets distinguish could-not-ask from genuinely empty")
+def t_e2e_vcenter_namespace_list():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from vcfaimport.vcenter import VCenterClient
+    server, port = fake_vcenter.serve(count=2)
+    saved = dict(os.environ)
+    try:
+        client = VCenterClient("http://127.0.0.1:{}".format(port), fake_vcenter.USER, fake_vcenter.PASSWORD)
+        client.connect()
+        try:
+            got = client.namespace_list()
+            eq({(n["namespace"], n["cluster"]) for n in got},
+               {("migration-testing-ns-kcvm5", "PROD-CL01"), ("testing-vpc-k826r", "PROD-CL01")})
+            for mode, want in (("forbidden", None), ("old", None), ("empty", [])):
+                os.environ["FAKE_VC_NS_LIST"] = mode
+                eq(client.namespace_list(), want, mode)
+            os.environ.pop("FAKE_VC_NS_LIST")
+
+            eq(client.namespace_subnets("migration-testing-ns-kcvm5"),
+               [{"name": "subnet-local", "namespace": "migration-testing-ns-kcvm5", "kind": "Subnet"}])
+            eq(client.namespace_subnets("no-such-namespace"), None, "404: a namespace vCenter does not know")
+            for mode, want in (("forbidden", None), ("old", None), ("empty", [])):
+                os.environ["FAKE_VC_SUBNET_LIST"] = mode
+                eq(client.namespace_subnets("migration-testing-ns-kcvm5"), want, mode)
+            os.environ.pop("FAKE_VC_SUBNET_LIST")
+
+            # "type" is the real OpenAPI enum spelling (SUBNET / SUBNETSET, verified against
+            # vmware/vcf-api-specs), not the "Subnet" / "SubnetSet" kind name this maps it
+            # to. Mixing those up (an earlier version of this code checked for the PascalCase
+            # spelling, which a real vCenter never sends) would have left every kind blank
+            # here, and every vCenter-sourced SubnetSet mislabelled as a Subnet downstream,
+            # once service.cluster_subnets' blank-kind fallback kicked in.
+            saved_fixture = fake_vcenter.NAMESPACE_SUBNETS["migration-testing-ns-kcvm5"]
+            try:
+                fake_vcenter.NAMESPACE_SUBNETS["migration-testing-ns-kcvm5"] = [
+                    {"name": "a", "type": "SUBNET"}, {"name": "b", "type": "SUBNETSET"},
+                    {"name": "c", "type": "something-unexpected"}]
+                got = {s["name"]: s["kind"] for s in client.namespace_subnets("migration-testing-ns-kcvm5")}
+                eq(got, {"a": "Subnet", "b": "SubnetSet", "c": ""})
+            finally:
+                fake_vcenter.NAMESPACE_SUBNETS["migration-testing-ns-kcvm5"] = saved_fixture
+
+            client._prefix = "/rest"   # a pre-7.0 vCenter never has this endpoint
+            eq(client.namespace_list(), None, "/rest only: never asked")
+            eq(client.namespace_subnets("migration-testing-ns-kcvm5"), None, "/rest only: never asked")
+        finally:
+            client.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+
+
+@test("e2e: vCenter's own namespace and subnet lists feed the mapping suggestions when a tenant login cannot list them")
+def t_e2e_vcenter_namespaces():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from vcfaimport import service
+    from vcfaimport.kube import Kubectl
+    from vcfaimport.state import Store
+    from vcfaimport.service import store_path
+    server, port = fake_vcenter.serve(count=3)
+    saved = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy")
+            env.update(VCFA_VC_SERVER="http://127.0.0.1:{}".format(port),
+                       VCFA_VC_USER=fake_vcenter.USER, VCFA_VC_PASSWORD=fake_vcenter.PASSWORD)
+            # The scenario this guards against: a tenant kubectl login that can list only
+            # its own namespace. vCenter's Workload Management (NAMESPACE_INSTANCES in
+            # fake_vcenter.py) can still answer for a namespace that login cannot see --
+            # but only ever *adds* that name when the Supervisor listing is itself
+            # incomplete; against a complete listing it must never invent a namespace
+            # (stale, or on another Supervisor the same vCenter manages).
+            _seed_cluster(tmp, ["migration-testing-ns-kcvm5"],
+                         ["migration-testing-ns-kcvm5/subnet-local", "testing-vpc-k826r/migration-testing"])
+            cfg_path = _write_config(tmp)
+            out = _run_cli(["-c", cfg_path, "discover"], env, tmp).stdout
+            assert "2 Supervisor namespace(s) known to vCenter" in out, out
+
+            cfg = Config.load(cfg_path)
+            with Store(store_path(cfg)) as store:
+                vc = store.get_meta("vc_namespaces")
+                eq(vc["server"], env["VCFA_VC_SERVER"])
+                eq({n["namespace"] for n in vc["namespaces"]},
+                   {"migration-testing-ns-kcvm5", "testing-vpc-k826r"})
+                vcsub = store.get_meta("vc_subnets")
+                eq(vcsub["server"], env["VCFA_VC_SERVER"])
+                eq({(s["namespace"], s["name"], s["kind"]) for s in vcsub["subnets"]},
+                   {("migration-testing-ns-kcvm5", "subnet-local", "Subnet"),
+                    ("testing-vpc-k826r", "migration-testing", "Subnet")})
+
+            os.environ.update(env)
+
+            # An admin login that can list every namespace: vCenter only tags the one
+            # already there, never adds the one it cannot otherwise confirm is still real.
+            complete = service.cluster_namespaces(Kubectl(cfg), vc)
+            eq(complete["complete"], True)
+            by_name_complete = {n["name"]: n["source"] for n in complete["namespaces"]}
+            eq(by_name_complete["migration-testing-ns-kcvm5"], "both+vcenter")
+            assert "testing-vpc-k826r" not in by_name_complete, \
+                "a complete Supervisor listing must not gain a namespace from vCenter alone: " + str(by_name_complete)
+
+            # The realistic tenant case: this login cannot list namespaces at all.
+            os.environ["FAKE_KUBECTL_NS_LIST"] = "forbidden"
+            d = service.cluster_namespaces(Kubectl(cfg), vc)
+            eq(d["complete"], False)
+            by_name = {n["name"]: n["source"] for n in d["namespaces"]}
+            eq(by_name["migration-testing-ns-kcvm5"], "kubeconfig+vcenter", "kubeconfig context, backed by vCenter")
+            eq(by_name["testing-vpc-k826r"], "vcenter", "a tenant login cannot list it, but vCenter can")
+
+            out = _run_cli(["-c", cfg_path, "namespaces"], dict(env, FAKE_KUBECTL_NS_LIST="forbidden"), tmp).stdout
+            assert "testing-vpc-k826r" in out and "vCenter" in out, out
+
+            # feeds the subnet lookup too: when neither namespace nor subnet listing is
+            # allowed, the per-namespace fallback can only ask about namespaces it knows.
+            # Without vCenter's namespace list it never asks about the VPC namespace and
+            # misses its subnet -- the real gap this guards against.
+            names = [n["name"] for n in d["namespaces"]]
+            assert "testing-vpc-k826r" in names
+            os.environ["FAKE_KUBECTL_SUBNET_LIST"] = "forbidden"
+            without_vc = service.cluster_subnets(Kubectl(cfg), ["migration-testing-ns-kcvm5"])
+            eq({x["name"] for x in without_vc["subnets"]}, {"subnet-local"}, "the VPC namespace was never asked about")
+            with_vc = service.cluster_subnets(Kubectl(cfg), names)
+            eq({x["name"] for x in with_vc["subnets"]}, {"subnet-local", "migration-testing"},
+               "vCenter's namespace list let the fallback also ask about the VPC namespace")
+
+            # vCenter's own per-namespace subnet list (vc_subnets) fills the same gap even
+            # when the VPC namespace is not in the namespaces list at all -- a namespace the
+            # Supervisor's per-namespace fallback never got asked about still gets its subnet
+            # suggested, never overriding a namespace the fallback *did* confirm (subnet-local
+            # stays sourced from the Supervisor, not vCenter).
+            with_vc_subnets = service.cluster_subnets(Kubectl(cfg), ["migration-testing-ns-kcvm5"], vcsub)
+            by_name_sub = {x["name"]: x["source"] for x in with_vc_subnets["subnets"]}
+            eq(by_name_sub, {"subnet-local": "cluster", "migration-testing": "vcenter"})
+
+            # a complete, cluster-wide Subnet listing is authoritative: vCenter is never
+            # consulted for a kind the Supervisor could answer for fully.
+            os.environ.pop("FAKE_KUBECTL_SUBNET_LIST")
+            full = service.cluster_subnets(Kubectl(cfg), names, vcsub)
+            eq(full["complete"], True)
+            eq({x["name"] for x in full["subnets"]}, {"subnet-local", "migration-testing"})
+            eq({x["source"] for x in full["subnets"]}, {"cluster"}, "nothing here came from vCenter")
+
+            c = _Console(tmp, Config.load(cfg_path))
+            try:
+                first = c.ok("GET", "/api/cluster/namespaces?refresh=1")
+                assert "testing-vpc-k826r" in {n["name"] for n in first["namespaces"]}, first
+                sub_first = c.ok("GET", "/api/cluster/subnets?refresh=1")
+                # The Supervisor itself can list cluster-wide here, so this namespace's subnet is
+                # reachable regardless of vCenter -- the console wiring (cluster_subnets reading
+                # vc_subnets meta) is exercised directly by the service-level checks above; this
+                # confirms only that the console's own endpoint serves a consistent answer.
+                assert "migration-testing" in {s["name"] for s in sub_first["subnets"]}, sub_first
+                # re-discovering must drop the server's 120s namespace-suggestion cache too
+                os.environ["FAKE_VC_NS_LIST"] = "empty"
+                _run_job(c, "discover", {"server": env["VCFA_VC_SERVER"], "user": fake_vcenter.USER,
+                                         "password": fake_vcenter.PASSWORD}, "succeeded")
+                again = c.ok("GET", "/api/cluster/namespaces")
+                assert "testing-vpc-k826r" not in {n["name"] for n in again["namespaces"]}, \
+                    "the namespace cache was not dropped after the re-discovery"
+            finally:
+                os.environ.pop("FAKE_VC_NS_LIST", None)
+                os.environ.pop("FAKE_KUBECTL_NS_LIST", None)
+                c.close()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        server.shutdown()
+
+
 # ------------------------------------------------------------------ re-discovery
 class _StubVc:
     """vm_exists answers per moref: True (there), False (vCenter said 404), None (no answer)."""
@@ -6046,6 +6221,7 @@ def t_store_clear_campaign():
         s.set_meta("settings", {"batch_size": 7})
         s.set_meta("run_id", "r-1")
         s.set_meta("discovered_at", "yesterday")
+        s.set_meta("vc_namespaces", {"server": "vc.lab", "namespaces": [{"namespace": "ns-a"}]})
         s.conn.execute("INSERT INTO users(name, role, token_hash, created_at) VALUES('ada', 'admin', 'x', 'now')")
         s.conn.execute("INSERT INTO discovered(moref, name, selected, namespace, wave, notes, app, discovered_at)"
                        " VALUES('vm-1', 'a', 1, 'ns-a', 3, 'n', 'erp', 'now')")
@@ -6057,11 +6233,12 @@ def t_store_clear_campaign():
         eq(s.wave_info(), {})
         eq((s.get_meta("settings"), s.get_meta("run_id"), s.get_meta("discovered_at")),
            ({"batch_size": 7}, None, "yesterday"), "settings kept, campaign meta gone")
+        assert s.get_meta("vc_namespaces"), "vCenter's namespace snapshot kept along with the rest of discovery"
         eq(s.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], 1, "people stay")
         eq(tuple(s.conn.execute("SELECT selected, namespace, wave, notes, app FROM discovered").fetchone()),
            (0, "", 0, "", ""), "discovery kept, every choice made on it cleared")
         s.clear_campaign()
-        eq((s.discovered_counts()["total"], s.get_meta("discovered_at")), (0, None))
+        eq((s.discovered_counts()["total"], s.get_meta("discovered_at"), s.get_meta("vc_namespaces")), (0, None, None))
         with Store(str(Path(tmp, "arch", "state.db"))) as old:
             eq(old.counts(), {"pending": 1}, "the archive holds the campaign as it was")
         s.close()
@@ -6188,7 +6365,7 @@ E2E = [
     t_e2e_reset_campaign, t_web_reset_campaign,
     t_e2e_wave_cleanup, t_web_wave_cleanup, t_e2e_precheck_storage_release, t_e2e_vm_deleted_before_commit,
     t_e2e_portgroups_subnets,
-    t_e2e_cluster_namespaces,
+    t_e2e_cluster_namespaces, t_e2e_vcenter_namespace_list, t_e2e_vcenter_namespaces,
     t_e2e_web_governance, t_e2e_cli_governance,
     t_fake_operator_name_collision,
     t_e2e_happy, t_e2e_precheck_gate, t_e2e_preflight_missing, t_e2e_flaky,

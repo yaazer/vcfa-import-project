@@ -1237,13 +1237,22 @@ def wave_estimates(store: st.Store, cfg: Config) -> Dict[int, Dict[str, Any]]:
 SYSTEM_NAMESPACE_RE = re.compile(r"^(kube-|vmware-system-|svc-)|^(default|tkg-system)$")
 
 
-def cluster_namespaces(kube: Kubectl) -> Dict[str, Any]:
+def cluster_namespaces(kube: Kubectl, vc_namespaces: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Namespaces a mapping could target, to suggest while mapping.
 
     Asks the Supervisor for its namespaces (system ones left out). Where that
     is not allowed or not answered, falls back to the kubeconfig's contexts for
     the same Supervisor -- one per namespace this login may use. `complete`
     says whether the list came from the cluster itself.
+
+    `vc_namespaces` is what the last vCenter discovery learned (the "vc_namespaces"
+    meta `record_discovery` saves): vCenter's own Workload Management list, which
+    needs no Supervisor login and so can include namespaces a tenant kubectl login
+    may not be allowed to list. When the Supervisor listing is complete, a vCenter
+    name not in it is never added -- it would be stale, or on another Supervisor
+    the same vCenter manages -- it only adds the "vcenter" tag to a name the
+    Supervisor (or kubeconfig) already named. It can only add a namespace outright
+    when that listing is incomplete, which is the case it actually helps.
     """
     out: Dict[str, Any] = {"namespaces": [], "complete": False, "notes": []}
     try:
@@ -1268,15 +1277,30 @@ def cluster_namespaces(kube: Kubectl) -> Dict[str, Any]:
             "forbidden": "This login may not list every namespace on the Supervisor; showing " + source + ".",
             "unanswered": "The Supervisor did not answer; showing " + source + ".",
         }.get(why, "Could not list namespaces ({}); showing {}.".format(why, source)))
+    vc_names = sorted({(n.get("namespace") or "").strip()
+                       for n in (vc_namespaces or {}).get("namespaces") or []} - {""})
+    for n in vc_names:
+        if SYSTEM_NAMESPACE_RE.search(n):
+            continue
+        if n in names:
+            names[n] = names[n] + "+vcenter"
+        elif not out["complete"]:
+            names[n] = "vcenter"
     out["namespaces"] = [{"name": n, "source": src} for n, src in sorted(names.items())]
     return out
 
 
 # ------------------------------------------------------------ vCenter portgroups
 def record_discovery(store: st.Store, server: str, extras: Optional[Dict[str, Any]]) -> None:
-    """What a discovery pass learned besides the VMs: vCenter's network list."""
+    """What a discovery pass learned besides the VMs: vCenter's network list and,
+    where this login could ask, vCenter's own Workload Management namespace and
+    per-namespace NSX Subnet/SubnetSet lists."""
     if extras and extras.get("networks") is not None:
         store.set_meta("vc_networks", {"server": server, "networks": extras["networks"]})
+    if extras and extras.get("namespaces") is not None:
+        store.set_meta("vc_namespaces", {"server": server, "namespaces": extras["namespaces"]})
+    if extras and extras.get("subnets") is not None:
+        store.set_meta("vc_subnets", {"server": server, "subnets": extras["subnets"]})
 
 
 # ------------------------------------------------------------ rediscovery
@@ -1429,13 +1453,23 @@ def vcenter_portgroups(store: st.Store) -> Dict[str, Any]:
 SUBNET_RESOURCES = (("subnets.crd.nsx.vmware.com", "Subnet"), ("subnetsets.crd.nsx.vmware.com", "SubnetSet"))
 
 
-def cluster_subnets(kube: Kubectl, namespaces: Sequence[str] = ()) -> Dict[str, Any]:
+def cluster_subnets(kube: Kubectl, namespaces: Sequence[str] = (),
+                    vc_subnets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Subnets and SubnetSets to suggest while mapping, with the namespace each
     lives in (a VPC namespace's subnets live in the VPC's own namespace) and
     its display name. Lists cluster-wide when allowed; otherwise namespace by
-    namespace for the ones given. `complete` is False when some could not be read."""
+    namespace for the ones given. `complete` is False when some could not be read.
+
+    `vc_subnets` is what the last vCenter discovery learned (the "vc_subnets" meta
+    `record_discovery` saves): vCenter's own per-namespace NSX Subnet/SubnetSet list
+    (vcenter.namespace_subnets, no Supervisor login needed). An entry from it is only
+    added for a (namespace, kind) the Supervisor itself could not answer for -- never
+    in place of a Supervisor answer, including a confirmed "none here" -- the same
+    rule `cluster_namespaces` applies to a vCenter-only namespace.
+    """
     out: Dict[str, Any] = {"subnets": [], "complete": True, "notes": []}
     found: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    covered: Dict[str, Any] = {}   # kind -> True (every namespace) or a set of namespaces covered
 
     def take(listing: Dict[str, Any], kind: str, group: str) -> None:
         for item in (listing or {}).get("items") or []:
@@ -1446,7 +1480,8 @@ def cluster_subnets(kube: Kubectl, namespaces: Sequence[str] = ()) -> Dict[str, 
             display = ((meta.get("annotations") or {}).get("vmware-system-display-name")
                        or (meta.get("labels") or {}).get("vmware-system-display-name") or "")
             found[(ns, kind, name)] = {"name": name, "namespace": ns, "kind": item.get("kind") or kind,
-                                       "api_group": group, "display": display if display != name else ""}
+                                       "api_group": group, "display": display if display != name else "",
+                                       "source": "cluster"}
 
     for resource, kind in SUBNET_RESOURCES:
         group = resource.split(".", 1)[1]
@@ -1459,23 +1494,30 @@ def cluster_subnets(kube: Kubectl, namespaces: Sequence[str] = ()) -> Dict[str, 
         if proc.returncode == 0:
             try:
                 take(json.loads(proc.stdout or "{}"), kind, group)
+                covered[kind] = True       # "-A" covers every namespace for this kind
             except ValueError:
                 out["complete"] = False
             continue
         err = (proc.stderr or "").strip()
         if "doesn't have a resource type" in err or "the server doesn't have" in err:
-            continue                       # this kind does not exist on this cluster
+            covered[kind] = True          # this kind does not exist on this cluster: nothing missed
+            continue
         # Not allowed (or not answered) cluster-wide: read the namespaces we know instead.
         unreadable = []
+        covered_ns: set = set()
         for ns in list(dict.fromkeys(n for n in namespaces if n))[:25]:
             p2 = kube.run(["get", resource, "-n", ns, "-o", "json"], check=False, timeout=20, retries=0)
             if p2.returncode == 0:
                 try:
                     take(json.loads(p2.stdout or "{}"), kind, group)
+                    covered_ns.add(ns)
                 except ValueError:
                     unreadable.append(ns)
             elif "doesn't have a resource type" not in (p2.stderr or ""):
                 unreadable.append(ns)
+            else:
+                covered_ns.add(ns)        # this kind does not exist in this namespace: a real answer
+        covered[kind] = covered_ns
         out["complete"] = False
         why = "not allowed" if "forbidden" in err.lower() else "no answer" if TRANSIENT_HINT.search(err) else "failed"
         note = "Listing {}s across the Supervisor {}; read namespace by namespace ({})".format(
@@ -1483,6 +1525,22 @@ def cluster_subnets(kube: Kubectl, namespaces: Sequence[str] = ()) -> Dict[str, 
         if unreadable:
             note += "; could not read: " + ", ".join(unreadable)
         out["notes"].append(note + ". A VPC's subnets live in the VPC's own namespace, which may be missing here.")
+
+    for entry in (vc_subnets or {}).get("subnets") or []:
+        ns = (entry.get("namespace") or "").strip()
+        name = (entry.get("name") or "").strip()
+        kind = entry.get("kind") or "Subnet"
+        if not ns or not name:
+            continue
+        key = (ns, kind, name)
+        if key in found:
+            continue
+        cov = covered.get(kind)
+        if cov is True or (isinstance(cov, set) and ns in cov):
+            continue    # the Supervisor already answered for this namespace and kind
+        found[key] = {"name": name, "namespace": ns, "kind": kind,
+                      "api_group": entry.get("api_group") or "crd.nsx.vmware.com",
+                      "display": entry.get("display") or "", "source": "vcenter"}
     out["subnets"] = sorted(found.values(), key=lambda s_: (s_["name"].lower(), s_["namespace"]))
     return out
 

@@ -375,6 +375,23 @@ Credentials come from `--vcenter/--user/--password`, then `VCFA_VC_SERVER` /
 is never written to disk**, and the session is deleted when the command ends.
 Re-running `discover` refreshes the cache and keeps whatever you had selected.
 
+Each pass also asks vCenter's own Workload Management for its Supervisor
+namespace list, and then for each of those namespaces' NSX Subnet and
+SubnetSet list (no Supervisor login needed for either part). When this
+account cannot list namespaces on the Supervisor itself -- the usual tenant
+case -- that vCenter namespace list fills in the suggestions in `namespaces`
+and the mapping dropdowns in the web console's Map & Stage, and widens the
+per-namespace fallback `subnets` uses when it cannot list Subnets
+cluster-wide. For a namespace (or kind) the Supervisor still can't answer for
+even then, vCenter's own subnet list fills that in too, so a namespace this
+login can't list -- a VPC's, say -- can still have its subnets found, if
+vCenter lists them. Against a full Supervisor listing, either list only
+confirms a name already there, never adding one the Supervisor itself did
+not name. Either way nothing is ever written into a map or a VM's target --
+namespaces and subnets are suggested, never guessed. Pass `--no-namespaces`
+or `--no-subnets` to skip either part on an older vCenter or one this account
+cannot query that way.
+
 ### Re-discovery: renamed, moved and removed VMs
 
 Every pass compares itself with the cache:
@@ -790,9 +807,9 @@ it never touches batches it did not create.
 | `skip` | exclude or re-include VMs |
 | `events` | the run's event log |
 | `report` | standalone HTML and/or CSV report |
-| `namespaces` | the namespaces you can map to: from the Supervisor, or from your kubeconfig's contexts when this login may not list them |
+| `namespaces` | the namespaces you can map to: from the Supervisor, your kubeconfig's contexts when this login may not list them, and vCenter's own Workload Management list from the last discovery |
 | `portgroups` | every vCenter portgroup from the last discovery, with how many (selected) VMs use it |
-| `subnets` | the Subnets and SubnetSets on the Supervisor, with their namespace and display name |
+| `subnets` | the Subnets and SubnetSets on the Supervisor, with their namespace and display name; filled in from vCenter's own list for a namespace the Supervisor can't answer for |
 | `readiness` | grade discovered VMs from their vCenter facts before precheck (advisory); exit 4 when some are likely to fail |
 | `verify` | check committed VMs: powered on, Tools running, IP kept, ping, TCP ports |
 | `schedule` | change windows: `add --start --end`, `list`, `cancel ID`, `tick` (run from Task Scheduler or cron) |

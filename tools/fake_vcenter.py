@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import threading
 import urllib.parse
@@ -21,6 +22,27 @@ from typing import Any, Dict, List
 TOKEN = "fake-session-token"
 USER = "administrator@vsphere.local"
 PASSWORD = "hunter2"
+
+# Supervisor namespaces vCenter's own Workload Management knows about -- two
+# names so a test can tell "the tenant's own namespace" from "one it cannot
+# list itself" (see t_e2e_vcenter_namespaces). FAKE_VC_NS_LIST overrides how
+# the endpoint behaves: "forbidden" (403, no System.Read), "old" (404, as on
+# a pre-7.0 /rest-only vCenter), "empty" (200, []).
+NAMESPACE_INSTANCES = [
+    {"cluster": "PROD-CL01", "namespace": "migration-testing-ns-kcvm5",
+     "description": "", "config_status": "RUNNING"},
+    {"cluster": "PROD-CL01", "namespace": "testing-vpc-k826r",
+     "description": "VPC namespace", "config_status": "RUNNING"},
+]
+# NSX Subnets/SubnetSets vCenter lists per namespace (GET /vcenter/namespaces/{ns}/networks/nsx/subnets).
+# FAKE_VC_SUBNET_LIST overrides how the endpoint behaves for every namespace:
+# "forbidden" (403), "old" (404, as if the endpoint itself did not exist), "empty" (200, []).
+# "type" is the real enum value from VMware's published OpenAPI spec (SUBNET /
+# SUBNETSET), not the "Subnet" / "SubnetSet" kind name vcfaimport maps it to.
+NAMESPACE_SUBNETS = {
+    "migration-testing-ns-kcvm5": [{"name": "subnet-local", "type": "SUBNET"}],
+    "testing-vpc-k826r": [{"name": "migration-testing", "type": "SUBNET"}],
+}
 
 CLUSTERS = ["PROD-CL01", "PROD-CL02", "DMZ-CL01"]
 # A realistic nested VM-folder tree. Keys are folder ids, values are
@@ -265,6 +287,40 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/vcenter/host":
             self._send(200, [{"host": "host-{}".format(10 + i), "name": "esx{:02d}.lab".format(i)}
                              for i in range(4)])
+            return
+
+        if path == "/api/vcenter/namespaces/instances":
+            mode = os.environ.get("FAKE_VC_NS_LIST", "")
+            if mode == "forbidden":
+                self._send(403, {"error_type": "UNAUTHORIZED",
+                                 "messages": [{"default_message": "System.Read is required"}]})
+                return
+            if mode == "old":
+                self._send(404, {"error": "not found"})
+                return
+            if mode == "empty":
+                self._send(200, [])
+                return
+            self._send(200, NAMESPACE_INSTANCES)
+            return
+
+        if path.startswith("/api/vcenter/namespaces/") and path.endswith("/networks/nsx/subnets"):
+            namespace = urllib.parse.unquote(path.split("/")[4])
+            mode = os.environ.get("FAKE_VC_SUBNET_LIST", "")
+            if mode == "forbidden":
+                self._send(403, {"error_type": "UNAUTHORIZED",
+                                 "messages": [{"default_message": "System.Read is required"}]})
+                return
+            if mode == "old":
+                self._send(404, {"error": "not found"})
+                return
+            if mode == "empty":
+                self._send(200, {"subnets": []})
+                return
+            if namespace not in {n["namespace"] for n in NAMESPACE_INSTANCES}:
+                self._send(404, {"error": "no such namespace"})
+                return
+            self._send(200, {"subnets": NAMESPACE_SUBNETS.get(namespace, [])})
             return
 
         self._send(404, {"error": "unsupported path {}".format(path)})

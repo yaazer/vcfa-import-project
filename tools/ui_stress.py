@@ -426,6 +426,26 @@ const SCENARIOS = {
     click('#stale-note-f [data-act="dropStale"]');
     check('Remove takes out that entry only', await waitFor(() => S.view.fr.length === live && !S.view.fr.some((r) => r.folder === 'migration-wave3'), 3000), S.view.fr.map((r) => r.folder).join(','));
     check('and the note goes', await waitFor(() => !document.querySelector('#stale-note-f'), 8000));
+
+    // Re-discovering refreshes the vCenter-sourced namespace/subnet suggestions
+    // instead of serving what this page session cached before the pass -- the
+    // interaction this feature was asked to cover. startJob (not a
+    // bare POST) is what a real Discover click does: it also starts following
+    // the job so jobFinished fires even for a pass this quick. The view is on
+    // this page throughout, so its own onJobDone/refreshView immediately asks
+    // again -- a transient null is not reliably observable, so this checks
+    // the outcome instead: a genuinely new promise, not the one from before.
+    await waitFor(() => CNS.data, 5000);
+    const promiseBefore = CNS.p, subnetPromiseBefore = CSN.p;
+    check('the namespace/subnet suggestion memos are set before a re-discovery', promiseBefore && subnetPromiseBefore);
+    const job = await startJob('discover', {}, true);
+    check('a re-discovery starts from here (no server/user/password needed again)', job && job.id, JSON.stringify(job));
+    if (job) {
+      await waitFor(async () => (await GET('/api/jobs/' + job.id)).status !== 'running', 30000);
+      check('its completion replaces the cached suggestion promises with fresh ones',
+        await waitFor(() => CNS.p && CNS.p !== promiseBefore && CSN.p && CSN.p !== subnetPromiseBefore, 8000),
+        'same CNS.p? ' + (CNS.p === promiseBefore) + ' same CSN.p? ' + (CSN.p === subnetPromiseBefore));
+    }
     check('stage view never broke', !brokeView());
   },
 

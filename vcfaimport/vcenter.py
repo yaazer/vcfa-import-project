@@ -463,6 +463,67 @@ class VCenterClient:
             return ""
         return str(data.get("run_state") or data.get("version_status") or "")
 
+    def namespace_list(self) -> Optional[List[Dict[str, str]]]:
+        """Supervisor namespaces vCenter's own Workload Management already knows
+        about -- independent of any Supervisor login or kubectl context. None
+        when this vCenter could not be asked (pre-7.0 /rest only, no System.Read
+        privilege, or no answer): never read as "there are none". An empty list
+        is a real answer -- no namespace configured yet.
+
+        Response shape (a bare array of Vcenter.Namespaces.Instances.Summary,
+        fields cluster/namespace/description/config_status/stats/self_service_namespace)
+        confirmed against VMware's own published OpenAPI spec (vmware/vcf-api-specs,
+        specifications/vsphere/openapi/automation/vcenter.yaml, version 9.1.1.0,
+        operationId Vcenter.Namespaces.Instances_list) -- not against a live vCenter."""
+        if self._prefix != "/api":
+            return None
+        try:
+            items = self.get("/vcenter/namespaces/instances")
+        except VCenterError:
+            return None
+        if not isinstance(items, list):
+            return None
+        return [
+            {"namespace": item.get("namespace", ""), "cluster": item.get("cluster", ""),
+             "description": item.get("description", ""), "config_status": item.get("config_status", "")}
+            for item in items if isinstance(item, dict) and item.get("namespace")
+        ]
+
+    def namespace_subnets(self, namespace: str) -> Optional[List[Dict[str, str]]]:
+        """NSX Subnets and SubnetSets vCenter lists for one Supervisor namespace --
+        independent of any Supervisor login or kubectl context. None when it could
+        not be asked (older vCenter, no privilege, the namespace is unknown to
+        vCenter, or no answer); an empty list is a real answer.
+
+        Response shape confirmed against VMware's own published OpenAPI spec
+        (vmware/vcf-api-specs, specifications/vsphere/openapi/automation/vcenter.yaml,
+        version 9.1.1.0, operationId Vcenter.Namespaces.Networks.Nsx.Subnets_list) --
+        not against a live vCenter. `type` is the entity's kind as an enum string,
+        `SUBNET` or `SUBNETSET`; anything else is left blank rather than guessed,
+        and service.cluster_subnets then treats a blank kind as "Subnet" (the common
+        case) when merging the entry in. The item carries no `namespace` of its own
+        -- it is namespace-scoped by the request, so it is supplied here instead."""
+        if self._prefix != "/api":
+            return None
+        try:
+            data = self.get("/vcenter/namespaces/{}/networks/nsx/subnets".format(
+                urllib.parse.quote(namespace, safe="")))
+        except VCenterError:
+            return None
+        items = (data or {}).get("subnets") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return None
+        kind_of = {"SUBNET": "Subnet", "SUBNETSET": "SubnetSet"}
+        out = []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            out.append({
+                "name": item["name"], "namespace": namespace,
+                "kind": kind_of.get(str(item.get("type") or "").strip().upper(), ""),
+            })
+        return out
+
 
 def _parse_nics(detail: Dict[str, Any], networks: Dict[str, str]) -> List[DiscoveredNic]:
     """VM detail reports NICs keyed by their device key -- exactly what we need."""
@@ -523,6 +584,8 @@ def discover(
     with_tools: bool = False,
     with_placement: bool = True,
     with_tags: bool = True,
+    with_namespaces: bool = True,
+    with_subnets: bool = True,
     concurrency: int = 12,
     progress: Optional[Callable[[int, int], None]] = None,
     log: Optional[Callable[[str], None]] = None,
@@ -544,6 +607,36 @@ def discover(
         # Kept by the caller, so portgroup fields can suggest every portgroup --
         # including ones no discovered VM uses yet.
         extras["networks"] = [{"name": n["name"], "type": n["type"]} for n in network_list if n["name"]]
+        if with_namespaces:
+            ns_list = client.namespace_list()
+            extras["namespaces"] = ns_list    # None = could not ask; [] = none configured
+            if ns_list is not None:
+                say("  {} Supervisor namespace(s) known to vCenter".format(len(ns_list)))
+                if with_subnets and ns_list:
+                    # Per namespace, not a single call: a namespace this failed for
+                    # contributes nothing (unknown), never a guessed "it has none".
+                    # A namespace that did answer, even with an empty list, is a real
+                    # observation and is kept as such.
+                    names = sorted({n["namespace"] for n in ns_list if n.get("namespace")})[:50]
+                    workers = max(1, min(int(concurrency), 32))
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        per_ns = list(pool.map(client.namespace_subnets, names))
+                    subnets: List[Dict[str, str]] = []
+                    asked, answered = len(names), 0
+                    for found in per_ns:
+                        if found is not None:
+                            answered += 1
+                            subnets.extend(found)
+                    # None when not one namespace could be asked (e.g. every call got a 403):
+                    # that is "could not ask", not "there are none", and must not overwrite a
+                    # previously good vc_subnets snapshot with an empty one (record_discovery
+                    # only replaces it when this is not None).
+                    extras["subnets"] = subnets if answered else None
+                    if answered:
+                        say("  {} NSX Subnet(s)/SubnetSet(s) known to vCenter across {} of {} namespace(s)".format(
+                            len(subnets), answered, asked))
+                    else:
+                        say("  vCenter could not be asked for any namespace's subnet list")
 
     folder_of: Dict[str, str] = {}
     dc_of: Dict[str, str] = {}

@@ -257,6 +257,8 @@ def cmd_discover(args) -> int:
             with_tools=not args.no_tools,
             with_placement=not args.no_placement,
             with_tags=not args.no_tags,
+            with_namespaces=not args.no_namespaces,
+            with_subnets=not args.no_subnets,
             concurrency=args.concurrency,
             progress=progress,
             log=log,
@@ -288,6 +290,28 @@ def cmd_discover(args) -> int:
         stale = sum(1 for v in vms if "running" not in (v.tools_status or "").lower())
         if stale:
             log("  {} VM(s) are not running VM Tools (likely precheck failures)".format(stale))
+    if not args.no_namespaces:
+        ns = extras.get("namespaces")
+        if ns is not None:
+            log("  {} Supervisor namespace(s) known to vCenter -- used where this login cannot list "
+                "namespaces itself".format(len(ns)))
+        else:
+            kept = store.get_meta("vc_namespaces")
+            if kept and kept.get("namespaces"):
+                log("  vCenter could not be asked for its namespace list this time (older vCenter, or no "
+                    "System.Read privilege); keeping the {} namespace(s) from the last time it could"
+                    .format(len(kept["namespaces"])))
+            else:
+                log("  vCenter could not be asked for its namespace list (older vCenter, or no System.Read "
+                    "privilege); namespace suggestions fall back to the Supervisor and your kubeconfig")
+        if not args.no_subnets:
+            sn = extras.get("subnets")
+            if sn is not None:
+                log("  {} NSX Subnet(s)/SubnetSet(s) known to vCenter -- used where the Supervisor cannot "
+                    "list them itself".format(len(sn)))
+            elif extras.get("namespaces"):
+                log("  vCenter could not be asked for any namespace's subnet list; subnet suggestions "
+                    "fall back to the Supervisor")
     log("")
     log("Next: `browse` to look around, `pick` for a clickable list, or")
     log("      `select --cluster ... --name ...` to choose non-interactively")
@@ -1115,16 +1139,25 @@ def cmd_report(args) -> int:
     return 0
 
 
+NS_SOURCE_LABEL = {
+    "cluster": "on the Supervisor", "kubeconfig": "kubeconfig context",
+    "both": "on the Supervisor, kubeconfig context", "vcenter": "vCenter (Workload Management)",
+    "cluster+vcenter": "on the Supervisor, vCenter", "kubeconfig+vcenter": "kubeconfig context, vCenter",
+    "both+vcenter": "on the Supervisor, kubeconfig context, vCenter",
+}
+
+
 def cmd_namespaces(args) -> int:
-    cfg, _store, kube, _engine = _open(args)
-    data = service.cluster_namespaces(kube)
+    cfg, store, kube, _engine = _open(args)
+    data = service.cluster_namespaces(kube, store.get_meta("vc_namespaces"))
     for note in data["notes"]:
         log(note)
     if not data["namespaces"]:
         log("no namespaces found")
         return 0
-    label = {"cluster": "on the Supervisor", "kubeconfig": "kubeconfig context", "both": "on the Supervisor, kubeconfig context"}
-    log(report.table(["namespace", "seen"], [[n["name"], label[n["source"]]] for n in data["namespaces"]], indent="  "))
+    log(report.table(["namespace", "seen"],
+                     [[n["name"], NS_SOURCE_LABEL.get(n["source"], n["source"])] for n in data["namespaces"]],
+                     indent="  "))
     return 0
 
 
@@ -1144,9 +1177,9 @@ def cmd_portgroups(args) -> int:
 
 def cmd_subnets(args) -> int:
     _cfg, store, kube, _engine = _open(args)
-    names = [n["name"] for n in service.cluster_namespaces(kube)["namespaces"]]
+    names = [n["name"] for n in service.cluster_namespaces(kube, store.get_meta("vc_namespaces"))["namespaces"]]
     names += [r["namespace"] for r in store.query_vms() if r["namespace"]]
-    data = service.cluster_subnets(kube, sorted(set(names)))
+    data = service.cluster_subnets(kube, sorted(set(names)), store.get_meta("vc_subnets"))
     for note in data["notes"]:
         log(note)
     if not data["subnets"]:
@@ -1566,6 +1599,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-placement", action="store_true",
                     help="skip folder and cluster attribution")
     sp.add_argument("--no-tags", action="store_true", help="skip reading vCenter tags")
+    sp.add_argument("--no-namespaces", action="store_true",
+                    help="skip asking vCenter for its Workload Management namespace list")
+    sp.add_argument("--no-subnets", action="store_true",
+                    help="skip asking vCenter for each namespace's NSX Subnet/SubnetSet list")
     sp.add_argument("--allow-mass-removal", action="store_true",
                     help="remove VMs gone from vCenter even when that is more than half the inventory")
 

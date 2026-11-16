@@ -1181,6 +1181,13 @@ async function jobFinished(id) {
   const kind = { succeeded: 'ok', warning: 'warn', failed: 'bad', stopped: 'warn' }[j.status] || 'info';
   toast(j.title + ' ' + jobWord(j), j.error || jobSummary(j), kind, 8000);
   if (D.id === id) pollDock();
+  if (j.kind === 'discover' && typeof CNS !== 'undefined') {
+    // A fresh vc_namespaces/vc_networks snapshot just landed server-side (the
+    // console's own 120s cache is already dropped): drop these page-session
+    // memos too, wherever the user is, so the next Map & Stage visit asks
+    // again instead of serving suggestions fetched before this discovery.
+    CNS.p = null; CSN.p = null;
+  }
   const v = S.view;
   if (v && v.onJobDone) v.onJobDone(v, j); else refreshView();
 }
