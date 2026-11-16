@@ -504,7 +504,11 @@ function loadClusterNs(refresh) {
     .catch((e) => { CNS.data = { namespaces: [], complete: false, notes: [e.message] }; return CNS.data; });
   return CNS.p;
 }
-const NS_SEEN = { cluster: 'on the Supervisor', both: 'on the Supervisor', kubeconfig: 'in your kubeconfig' };
+const NS_SEEN = {
+  cluster: 'on the Supervisor', both: 'on the Supervisor, kubeconfig', kubeconfig: 'in your kubeconfig',
+  vcenter: 'vCenter (Workload Management)', 'cluster+vcenter': 'on the Supervisor, vCenter',
+  'kubeconfig+vcenter': 'in your kubeconfig, vCenter', 'both+vcenter': 'on the Supervisor, kubeconfig, vCenter',
+};
 /** <option>s for a namespace datalist: the known namespaces first, then any other names in use.
  * Value only, no label: Edge and Chrome on Windows show an option's label *instead of* its
  * value, which hid every namespace name behind "on the Supervisor". The strip above the
@@ -522,8 +526,15 @@ function nsKnown(name) {
   if (!c || !c.namespaces.length || !name) return null;
   return c.namespaces.some((n) => n.name === name);
 }
-const nsMissingText = () => (CNS.data && CNS.data.complete ? 'Not a namespace on the Supervisor — check the spelling'
-  : 'Not among the namespaces in your kubeconfig — check the spelling, or log in again with kubectl vsphere login');
+// A complete listing never gains a name from vCenter alone (service.cluster_namespaces
+// only tags one already there), so a complete listing's "missing" verdict already
+// covers vCenter too -- mentioning it there would claim a name IS in vCenter that is
+// not, since a complete listing is exactly where that addition is withheld.
+const nsHasVcenter = () => !!(CNS.data && !CNS.data.complete && CNS.data.namespaces.some((n) => n.source.indexOf('vcenter') >= 0));
+const nsMissingText = () => (CNS.data && CNS.data.complete
+  ? 'Not a namespace on the Supervisor — check the spelling'
+  : 'Not among the namespaces in your kubeconfig' + (nsHasVcenter() ? ' or vCenter' : '')
+    + ' — check the spelling, or log in again with kubectl vsphere login');
 const nsInputAttrs = (value) => (nsKnown(value) === false ? raw(' title="' + esc(nsMissingText()) + '"') : '');
 const nsInputClass = (value) => (nsKnown(value) === false ? 'unknown' : '');
 // The namespace field a click on a suggested namespace fills: the last one focused.
@@ -664,7 +675,7 @@ function targetsPanel(v) {
       </div>
     </details>
     ${warn ? html`<div class="card-b stack tgt-warn" style="gap:8px">
-      ${missingNs.length ? html`<div class="note warn"><b>${plural(missingNs.length, 'namespace')} in these maps ${c.complete ? 'not found on the Supervisor' : 'not among your kubeconfig namespaces'}:</b>
+      ${missingNs.length ? html`<div class="note warn"><b>${plural(missingNs.length, 'namespace')} in these maps ${(c.complete ? 'not found on the Supervisor' : 'not among your kubeconfig namespaces') + (nsHasVcenter() ? ' or in vCenter' : '')}:</b>
         <span class="mono">${missingNs.join(', ')}</span>. Check the spelling; VMs mapped there would fail preflight.</div>` : ''}
       ${badSubnets.length ? html`<div class="note warn"><b>${plural(badSubnets.length, 'subnet')} in the portgroup map not found on the Supervisor:</b>
         <span class="mono">${badSubnets.join(', ')}</span>. Check the spelling; in a VPC namespace use the name from the VPC’s own namespace.</div>` : ''}

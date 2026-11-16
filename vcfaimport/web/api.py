@@ -823,6 +823,8 @@ class WebApp:
             "with_tools": not body.get("no_tools"),
             "with_placement": not body.get("no_placement"),
             "with_tags": not body.get("no_tags"),
+            "with_namespaces": not body.get("no_namespaces"),
+            "with_subnets": not body.get("no_subnets"),
             "concurrency": _int(body.get("concurrency"), default=12, minimum=1),
         }
         timeout = _int(body.get("timeout"), default=60, minimum=5)
@@ -851,8 +853,14 @@ class WebApp:
                     ws.store.set_meta("vcenter", server)
                     ws.store.set_meta("discovered_at", _local_now())
                     counts = ws.store.discovered_counts()
+                    kept_namespaces = ws.store.get_meta("vc_namespaces")
             finally:
                 client.close()
+            # A fresh vc_namespaces/vc_networks snapshot just landed: drop the
+            # in-memory suggestion caches so the mapping dropdowns see it on
+            # their next look, not up to 120s later.
+            self._ns_cache = None
+            self._subnet_cache = None
             job.log("")
             job.log("discovered {} VM(s) from {} (added {}, refreshed {})".format(
                 len(vms), server, summary["added"], summary["updated"]))
@@ -865,6 +873,27 @@ class WebApp:
                 job.log("  {} VM(s) have no network adapters".format(no_nics))
             if stale:
                 job.log("  {} VM(s) are not running VM Tools (likely precheck failures)".format(stale))
+            if opts["with_namespaces"]:
+                ns = extras.get("namespaces")
+                if ns is not None:
+                    job.log("  {} Supervisor namespace(s) known to vCenter -- used where this login "
+                            "cannot list namespaces itself".format(len(ns)))
+                elif kept_namespaces and kept_namespaces.get("namespaces"):
+                    job.log("  vCenter could not be asked for its namespace list this time (older vCenter, "
+                            "or no System.Read privilege); keeping the {} namespace(s) from the last time "
+                            "it could".format(len(kept_namespaces["namespaces"])))
+                else:
+                    job.log("  vCenter could not be asked for its namespace list (older vCenter, or no "
+                            "System.Read privilege); namespace suggestions fall back to the Supervisor "
+                            "and your kubeconfig")
+                if opts["with_subnets"]:
+                    sn = extras.get("subnets")
+                    if sn is not None:
+                        job.log("  {} NSX Subnet(s)/SubnetSet(s) known to vCenter -- used where the "
+                                "Supervisor cannot list them itself".format(len(sn)))
+                    elif extras.get("namespaces"):
+                        job.log("  vCenter could not be asked for any namespace's subnet list; subnet "
+                                "suggestions fall back to the Supervisor")
             return {"discovered": len(vms), "added": summary["added"],
                     "updated": summary["updated"], "total": counts["total"],
                     "selected": counts["selected"], "no_nics": no_nics, "tools_not_running": stale,
@@ -1160,7 +1189,9 @@ class WebApp:
         cached = getattr(self, "_ns_cache", None)
         if cached and not q.get("refresh") and time.time() - cached[0] < 120:
             return cached[1]
-        data = service.cluster_namespaces(Kubectl(self.cfg))
+        with self.lock:
+            vc_namespaces = self.store.get_meta("vc_namespaces")
+        data = service.cluster_namespaces(Kubectl(self.cfg), vc_namespaces)
         data["checked_at"] = _local_now()
         data["context"] = self.cfg.context or ""
         self._ns_cache = (time.time(), data)
@@ -1181,7 +1212,8 @@ class WebApp:
             for rows in self._map_rows():
                 names += [r.get("namespace", "") for r in rows]
             names += [r.get("namespace", "") for r in self._tag_rows()]
-        data = service.cluster_subnets(Kubectl(self.cfg), sorted(set(n for n in names if n)))
+            vc_subnets = self.store.get_meta("vc_subnets")
+        data = service.cluster_subnets(Kubectl(self.cfg), sorted(set(n for n in names if n)), vc_subnets)
         data["checked_at"] = _local_now()
         self._subnet_cache = (time.time(), data)
         return data

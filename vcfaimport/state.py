@@ -358,7 +358,7 @@ class Store:
     CAMPAIGN_TABLES = ("vms", "batches", "transitions", "wave_info", "events", "schedules",
                        "approvals", "verifications")
     CAMPAIGN_META = ("run_id", "inventory_path")
-    DISCOVERY_META = ("discovered_at", "vc_networks")
+    DISCOVERY_META = ("discovered_at", "vc_networks", "vc_namespaces", "vc_subnets")
 
     def backup_to(self, path: str) -> None:
         """A consistent copy of the whole database, taken while other connections stay open."""

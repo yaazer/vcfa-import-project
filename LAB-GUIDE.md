@@ -275,9 +275,13 @@ the manifest; the article's example uses 4000, but a VM whose first NIC was
 ever removed and re-added may have 4001.
 
 Select them and assign the target. `vcfa-import namespaces` lists the
-namespaces you can use -- from the Supervisor, or from your kubeconfig's
-contexts if this login may not list them. `vcfa-import subnets` and
-`vcfa-import portgroups` do the same for subnets and portgroups:
+namespaces you can use -- from the Supervisor, or your kubeconfig's contexts
+if this login may not list them. When it can't, the `discover` you just ran
+also asked vCenter's own Workload Management for its namespace list, and
+those names fill the gap too. `vcfa-import subnets` does the same for
+Subnets and SubnetSets -- vCenter's own per-namespace list fills in wherever
+the Supervisor itself can't answer. `vcfa-import portgroups` lists portgroups
+from the same discovery:
 
 ```bash
 vcfa-import select --folder Lab/Import --namespace <target-namespace> --wave 1
