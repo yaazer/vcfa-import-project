@@ -27,15 +27,19 @@ S_AWAITING_COMMIT = "awaiting_commit"    # commit_action = Wait, needs approval
 S_COMMITTED = "committed"                # terminal success
 S_FAILED = "failed"                      # terminal failure (retries exhausted)
 S_ROLLING_BACK = "rolling_back"          # rollbackAction requested, operator reverting
+S_ROLLBACK_FAILED = "rollback_failed"    # a rollback step failed; batch kept alive, needs a human
 S_ROLLED_BACK = "rolled_back"            # ownership back with vCenter; retryable
 S_SKIPPED = "skipped"                    # excluded by the operator
 
 TERMINAL_STATES = (S_COMMITTED, S_FAILED, S_ROLLED_BACK, S_SKIPPED)
-ACTIVE_STATES = (S_PRECHECK_RUNNING, S_IMPORTING)
+# rolling_back/rollback_failed included: `watch` stopping because nothing is
+# "active" must not also mean it stops watching a stuck rollback (incident
+# 2026-11-13 went unwatched for three days).
+ACTIVE_STATES = (S_PRECHECK_RUNNING, S_IMPORTING, S_ROLLING_BACK, S_ROLLBACK_FAILED)
 # A VM in one of these is inside a batch that already carries its wave (or is
 # done): moving it to another wave would not move it, only mislabel it.
 WAVE_LOCKED_STATES = (S_PRECHECK_RUNNING, S_IMPORTING, S_AWAITING_COMMIT,
-                      S_ROLLING_BACK, S_COMMITTED)
+                      S_ROLLING_BACK, S_ROLLBACK_FAILED, S_COMMITTED)
 # A VM in one of these has not been handed to the importer (or is back with
 # vCenter): a new discovery pass refreshes its recorded source facts.
 PROVENANCE_REFRESH_STATES = (S_PENDING, S_PRECHECK_PASSED, S_PRECHECK_FAILED,
@@ -1095,6 +1099,23 @@ class Store:
                               message="precheck cleared: {} since it passed".format(why))
             summary["precheck_cleared"] += 1
         return summary
+
+    def merge_discovered_facts(self, moref: str, patch: Dict[str, Any]) -> bool:
+        """Merge keys into one VM's stored discovery facts without a full
+        re-discovery pass -- used to record a live storage-policy recheck
+        made right before import (see engine.py), so the next plan's own
+        cached-facts gate (`eligible()`) sees the same answer this VM was
+        actually held back or let through on."""
+        row = self.conn.execute(
+            "SELECT facts_json FROM discovered WHERE moref=?", (moref,)).fetchone()
+        if row is None:
+            return False
+        facts = json.loads(row["facts_json"] or "{}") or {}
+        facts.update(patch)
+        self.conn.execute("UPDATE discovered SET facts_json=? WHERE moref=?",
+                          (json.dumps(facts), moref))
+        self.conn.commit()
+        return True
 
     def remove_discovered(self, morefs: Sequence[str]) -> int:
         """Drop VMs from the inventory cache (and so from any selection)."""

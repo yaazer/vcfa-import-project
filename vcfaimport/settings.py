@@ -35,6 +35,7 @@ FIELDS: Dict[str, tuple] = {
     "require_precheck": ("Safety", "Require a passed precheck", "bool", None, None, "Import refuses VMs that did not pass precheck."),
     "readiness_exclude_blocked": ("Safety", "Skip VMs readiness blocks", "bool", None, None, "Keep VMs graded 'blocked' out of precheck."),
     "precheck_max_age_hours": ("Safety", "Precheck valid for (h)", "int", 0, 720, "Import holds back VMs whose precheck is older. 0 means no limit."),
+    "storage_compliance_enforce": ("Safety", "Require storage-policy compliance", "bool", None, None, "Refuse to import a VM not known COMPLIANT/NOT_APPLICABLE by vCenter's own check (including one never checked)."),
     "commit_action": ("Safety", "Commit action", "choice:Auto,Wait", None, None, "Auto commits on success; Wait holds imports for approval."),
     "require_approval": ("Governance", "Needs a second person", "stages", None, None, "Stages that a different operator must approve."),
     "app_category": ("Applications", "App tag category", "str", 0, 80, "vCenter tag category that names each VM's application."),

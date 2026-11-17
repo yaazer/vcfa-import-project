@@ -619,6 +619,38 @@ const SCENARIOS = {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
       check('Escape cancels the modal', await waitFor(() => !document.querySelector('.modal')));
     }
+
+    // 2026-11-16 safeguards: Abandon must be refused (client-side, matching the
+    // server's own abandon_targets) for rolling_back and rollback_failed, and
+    // rollback_failed alone offers Release stuck rollback.
+    window.vmDrawer('vm-9010');
+    await waitFor(() => document.querySelector('.drawer h2'));
+    check('Abandon is disabled for rolling_back', await waitFor(() =>
+      document.querySelector('.drawer [data-act="d_abandon"]')?.disabled));
+    check('no Release button for a VM still plainly rolling_back',
+      !document.querySelector('.drawer [data-act="d_release_rollback"]'));
+    click('.drawer [data-act="closeDrawer"]');
+    await waitFor(() => !document.querySelector('.drawer'));
+
+    window.vmDrawer('vm-9011');
+    await waitFor(() => document.querySelector('.drawer h2'));
+    check('Abandon is disabled for rollback_failed', await waitFor(() =>
+      document.querySelector('.drawer [data-act="d_abandon"]')?.disabled));
+    check('Release stuck rollback is offered for rollback_failed', await waitFor(() =>
+      document.querySelector('.drawer [data-act="d_release_rollback"]')));
+    click('.drawer [data-act="closeDrawer"]');
+    await waitFor(() => !document.querySelector('.drawer'));
+
+    // Same two checks on the batch drawer, which has its own Abandon/Release
+    // wiring separate from the VM drawer's.
+    window.batchDrawer('prod-web-ns1', 'fake-batch-ui');
+    await waitFor(() => document.querySelector('.drawer h2'));
+    check('batch drawer: Abandon is disabled while a member is still live', await waitFor(() =>
+      document.querySelector('.drawer [data-act="b_abandon"]')?.disabled));
+    check('batch drawer: Release stuck rollback is offered (one member is rollback_failed)',
+      await waitFor(() => document.querySelector('.drawer [data-act="b_release_rollback"]')));
+    click('.drawer [data-act="closeDrawer"]');
+    await waitFor(() => !document.querySelector('.drawer'));
   },
 
   async resilience() {
@@ -1405,16 +1437,52 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
             wait_job(app, app._job_execute({"stage": "precheck", "waves": [1], "confirm": True}))
             wait_job(app, app._job_execute({"stage": "import", "waves": [1], "confirm": True}))
         if hostile:
+            # A real discover would have recorded a compliance verdict (the
+            # gate is on by default, including at precheck since 2026-11-16);
+            # without one these never reach precheck_passed, which among
+            # other things starves the govern scenario's wave-2 import plan
+            # down to 0 VMs instead of ~5, through app_together's unrelated
+            # (and unchanged) blocking of the Payroll/Portal members.
             app.store.upsert_discovered([{"moref": m, "name": n, "folder": "Evil/" + n[:12],
                                           "datacenter": "LabDC", "cluster": "PROD-CL01",
                                           "networks": "VLAN197-Prod", "power_state": "POWERED_ON",
-                                          "nics": [{"device_key": 4000, "network_name": "VLAN197-Prod"}]}
+                                          "nics": [{"device_key": 4000, "network_name": "VLAN197-Prod"}],
+                                          "facts": {"storage_compliance": {"overall": "COMPLIANT"}}}
                                          for m, n in HOSTILE])
             app.store.set_selected([m for m, _ in HOSTILE], True, namespace="prod-web-ns1", wave=2)
             app.stage_commit({}, {})
             from vcfaimport import state as st
             app.store.set_vm_state(HOSTILE[0][0], st.S_FAILED, stage="import",
                                    message=HOSTILE_MESSAGE)
+            # UI fixtures (2026-11-16 safeguards): a VM mid-revert and one whose
+            # revert step failed. Abandon must be disabled for both; the second
+            # must also offer Release stuck rollback. No real batch/kubectl
+            # interaction needed -- this is a pure button-state rendering check.
+            app.store.upsert_discovered([
+                {"moref": "vm-9010", "name": "rolling-back-vm", "folder": "Evil/rolling-back-vm",
+                 "datacenter": "LabDC", "cluster": "PROD-CL01", "power_state": "POWERED_ON", "nics": [],
+                 "facts": {"storage_compliance": {"overall": "COMPLIANT"}}},
+                {"moref": "vm-9011", "name": "rollback-failed-vm", "folder": "Evil/rollback-failed-vm",
+                 "datacenter": "LabDC", "cluster": "PROD-CL01", "power_state": "POWERED_ON", "nics": [],
+                 "facts": {"storage_compliance": {"overall": "COMPLIANT"}}},
+            ])
+            app.store.set_selected(["vm-9010", "vm-9011"], True, namespace="prod-web-ns1", wave=2)
+            app.stage_commit({}, {})
+            # A real manifest file: a batch drawer with no manifest renders no
+            # <pre> at all, and the "batches" page's own existing check clicks
+            # whichever batch row comes first, not necessarily a real one.
+            fake_manifest = tmp / "run" / "manifests" / "fake-batch-ui.yaml"
+            fake_manifest.parent.mkdir(parents=True, exist_ok=True)
+            fake_manifest.write_text("apiVersion: mobility-operator.vmware.com/v1alpha3\n"
+                                     "kind: ImportOperationBatch\n"
+                                     "metadata:\n  name: fake-batch-ui\n", encoding="utf-8")
+            app.store.create_batch("fake-batch-ui", "prod-web-ns1", "ui-stress", 2, "import", 2,
+                                   manifest_path=str(fake_manifest))
+            app.store.set_vm_state("vm-9010", st.S_ROLLING_BACK, stage="rollback",
+                                   batch_name="fake-batch-ui")
+            app.store.set_vm_state("vm-9011", st.S_ROLLBACK_FAILED, stage="rollback",
+                                   batch_name="fake-batch-ui",
+                                   message="ROLLBACK FAILED: ObjectDeletionFailure")
     return app, vc_server
 
 

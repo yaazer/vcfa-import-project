@@ -474,6 +474,16 @@ The rolled-back VM is retryable:
 vcfa-import retry --vm <moref>
 ```
 
+**If it instead ends at `rollback_failed`** (a rollback *step* failed, not
+just timed out), `refresh`/`watch` keep polling it with no timeout -- the
+operator may still resolve it on its own. If it does not, `release-rollback`
+is the guided way out; it previews first and only acts with `-y`:
+
+```bash
+vcfa-import release-rollback --vm <moref>        # preview
+vcfa-import release-rollback --vm <moref> -y      # deletes the VirtualMachine + batch; detaches the disk
+```
+
 **Optional, on a throwaway VM:** confirm first-hand that `rollbackAction` is an
 instruction and not a policy. Take a manifest from `plan --show`, add
 `rollbackAction: Immediate` under `controlAction` by hand, `kubectl apply` it,
@@ -573,6 +583,9 @@ exact rather than heuristic.
 | need a clean slate on a batch | precheck-only batch, or nothing in flight | `vcfa-import abandon --batch <name>` (or `--stage precheck`): deletes it, VMs back to `pending`, inventory edits then land |
 | batch deleted with `kubectl` behind the tool's back | | the tool marks its VMs failed with "disappeared from the cluster"; `retry` requeues them |
 | `rollback` never confirms | unrecognised rollback phase | same, under `"rolled_back"` |
+| `precheck`/`run` says *N VM(s) held back: storage-policy compliance is not COMPLIANT/NOT_APPLICABLE* -- including right after upgrading, on VMs discovered long ago | the storage-policy gate is on by default and fails closed: a VM `discover` never checked (an old snapshot, or one loaded from CSV) blocks the same as a known-bad one | re-run `discover` so it records a verdict, or set `storage_compliance_enforce = false` (Settings -> Safety) if this vCenter has no compliance API |
+| a VM sits at `rollback_failed` and stays there | vCenter refuses a step of the operator's own revert (seen: CNS disk unregister, "not supported on the object"); the operator can retry for days without resolving it | `refresh`/`watch` keep polling it (no timeout) in case the operator resolves it on its own; `release-rollback --vm <moref>` is the guided way out once you are sure it will not -- it detaches the disk, so copy the VMDK first if the VM matters |
+| `release-rollback` says no Supervisor VirtualMachine name is on record | `target_resource` was never populated (likely every time in this lab -- unconfirmed whether the operator ever reports it) | the refusal lists candidate VirtualMachine(s) in the namespace (annotated, unclaimed) with the exact `--target` command to copy, if any exist -- it never picks one for you; confirm it's the right one against Automation first, or find the name there yourself if none are listed. It is still checked to exist and to carry the "import in progress" skip-delete annotation before anything is touched |
 | `target_resource` blank | field name unknown | extend `TARGET_KEYS` in `status.py` |
 | `discover`: certificate error | self-signed vCenter | `--insecure` |
 | `discover`: 401 | wrong user format | try `user@vsphere.local` |

@@ -41,9 +41,11 @@ EVENTS = {
     "schedule_finished": "a scheduled run finished (or the window closed)",
     "schedule_missed": "a change window passed without its run starting",
     "verify_failed": "post-import verification found a problem",
+    "rollback_failed": "a rollback step failed and needs a human (see Triage or release-rollback)",
     "test": "a test message from the Settings page",
 }
 SEVERITY = {"job_failed": "bad", "circuit_breaker": "bad", "verify_failed": "bad", "schedule_missed": "bad",
+            "rollback_failed": "bad",
             "job_warning": "warn", "awaiting_commit": "warn", "approval_requested": "warn"}
 COLOR = {"bad": "D42A2A", "warn": "E5A000", "info": "2F6BFF"}
 TYPES = ("teams", "slack", "webhook", "email")

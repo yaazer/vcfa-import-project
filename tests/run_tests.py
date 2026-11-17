@@ -570,6 +570,50 @@ def t_status_child_rollback_condition():
     assert "rollback" in failed.phase.lower(), "the engine flags ROLLBACK FAILED on this"
 
 
+@test("a child stuck mid-rollback on a failed CNS unregister reads as ROLLBACK FAILED")
+def t_status_rollback_stuck_cns_unregister():
+    """Incident 2026-11-13 (docs/incidents/2026-11-13-stuck-rollback-cns-unregister.md):
+    a VM reached AwaitingCommit, then rollbackAction was set. The child kept
+    ReadyForCommit, VirtualMachineCreated and VirtualMachineReady all True and
+    added only RollbackCustomResourceCompleted: False (ObjectDeletionFailure) --
+    RollbackVirtualMachineLocationCompleted, RollbackVirtualMachinePropertyCompleted
+    and RollbackCompleted never appeared at all. Before the fix, operator_status
+    only read RollbackCompleted, so this fell through to ReadyForCommit: True ->
+    AWAITING_COMMIT, forever, while vCenter retried the unregister every ~4.5 min
+    for three days without ever resolving it.
+    """
+    cfg = Config()
+    batch = {"metadata": {"name": "imp-w1-migration-testing-wave-001-9d59f"},
+             "spec": {"defaultSpec": {"controlAction": {"commitAction": "Wait",
+                                                        "rollbackAction": "Immediate"}}},
+             "status": {"conditions": [
+                 {"type": "ReadyForCommit", "status": "True", "reason": "True"},
+                 {"type": "ReadyForImport", "status": "True", "reason": "True"}]}}
+    child = {
+        "metadata": {"name": "8cs-s04-c004001-16890-b78af",
+                     "ownerReferences": [{"name": "imp-w1-migration-testing-wave-001-9d59f"}]},
+        "spec": {"virtualMachineID": "vm-16890"},
+        "status": {"conditions": [
+            {"type": "ReadyForCommit", "status": "True", "reason": "True"},
+            {"type": "VirtualMachineCreated", "status": "True", "reason": "True"},
+            {"type": "VirtualMachineReady", "status": "True", "reason": "True"},
+            {"type": "RollbackCustomResourceCompleted", "status": "False",
+             "reason": "ObjectDeletionFailure",
+             "message": "failed to unregister PVCs from CNS: failed to unregister associated "
+                        "volume f126123a-89a5-46e8-afd4-53cc9e8e10f7"},
+        ]},
+    }
+    result = batch_status(batch, cfg, [child], stage="import").by_moref()["vm-16890"]
+    eq(result.bucket, "failed", "a failed rollback step must never read as still awaiting commit")
+    assert "rollback" in result.phase.lower(), result.phase
+    assert "ObjectDeletionFailure" in result.phase or "ObjectDeletionFailure" in (result.message or ""), result
+
+    # Directly on the child too (operator_status is what _child_operations calls).
+    direct = operator_status(child, cfg, "import")
+    eq(direct.bucket, "failed")
+    assert "ObjectDeletionFailure" in direct.phase
+
+
 @test("a child's PrecheckSucceeded verdict is read directly")
 def t_status_child_precheck_condition():
     """Observed 2026-09-21/23: a precheck child carries PrecheckSucceeded alone.
@@ -933,6 +977,29 @@ def t_vcenter_nics():
     nics2 = _parse_nics(legacy, networks)
     eq(nics2[0].device_key, 4001)
     eq(nics2[0].network_name, "VLAN197-Prod")
+
+
+@test("storage-policy compliance: pass/block classification over every enum value, None and ERROR")
+def t_vcenter_storage_compliance_classify():
+    from vcfaimport.vcenter import storage_compliance_ok, storage_compliance_reason
+
+    # Pass: a known-good answer, or nothing to be non-compliant with.
+    for overall in ("COMPLIANT", "NOT_APPLICABLE", "NO_POLICY"):
+        assert storage_compliance_ok({"overall": overall}), overall
+    # Fail closed: a known-bad answer, an answer that is not known-good, a
+    # failed request, and never having been asked at all -- "unless
+    # compliant" (2026-11-16) means every one of these blocks the same way.
+    for overall in ("NON_COMPLIANT", "OUT_OF_DATE", "UNKNOWN_COMPLIANCE", "ERROR", "", "BOGUS_FUTURE_VALUE"):
+        assert not storage_compliance_ok({"overall": overall}), overall
+    assert not storage_compliance_ok(None)
+    assert not storage_compliance_ok({})
+
+    assert "never checked" in storage_compliance_reason(None)
+    assert "HTTP 403" in storage_compliance_reason({"overall": "ERROR", "status": 403, "error": "nope"})
+    assert "no storage policy" in storage_compliance_reason({"overall": "NO_POLICY"})
+    reason = storage_compliance_reason({"overall": "NON_COMPLIANT", "disks": {
+        "2000": {"status": "NON_COMPLIANT", "failure_cause": "Datastore is not thick"}}})
+    assert "NON_COMPLIANT" in reason and "Datastore is not thick" in reason, reason
 
 
 # ------------------------------------------------------------- tracking
@@ -1309,6 +1376,14 @@ def _write_config(tmp, **overrides):
         "batch_size": 4,
         "max_parallel_batches": 3,
         "workdir": Path(tmp, "run").as_posix(),
+        # Most fixtures here build VMs via `load`/sync_inventory or hand-built
+        # discovered rows, neither of which carries a storage_compliance fact
+        # -- the gate added 2026-11-16 is fail-closed on exactly that ("never
+        # checked" blocks the same as a known-bad answer), so it is off by
+        # default for this test harness. Tests of the gate itself turn it
+        # back on explicitly (storage_compliance_enforce=True) and seed
+        # (or fake_vcenter-discover) a real compliance verdict.
+        "storage_compliance_enforce": False,
     }
     values.update(overrides)  # merge, so a key is never written twice
     lines = []
@@ -1344,6 +1419,56 @@ def _inventory(tmp, count=10, namespaces=("ns-a", "ns-b"), waves=(1, 2)):
                      "sub-{}".format(ns), "4000", wave])
     write_csv(path, rows, ["vm_name", "moref", "namespace", "subnet", "device_key", "wave"])
     return str(path)
+
+
+@test("e2e: discover records vCenter's own storage-policy compliance verdict per VM, "
+      "and readiness/precheck treat it as a hard block, not advisory")
+def t_e2e_discover_storage_compliance():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+
+    # fake_vcenter runs in-process (its HTTP handler reads os.environ directly,
+    # unlike the discover subprocess's own env dict, which it never sees) --
+    # same distinction t_e2e_release_rollback makes the other way round.
+    server, port = fake_vcenter.serve(count=5)
+    saved_env = dict(os.environ)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = _e2e_env(tmp, "happy")
+            env["VCFA_VC_SERVER"] = "http://127.0.0.1:{}".format(port)
+            env["VCFA_VC_USER"] = fake_vcenter.USER
+            env["VCFA_VC_PASSWORD"] = fake_vcenter.PASSWORD
+            _seed_cluster(tmp, ["ns-prod"], ["ns-prod/subnet-197"])
+            cfg = _write_config(tmp, storage_compliance_enforce=True)
+
+            os.environ["FAKE_VC_STORAGE_COMPLIANCE"] = "noncompliant"
+            out = _run_cli(["-c", cfg, "discover"], env, tmp).stdout
+            assert "discovered 5 VM(s)" in out, out
+            assert "not known COMPLIANT/NOT_APPLICABLE" in out, out
+
+            discovered = json.loads(_run_cli(["-c", cfg, "browse", "--json"], env, tmp).stdout)
+            facts = json.loads(discovered[0]["facts_json"])
+            eq(facts["storage_compliance"]["overall"], "NON_COMPLIANT")
+
+            # Every VM finds storage_noncompliant; VM index 0 (i % 11 == 0) also
+            # has Tools NOT_RUNNING, which blocks for its own reason -- assert the
+            # one finding this test is about, not the total block count.
+            cli_readiness = _run_cli(["-c", cfg, "readiness"], env, tmp, expect=4).stdout
+            assert "storage policy" in cli_readiness.lower(), cli_readiness
+            assert "5 VM(s)" in cli_readiness, cli_readiness
+
+            # Fixed in vCenter and re-discovered: the same VMs now pass.
+            os.environ["FAKE_VC_STORAGE_COMPLIANCE"] = ""
+            _run_cli(["-c", cfg, "discover"], env, tmp)
+            discovered2 = json.loads(_run_cli(["-c", cfg, "browse", "--json"], env, tmp).stdout)
+            facts2 = json.loads(discovered2[0]["facts_json"])
+            eq(facts2["storage_compliance"]["overall"], "COMPLIANT")
+            clean = _run_cli(["-c", cfg, "readiness"], env, tmp, expect=None).stdout
+            assert "storage policy" not in clean.lower(), clean
+    finally:
+        server.shutdown()
+        os.environ.clear()
+        os.environ.update(saved_env)
 
 
 @test("e2e: preflight, precheck and import drive every VM to committed")
@@ -2299,6 +2424,27 @@ def t_e2e_run_rollback_failed():
         assert _run_cli(["-c", cfg, "cleanup", "-y"], env, tmp).stdout.count("deleted")
 
 
+@test("e2e: rollback --wait reports a failed rollback step as an error, not a quiet success")
+def t_e2e_rollback_wait_reports_stuck_step():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _e2e_env(tmp, "rollback-stuck", settle="1")
+        _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-a"])
+        cfg = _write_config(tmp, require_precheck=False, rollback_timeout_minutes=1)
+        _run_cli(["-c", cfg, "load", "-i", _inventory(tmp, 1, namespaces=("ns-a",), waves=(1,))],
+                env, tmp)
+        _run_cli(["-c", cfg, "run", "-y"], env, tmp)
+        vms = json.loads(_run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)
+        eq(vms[0]["state"], "awaiting_commit")
+
+        # The incident this models: the tool never reported any of this. Here
+        # it must -- a non-zero exit and the failure named, not a silent 0.
+        out = _run_cli(["-c", cfg, "rollback", "--vm", vms[0]["moref"], "-y"], env, tmp, expect=4).stdout
+        assert "rollback FAILED" in out, out
+        states = {v["state"] for v in json.loads(
+            _run_cli(["-c", cfg, "vms", "--json"], env, tmp).stdout)}
+        eq(states, {"rollback_failed"}, "not a quiet rolled_back")
+
+
 @test("e2e: rollback --no-wait returns at once and refresh picks up the revert")
 def t_e2e_rollback_nowait():
     with tempfile.TemporaryDirectory() as tmp:
@@ -2439,6 +2585,35 @@ def t_triage_groups():
         eq(by_issue["tools"]["stages"], {"import": 1})
         assert None in by_issue, "an unknown message still gets its own group"
         eq(out["groups"][0]["count"], 2, "biggest group first")
+        store.close()
+
+
+@test("triage: a rolling_back VM counts as stalled by when it entered rolling_back, "
+      "not by updated_at (which a chattering operator keeps moving)")
+def t_triage_stalled_rollback():
+    from vcfaimport import service
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _record(store, moref="vm-1", name="web-01")
+        _record(store, moref="vm-2", name="web-02")
+        store.set_vm_state("vm-1", vst.S_ROLLING_BACK, stage="rollback")
+        store.set_vm_state("vm-2", vst.S_ROLLING_BACK, stage="rollback")
+        # vm-1 actually entered rolling_back long ago, but the operator keeps
+        # sending new messages, so updated_at reads as "just now" -- the bug
+        # this guards against used updated_at and so missed exactly this VM.
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        store.conn.execute(
+            "UPDATE transitions SET ts='2026-01-01T00:00:00Z' WHERE moref='vm-1' AND to_state='rolling_back'")
+        store.conn.execute("UPDATE vms SET updated_at=? WHERE moref='vm-1'", (now,))
+        store.conn.commit()
+
+        cfg = Config()
+        cfg.rollback_timeout_minutes = 30
+        out = service.failure_groups(store, cfg)
+        stalled = {v["moref"] for v in out["stalled_rollback"]}
+        eq(stalled, {"vm-1"}, "only the one actually stuck for longer than the timeout")
         store.close()
 
 
@@ -2677,6 +2852,7 @@ def t_plan_fresh_name_after_use():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = Config()
         cfg.workdir = tmp
+        cfg.storage_compliance_enforce = False  # not discovered from vCenter here
         store = _store(tmp)
         _record(store)
         store.set_vm_state("vm-1", vst.S_PRECHECK_PASSED, message="test")
@@ -2729,6 +2905,460 @@ def t_rollback_stop():
         assert "stopped waiting" in store.get_batch("imp-a", "ns-a")["message"], dict(store.get_batch("imp-a", "ns-a"))
         assert any("no further batches will be patched" in m for m in lines), lines
         store.close()
+
+
+@test("refresh: a rolling_back VM never reads as awaiting_commit or committed, not even "
+      "in the gap before any Rollback* condition exists")
+def t_engine_rollback_outranks_import():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    from vcfaimport.status import BatchStatus
+    from vcfaimport.config import (BUCKET_AWAITING_COMMIT, BUCKET_SUCCEEDED, BUCKET_FAILED,
+                                   BUCKET_ROLLED_BACK)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config()
+        cfg.workdir = tmp
+        store = _store(tmp)
+        _record(store, moref="vm-1", name="web-01")
+        store.create_batch("imp-1", "ns-a", "run-1", 1, "import", 1)
+        store.set_vm_state("vm-1", vst.S_IMPORTING, stage="import", batch_name="imp-1")
+        store.set_vm_state("vm-1", vst.S_ROLLING_BACK, stage="rollback")
+        engine = Engine(cfg, store, None, lambda m: None)
+
+        def apply(bstatus):
+            return engine._apply_status_to_vms(
+                "ns-a", "imp-1", "import", bstatus, {"ok": 0, "bad": 0},
+                {"succeeded": 0, "failed": 0, "awaiting_commit": 0})
+
+        # The gap: rollbackAction just landed, the operator has not added any
+        # Rollback* condition yet, so ReadyForCommit can still read True
+        # (observed 2026-11-13). Before the fix this moved the VM to
+        # awaiting_commit via the ordinary import rules.
+        apply(BatchStatus(bucket=BUCKET_AWAITING_COMMIT, phase="ReadyForCommit"))
+        eq(store.get_vm("vm-1")["state"], vst.S_ROLLING_BACK,
+           "a bare ReadyForCommit:True must not override a rollback in progress")
+
+        # A stale Complete:True reading must not commit it either.
+        apply(BatchStatus(bucket=BUCKET_SUCCEEDED, phase="Complete"))
+        eq(store.get_vm("vm-1")["state"], vst.S_ROLLING_BACK)
+
+        # A stale import-side failure (from before rollbackAction was set, or
+        # read in the same gap) that says nothing about rollback at all must
+        # not win either -- only a verdict that actually names rollback may
+        # move this VM out of rolling_back.
+        apply(BatchStatus(bucket=BUCKET_FAILED, phase="OperationFailed",
+                          message="VM Tools not running"))
+        eq(store.get_vm("vm-1")["state"], vst.S_ROLLING_BACK,
+           "a stale, non-rollback failure must not make this VM terminal")
+
+        # The real verdict: a failed rollback step -> rollback_failed, which is
+        # non-terminal so refresh (and release-rollback) can still act on it.
+        apply(BatchStatus(bucket=BUCKET_FAILED, phase="RollbackFailed: ObjectDeletionFailure",
+                          message="failed to unregister associated volume"))
+        row = store.get_vm("vm-1")
+        eq(row["state"], vst.S_ROLLBACK_FAILED)
+        assert row["state"] not in vst.TERMINAL_STATES, "must stay watched, not terminal"
+        assert "ROLLBACK FAILED" in row["message"]
+        eq(engine.newly_rollback_failed, ["vm-1"], "recorded once, for whoever polls to notify")
+
+        # Re-applying the same failed verdict must not spam the event log,
+        # or record a second "newly failed" notification for it.
+        before = len(store.recent_events(limit=50))
+        apply(BatchStatus(bucket=BUCKET_FAILED, phase="RollbackFailed: ObjectDeletionFailure",
+                          message="failed to unregister associated volume"))
+        eq(len(store.recent_events(limit=50)), before, "no duplicate event for an unchanged verdict")
+        eq(engine.newly_rollback_failed, ["vm-1"], "not recorded twice for an unchanged verdict")
+
+        # Eventually the operator succeeds on its own -- always allowed.
+        apply(BatchStatus(bucket=BUCKET_ROLLED_BACK, phase="RollbackCompleted"))
+        eq(store.get_vm("vm-1")["state"], vst.S_ROLLED_BACK)
+        store.close()
+
+
+@test("notify_rollback_failed: pushes one rollback_failed event for a newly-stuck VM, "
+      "and nothing for a refresh that found no new one")
+def t_service_notify_rollback_failed():
+    import time
+    from vcfaimport.engine import Engine
+    from vcfaimport import service
+
+    cap = _Capture()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config()
+            cfg.workdir = tmp
+            cfg.notify = [{"type": "webhook", "name": "test", "url": cap.url + "/h"}]
+            store = _store(tmp)
+            try:
+                engine = Engine(cfg, store, None, lambda m: None)
+
+                # Nothing queued yet -- draining must be a no-op, not an empty send.
+                service.notify_rollback_failed(cfg, engine)
+
+                engine.newly_rollback_failed.append("vm-1")
+                service.notify_rollback_failed(cfg, engine)
+                assert cap.wait_for(lambda p, b: b.get("event") == "rollback_failed", timeout=15), cap.got
+                eq(len(cap.got), 1, "exactly one event for the one VM that just got stuck")
+                eq(engine.newly_rollback_failed, [], "drained")
+
+                # A second, identical call (e.g. the next watch poll with nothing new
+                # to report) must send nothing further.
+                service.notify_rollback_failed(cfg, engine)
+                time.sleep(0.3)
+                eq(len(cap.got), 1, "no new transition, no second notification")
+
+                # wait=True (the CLI's one-shot commands) must join the delivery
+                # thread, so the event is already there with no wait_for polling --
+                # proving a CLI process that exits right after this call would not
+                # have raced its own notification thread to death.
+                engine.newly_rollback_failed.append("vm-2")
+                service.notify_rollback_failed(cfg, engine, wait=True)
+                eq(len(cap.got), 2, "delivered synchronously under wait=True")
+            finally:
+                store.close()
+    finally:
+        cap.close()
+
+
+@test("release_rollback: refuses a batch with a VM lacking a known target name, or still "
+      "plainly rolling_back, without touching the cluster")
+def t_engine_release_rollback_refusals():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+
+    class Kube:
+        dry_run = False
+        calls = []
+        # name -> has the "import in progress" skip-delete annotation
+        existing = {"vm-correct-9001": True, "vm-target-a": True, "vm-target-b": True,
+                   "vm-no-annotation-9002": False}
+
+        def get_json(self, resource, name=None, namespace=None, check=True, **kw):
+            Kube.calls.append(("get", resource, name, namespace))
+            if name not in Kube.existing:
+                return None
+            ann = {"vmoperator.vmware.com.protected/skip-delete-platform-resource": "import in progress"} \
+                if Kube.existing[name] else {}
+            return {"metadata": {"name": name, "annotations": ann}}
+
+        def delete(self, resource, name, ns, ignore_missing=True):
+            Kube.calls.append(("delete", resource, name, ns))
+            return ""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config()
+        cfg.workdir = tmp
+        store = _store(tmp)
+        _record(store, moref="vm-1", name="web-01")
+        _record(store, moref="vm-2", name="web-02")
+        store.create_batch("imp-1", "ns-a", "run-1", 1, "import", 2)
+        store.set_vm_state("vm-1", vst.S_ROLLING_BACK, stage="rollback", batch_name="imp-1")
+        store.set_vm_state("vm-2", vst.S_ROLLING_BACK, stage="rollback", batch_name="imp-1")
+        engine = Engine(cfg, store, Kube(), lambda m: None)
+
+        # vm-1 fails its rollback step but has no known Supervisor VM name on
+        # record; vm-2 is still plainly rolling_back (not yet failed). Either
+        # alone must refuse the whole batch -- never the batch delete without
+        # a known name (never guess), never cut short a rollback that may
+        # still succeed on its own.
+        store.set_vm_state("vm-1", vst.S_ROLLBACK_FAILED, stage="rollback",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        result = engine.release_rollback(batch_names=["imp-1"], confirm=True)
+        assert not result["released"], result
+        assert any("still rolling back" in e for e in result["errors"]), result
+        eq(Kube.calls, [], "nothing touched while another VM may still revert on its own")
+
+        # Now vm-2 also fails, but vm-1 never got a target_resource recorded.
+        store.set_vm_state("vm-2", vst.S_ROLLBACK_FAILED, stage="rollback",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        result = engine.release_rollback(batch_names=["imp-1"], confirm=True)
+        assert not result["released"], result
+        assert any("no known Supervisor VirtualMachine name" in e for e in result["errors"]), result
+        eq(Kube.calls, [], "never guess the target name -- nothing deleted")
+        eq(store.get_vm("vm-1")["state"], vst.S_ROLLBACK_FAILED, "untouched, still watched")
+
+        # A single stuck VM with no target_resource on record (CLAUDE.md: "not
+        # yet observed" on a real operator -- likely true every time, not an
+        # edge case): target= supplies the name by hand, but it is still
+        # checked to exist before anything is touched, same as a recorded one.
+        _record(store, moref="vm-3", name="web-03")
+        store.create_batch("imp-2", "ns-a", "run-1", 1, "import", 1)
+        store.set_vm_state("vm-3", vst.S_ROLLBACK_FAILED, stage="rollback", batch_name="imp-2",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        Kube.calls.clear()
+        wrong = engine.release_rollback(batch_names=["imp-2"], confirm=True, target="vm-wrong-name")
+        assert not wrong["released"], wrong
+        assert any("not found under that name" in e for e in wrong["errors"]), wrong
+        assert not any(c[0] == "delete" for c in Kube.calls), "a wrong target must never be deleted"
+
+        Kube.calls.clear()
+        right = engine.release_rollback(batch_names=["imp-2"], confirm=True, target="vm-correct-9001")
+        eq(right["released"], ["imp-2"], right)
+        eq(store.get_vm("vm-3")["state"], vst.S_SKIPPED)
+
+        # A human-supplied target must exist AND carry the "import in
+        # progress" skip-delete annotation this tool has only observed on an
+        # unfinished import's own VM -- existing is not enough on its own, or
+        # a mistyped name could be any other healthy VM in the namespace.
+        _record(store, moref="vm-4", name="web-04")
+        store.create_batch("imp-3", "ns-a", "run-1", 1, "import", 1)
+        store.set_vm_state("vm-4", vst.S_ROLLBACK_FAILED, stage="rollback", batch_name="imp-3",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        Kube.calls.clear()
+        unannotated = engine.release_rollback(batch_names=["imp-3"], confirm=True,
+                                              target="vm-no-annotation-9002")
+        assert not unannotated["released"], unannotated
+        assert any("does not carry the" in e for e in unannotated["errors"]), unannotated
+        assert not any(c[0] == "delete" for c in Kube.calls), "an unannotated VM must never be deleted"
+
+        # A target= equal to some OTHER VM's own recorded target_resource is
+        # refused outright, before even checking the cluster: a mistyped name
+        # must never silently land on a real, unrelated VM.
+        _record(store, moref="vm-5", name="web-05")
+        store.create_batch("imp-4", "ns-a", "run-1", 1, "import", 1)
+        store.set_vm_state("vm-5", vst.S_COMMITTED, target_resource="vm-already-recorded")
+        _record(store, moref="vm-6", name="web-06")
+        store.set_vm_state("vm-6", vst.S_ROLLBACK_FAILED, stage="rollback", batch_name="imp-4",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        Kube.calls.clear()
+        collide = engine.release_rollback(batch_names=["imp-4"], confirm=True,
+                                          target="vm-already-recorded")
+        assert not collide["released"], collide
+        assert any("already on record as" in e for e in collide["errors"]), collide
+        eq(Kube.calls, [], "refused before ever asking the cluster")
+
+        # target= with more than one batch selected is refused -- it would
+        # otherwise apply the same human-supplied name to all of them. imp-3
+        # (vm-4) and imp-4 (vm-6) are both still stuck: their earlier target=
+        # attempts above were refused, not consumed.
+        multi = engine.release_rollback(batch_names=["imp-3", "imp-4"], confirm=True,
+                                        target="vm-correct-9001")
+        assert any("batches matched" in e for e in multi["errors"]), multi
+
+        # --vm chooses the batch, not which VM in it: a second stuck VM in
+        # the same batch (both already carrying a recorded target_resource,
+        # so target= is irrelevant here) must still get its VirtualMachine
+        # deleted, not left behind unwatched.
+        _record(store, moref="vm-7", name="web-07")
+        _record(store, moref="vm-8", name="web-08")
+        store.create_batch("imp-5", "ns-a", "run-1", 1, "import", 2)
+        store.set_vm_state("vm-7", vst.S_ROLLBACK_FAILED, stage="rollback", batch_name="imp-5",
+                           target_resource="vm-target-a",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        store.set_vm_state("vm-8", vst.S_ROLLBACK_FAILED, stage="rollback", batch_name="imp-5",
+                           target_resource="vm-target-b",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        Kube.calls.clear()
+        partial = engine.release_rollback(morefs=["vm-7"], confirm=True)
+        eq(partial["released"], ["imp-5"], partial)
+        deleted = {c[2] for c in Kube.calls if c[0] == "delete"}
+        assert {"vm-target-a", "vm-target-b"} <= deleted, (
+            "both stuck VMs in the batch must be deleted, not just the one named by --vm: {}"
+            .format(Kube.calls))
+        eq(store.get_vm("vm-8")["state"], vst.S_SKIPPED, "the unnamed one is not left behind")
+        store.close()
+
+
+@test("release_rollback: deletes the VirtualMachine(s) and the batch, stops cleanly on "
+      "Forbidden, and catches one the child recreated empty before the batch was gone")
+def t_e2e_release_rollback():
+    from vcfaimport import state as vst
+    from vcfaimport import service
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved_env = dict(os.environ)
+        try:
+            os.environ.update(_e2e_env(tmp, "rollback-stuck", settle="2"))
+            _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-a"])
+            cfg_path = _write_config(tmp, batch_size=4, require_precheck=False)
+            _run_cli(["-c", cfg_path, "load", "-i",
+                     _inventory(tmp, 1, namespaces=("ns-a",), waves=(1,))], dict(os.environ), tmp)
+            cfg = Config.load(cfg_path)
+
+            with service.Workspace(cfg) as ws:
+                ws.engine.execute("import")
+                rows = ws.store.query_vms()
+                eq([r["state"] for r in rows], [vst.S_AWAITING_COMMIT], "reaches AwaitingCommit first")
+                moref, batch = rows[0]["moref"], rows[0]["batch_name"]
+
+                batches, notes = ws.engine.rollback_targets(batch_names=[batch])
+                assert not notes, notes
+                ws.engine.rollback(batches, action="Immediate", wait=False)
+                eq(ws.store.get_vm(moref)["state"], vst.S_ROLLING_BACK)
+                # The fake child never names its target VM, so the pipeline
+                # never learns it either (unobserved against a real
+                # Supervisor; the real UI reports it) -- set directly here,
+                # same as a `discover`/`cmd_namespaces`-style known fact.
+                ws.store.set_vm_state(moref, vst.S_ROLLING_BACK, stage="rollback",
+                                      target_resource="vm-target-9001")
+                eq(ws.store.get_vm(moref)["target_resource"], "vm-target-9001",
+                   "target_resource must stick on a same-state set_vm_state call")
+
+                # One poll is enough with the fix: RollbackCustomResourceCompleted:
+                # False (ObjectDeletionFailure) is read immediately, not masked
+                # by a lingering ReadyForCommit: True.
+                ws.engine.refresh()
+                row = ws.store.get_vm(moref)
+                eq(row["state"], vst.S_ROLLBACK_FAILED)
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "rolling_back",
+                   "stays pollable, not a terminal batch state")
+
+                # A later refresh must still be watching it (the regression
+                # this guards: a batch wrongly marked done stops being re-polled).
+                ws.engine.refresh()
+                eq(ws.store.get_vm(moref)["state"], vst.S_ROLLBACK_FAILED)
+
+                def cluster_path():
+                    return Path(tmp, "cluster.json")
+
+                # Not found: refuses the whole batch, before anything is
+                # touched -- never guess that an unknown target name means
+                # nothing needs deleting (a wrong target_resource on record
+                # must not silently let the batch get deleted anyway).
+                not_found = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                assert any("not found under that name" in e for e in not_found["errors"]), not_found
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "rolling_back", "batch untouched")
+
+                # Now the VirtualMachine really exists on the cluster.
+                cdata = json.loads(cluster_path().read_text(encoding="utf-8"))
+                cdata.setdefault("vms", {})["ns-a/vm-target-9001"] = {
+                    "apiVersion": "vmoperator.vmware.com/v1alpha2", "kind": "VirtualMachine",
+                    "metadata": {"name": "vm-target-9001", "namespace": "ns-a"}, "status": {}}
+                cluster_path().write_text(json.dumps(cdata), encoding="utf-8")
+
+                # Forbidden stops before the batch is touched (the VM itself
+                # is confirmed to exist first, so this exercises the delete
+                # refusal, not the existence check above).
+                os.environ["FAKE_KUBECTL_VM_DELETE"] = "forbidden"
+                refused = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                assert any("Forbidden" in e for e in refused["errors"]), refused
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "rolling_back", "batch untouched")
+                del os.environ["FAKE_KUBECTL_VM_DELETE"]
+
+                # One recreation of the empty VirtualMachine is caught by the
+                # second pass; the batch and the VM both end up gone, and the
+                # VM is skipped (never failed-with-retry: its disk is detached).
+                os.environ["FAKE_KUBECTL_VM_RECREATE"] = "1"
+                result = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                eq(result["released"], [batch], result)
+                eq(ws.store.get_vm(moref)["state"], vst.S_SKIPPED)
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "deleted")
+                assert result["leftover_checklist"], "the leftover checklist is not silently dropped"
+                assert "ns-a/vm-target-9001" not in _cluster(tmp).get("vms", {}), (
+                    "the recreated VirtualMachine must actually be gone, not just reported gone")
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+
+
+@test("release_rollback: with no known target, lists read-only candidates by the same "
+      "annotation+unclaimed check as target=, but never picks one -- zero, one and two matches")
+def t_e2e_release_rollback_candidates():
+    from vcfaimport import state as vst
+    from vcfaimport import service
+
+    ANN = {"vmoperator.vmware.com.protected/skip-delete-platform-resource": "import in progress"}
+
+    def seed_vm(tmp, ns, name, annotated=True):
+        cdata = json.loads(Path(tmp, "cluster.json").read_text(encoding="utf-8"))
+        cdata.setdefault("vms", {})["{}/{}".format(ns, name)] = {
+            "apiVersion": "vmoperator.vmware.com/v1alpha2", "kind": "VirtualMachine",
+            "metadata": {"name": name, "namespace": ns, "annotations": dict(ANN) if annotated else {},
+                        "creationTimestamp": "2026-11-13T18:26:07Z"},
+            "status": {}}
+        Path(tmp, "cluster.json").write_text(json.dumps(cdata), encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saved_env = dict(os.environ)
+        try:
+            os.environ.update(_e2e_env(tmp, "rollback-stuck", settle="2"))
+            _seed_cluster(tmp, ["ns-a"], ["ns-a/sub-a"])
+            cfg_path = _write_config(tmp, batch_size=4, require_precheck=False)
+            _run_cli(["-c", cfg_path, "load", "-i",
+                     _inventory(tmp, 1, namespaces=("ns-a",), waves=(1,))], dict(os.environ), tmp)
+            cfg = Config.load(cfg_path)
+
+            with service.Workspace(cfg) as ws:
+                ws.engine.execute("import")
+                moref, batch = ws.store.query_vms()[0]["moref"], ws.store.query_vms()[0]["batch_name"]
+                batches, _ = ws.engine.rollback_targets(batch_names=[batch])
+                ws.engine.rollback(batches, action="Immediate", wait=False)
+                # Unlike t_e2e_release_rollback, target_resource is never set here --
+                # this is the "operator never reported it" case the candidate list exists for.
+                ws.engine.refresh()
+                eq(ws.store.get_vm(moref)["state"], vst.S_ROLLBACK_FAILED)
+                assert not ws.store.get_vm(moref)["target_resource"]
+
+                # Zero candidates: nothing in the namespace carries the annotation.
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                err = next(e for e in r["errors"] if "no known Supervisor VirtualMachine" in e)
+                assert "candidate" not in err, err
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "rolling_back", "untouched")
+
+                # One candidate: listed by name, but still not picked automatically --
+                # release_rollback without target= must still refuse and delete nothing.
+                seed_vm(tmp, "ns-a", "vm-candidate-a")
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                err = next(e for e in r["errors"] if "no known Supervisor VirtualMachine" in e)
+                assert "vm-candidate-a" in err, err
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "rolling_back", "still untouched")
+                eq(_cluster(tmp)["vms"].get("ns-a/vm-candidate-a") is not None, True,
+                   "listing a candidate must not delete it")
+                # Reported structurally too, so the CLI can print its own --target
+                # syntax rather than parsing a human-readable string.
+                eq(r["candidates"], [{"namespace": "ns-a", "batch": batch,
+                                      "candidates": [{"name": "vm-candidate-a",
+                                                       "created_at": "2026-11-13T18:26:07Z"}]}])
+
+                # The CLI prints the exact, copy-pasteable --target command for
+                # that candidate -- not the engine's own "pass one by hand"
+                # wording -- and never claims "nothing eligible" in the same
+                # breath as a refusal that names a real cause.
+                out = _run_cli(["-c", cfg_path, "release-rollback", "--batch", batch],
+                               dict(os.environ), tmp, expect=4).stdout
+                assert "release-rollback --batch {} --target vm-candidate-a".format(batch) in out, out
+                assert "nothing eligible" not in out, out
+
+                # A namespace user who cannot `list` VirtualMachines must be told
+                # that, not shown an empty/zero-candidate list that reads as settled.
+                os.environ["FAKE_KUBECTL_VM_LIST"] = "forbidden"
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                err = next(e for e in r["errors"] if "no known Supervisor VirtualMachine" in e)
+                assert "could not list candidate" in err, err
+                eq(r["candidates"], [])
+                del os.environ["FAKE_KUBECTL_VM_LIST"]
+
+                # A second, unannotated VM must never show up as a candidate.
+                seed_vm(tmp, "ns-a", "vm-unannotated", annotated=False)
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                err = next(e for e in r["errors"] if "no known Supervisor VirtualMachine" in e)
+                assert "vm-candidate-a" in err and "vm-unannotated" not in err, err
+
+                # Two real candidates: both listed, and release_rollback still refuses --
+                # ambiguity is surfaced to a human, never resolved by guessing.
+                seed_vm(tmp, "ns-a", "vm-candidate-b")
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                err = next(e for e in r["errors"] if "no known Supervisor VirtualMachine" in e)
+                assert "vm-candidate-a" in err and "vm-candidate-b" in err, err
+                eq(ws.store.get_batch(batch, "ns-a")["state"], "rolling_back", "still nothing deleted")
+
+                # A VM already on record as another row's target_resource must never
+                # be listed as a candidate for this one, even if annotated.
+                _record(ws.store, moref="vm-999", name="other-vm")
+                ws.store.set_vm_state("vm-999", vst.S_SKIPPED, stage="rollback",
+                                      target_resource="vm-candidate-b")
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True)
+                err = next(e for e in r["errors"] if "no known Supervisor VirtualMachine" in e)
+                assert "vm-candidate-a" in err and "vm-candidate-b" not in err, err
+
+                # Copying a listed candidate into target= actually releases it.
+                r = ws.engine.release_rollback(batch_names=[batch], confirm=True, target="vm-candidate-a")
+                eq(r["released"], [batch], r)
+                eq(ws.store.get_vm(moref)["state"], vst.S_SKIPPED)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
 
 
 @test("e2e web: discover, select, stage, arrange, precheck, import, triage, roll back, retry")
@@ -2995,7 +3625,11 @@ def _seed_store_with_vms(store, count, waves=(1, 2), folders=("Prod/Web", "Prod/
         disc.append({"moref": moref, "name": "vm{:04d}".format(i), "power_state": "POWERED_ON",
                      "folder": folder, "datacenter": "DC1", "cluster": "CL1",
                      "tools_status": "RUNNING",
-                     "nics": [{"device_key": 4000, "network_name": "VLAN1"}]})
+                     "nics": [{"device_key": 4000, "network_name": "VLAN1"}],
+                     # A real discover() would have recorded a compliance verdict
+                     # (storage_compliance_enforce is on by default, 2026-11-16);
+                     # a test of that gate itself overwrites this on purpose.
+                     "facts": {"storage_compliance": {"overall": "COMPLIANT", "disks": {}}}})
         recs.append(VmRecord(moref=moref, vm_name="vm{:04d}".format(i), namespace="ns-a",
                              nics=[Nic(4000, "sub-a", "Subnet", "crd.nsx.vmware.com")],
                              wave=waves[i % len(waves)], group=folder.replace("/", "-").lower()))
@@ -3479,7 +4113,16 @@ def _cluster(tmp):
 
 def _queue_console(tmp, scenario, count=8, settle="1", namespaces=("ns-a", "ns-b"),
                    waves=(1,), seed=True, **cfg_overrides):
-    """A console over a workspace whose queue was loaded from an inventory CSV."""
+    """A console over a workspace whose queue was loaded from an inventory CSV.
+
+    A VM loaded this way (not through vCenter discovery) has no `discovered`
+    row, so storage_compliance_enforce's "never checked" is fail-closed on
+    every one of them (2026-11-16: the storage-policy gate is deliberately
+    unconditional). Tests using this helper are about other mechanics, so the
+    override defaults off here; a test that wants the gate on passes
+    storage_compliance_enforce=True through cfg_overrides.
+    """
+    cfg_overrides.setdefault("storage_compliance_enforce", False)
     env = _e2e_env(tmp, scenario, settle=settle)
     patch = _EnvPatch(**{k: env[k] for k in ("FAKE_KUBECTL_STATE", "FAKE_KUBECTL_SCENARIO",
                                               "FAKE_KUBECTL_SETTLE")})
@@ -4268,7 +4911,8 @@ class _FakeSmtp:
 def t_readiness_rules():
     from vcfaimport import readiness
     good = dict(ip="10.0.0.5", facts_json=json.dumps(
-        {"hw_version": "VMX_19", "disk_backings": ["VMDK_FILE"], "nic_states": ["CONNECTED"]}))
+        {"hw_version": "VMX_19", "disk_backings": ["VMDK_FILE"], "nic_states": ["CONNECTED"],
+         "storage_compliance": {"overall": "COMPLIANT"}}))
     eq(readiness.grade(readiness.assess(_disc_row(**good))), "ready")
     codes = lambda **kw: {f["code"] for f in readiness.assess(_disc_row(**dict(good, **kw)))}  # noqa: E731
     eq(codes(tools_status="toolsNotRunning"), {"tools_not_running"})
@@ -4397,6 +5041,8 @@ def t_notify_channels():
             assert why in str(exc), (why, exc)
     cap, smtp = _Capture(), _FakeSmtp()
     try:
+        assert notify.validate([{"type": "webhook", "url": "http://x", "events": ["rollback_failed"]}]), \
+            "rollback_failed must be a known, filterable event"
         channels = notify.validate([
             {"type": "teams", "name": "ops-teams", "url": cap.url + "/teams"},
             {"type": "slack", "url": cap.url + "/slack"},
@@ -4619,6 +5265,7 @@ def t_apps_together():
     from vcfaimport import state as st
     cfg = Config()
     cfg.app_category, cfg.app_together = "Application", True
+    cfg.storage_compliance_enforce = False  # not discovered from vCenter here
     nets = network_map_from_rows([{"portgroup": "*", "subnet": "sub-a"}])
     rows = [_disc_row(moref="vm-1", tags_json='["Application:Payroll"]', namespace="ns-a", wave=2),
             _disc_row(moref="vm-2", tags_json='["application:Payroll", "Tier:DB"]', namespace="ns-a", wave=1),
@@ -4674,6 +5321,141 @@ def t_readiness_exclusion():
         eligible = [r["moref"] for r in engine.eligible("precheck", 1)]
         assert "vm-1001" not in eligible and len(eligible) == 3, eligible
         eq(service.holdbacks(engine, "precheck"), ["wave 1: 1 VM(s) held back: readiness marks them blocked"])
+        store.close()
+
+
+@test("storage-policy compliance: eligible() refuses a VM not known COMPLIANT/NOT_APPLICABLE, "
+      "at precheck and at import, unconditionally unlike readiness_exclude_blocked")
+def t_engine_storage_compliance_gate():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _seed_store_with_vms(store, 4, waves=(1,))
+        store.conn.execute("UPDATE discovered SET facts_json=? WHERE moref='vm-1002'",
+                           (json.dumps({"storage_compliance": {"overall": "NON_COMPLIANT"}}),))
+        store.conn.execute("UPDATE discovered SET facts_json='{}' WHERE moref='vm-1003'")
+        store.conn.commit()
+        cfg = Config()
+        cfg.kubectl, cfg.workdir = "vcfa-test-no-such-kubectl", tmp
+        engine = Engine(cfg, store, None, lambda m: None)
+
+        for stage in ("precheck", "import"):
+            if stage == "import":
+                for m in ("vm-1000", "vm-1001", "vm-1002", "vm-1003"):
+                    store.set_vm_state(m, vst.S_PRECHECK_PASSED, stage="precheck")
+            eligible = {r["moref"] for r in engine.eligible(stage, 1)}
+            assert "vm-1002" not in eligible, (stage, "NON_COMPLIANT must be refused")
+            assert "vm-1003" not in eligible, (stage, "never-checked must be refused (fail closed)")
+            assert {"vm-1000", "vm-1001"} <= eligible, (stage, eligible)
+            assert any("storage-policy compliance" in h for h in engine.holdbacks), engine.holdbacks
+
+        cfg.storage_compliance_enforce = False
+        eligible = {r["moref"] for r in engine.eligible("import", 1)}
+        assert "vm-1002" in eligible and "vm-1003" in eligible, "the named override lets them through"
+        store.close()
+
+
+@test("storage-policy compliance: the live recheck against a real connected client "
+      "(POST .../compliance?action=check) holds back OUT_OF_DATE and a Forbidden alike")
+def t_engine_storage_compliance_live_filter_real_client():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    from vcfaimport.vcenter import VCenterClient, storage_compliance_checker
+
+    server, port = fake_vcenter.serve(count=2)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            from vcfaimport.inventory import Nic, VmRecord
+            store = _store(tmp)
+            # The real morefs fake_vcenter.build_inventory(count=2) generates
+            # (1483400 + i*2) -- the live check calls the real server by
+            # moref, so a fixture moref it does not know would 404 as ERROR
+            # and never reach the OUT_OF_DATE path this test is about.
+            morefs = ["vm-1483400", "vm-1483402"]
+            # Compliant as of the last discover -- eligible()'s own cached
+            # gate must let these through to plan() so the live recheck (not
+            # the cached gate) is what this test exercises.
+            store.upsert_discovered([{"moref": m, "name": m, "power_state": "POWERED_ON",
+                                      "folder": "Prod/Web", "nics": [],
+                                      "facts": {"storage_compliance": {"overall": "COMPLIANT"}}}
+                                     for m in morefs])
+            store.sync_inventory([VmRecord(moref=m, vm_name=m, namespace="ns-a",
+                                           nics=[Nic(4000, "sub-a", "Subnet", "crd.nsx.vmware.com")],
+                                           wave=1) for m in morefs])
+            for m in morefs:
+                store.set_vm_state(m, vst.S_PRECHECK_PASSED, stage="precheck")
+            cfg = Config()
+            cfg.kubectl, cfg.workdir, cfg.batch_size = "vcfa-test-no-such-kubectl", tmp, 10
+            engine = Engine(cfg, store, None, lambda m: None)
+            batches = engine.plan("import", wave=1, write_manifests=False)
+            eq(len(batches), 1)
+
+            client = VCenterClient("http://127.0.0.1:{}".format(port), fake_vcenter.USER,
+                                   fake_vcenter.PASSWORD)
+            client.connect()
+            try:
+                os.environ["FAKE_VC_STORAGE_COMPLIANCE"] = "outofdate"
+                engine.storage_compliance_check = storage_compliance_checker(client)
+                kept = engine._filter_storage_compliance(batches)
+                eq(kept, [], "a real OUT_OF_DATE answer, fetched live, holds the batch back")
+                facts = {m: json.loads(store.query_discovered(morefs=[m])[0]["facts_json"])
+                        for m in morefs}
+                assert all(f["storage_compliance"]["overall"] == "OUT_OF_DATE" for f in facts.values()), facts
+
+                # A real vCenter refusing the call must fail closed too, and
+                # must never overwrite the OUT_OF_DATE verdict just persisted.
+                os.environ["FAKE_VC_STORAGE_COMPLIANCE"] = "forbidden"
+                kept2 = engine._filter_storage_compliance(batches)
+                eq(kept2, [])
+                facts2 = {m: json.loads(store.query_discovered(morefs=[m])[0]["facts_json"])
+                         for m in morefs}
+                assert all(f["storage_compliance"]["overall"] == "OUT_OF_DATE" for f in facts2.values()), (
+                    "a failed request must not overwrite the last real verdict")
+            finally:
+                os.environ.pop("FAKE_VC_STORAGE_COMPLIANCE", None)
+                client.close()
+            store.close()
+    finally:
+        server.shutdown()
+
+
+@test("storage-policy compliance: the live recheck holds back a whole batch, and never persists "
+      "a failed request as if it were a verdict")
+def t_engine_storage_compliance_live_filter():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        # One shared folder/group: plan_batches groups by it, and this test
+        # wants all three VMs in one batch.
+        _seed_store_with_vms(store, 3, waves=(1,), folders=("Prod/Web",))
+        for m in ("vm-1000", "vm-1001", "vm-1002"):
+            store.set_vm_state(m, vst.S_PRECHECK_PASSED, stage="precheck")
+        cfg = Config()
+        cfg.kubectl, cfg.workdir, cfg.batch_size = "vcfa-test-no-such-kubectl", tmp, 10
+        engine = Engine(cfg, store, None, lambda m: None)
+        batches = engine.plan("import", wave=1, write_manifests=False)
+        eq(len(batches), 1, "all three fit in one batch")
+        eq(len(batches[0].records), 3)
+
+        def live_check(morefs):
+            return {
+                "vm-1000": {"overall": "COMPLIANT"},
+                "vm-1001": {"overall": "NON_COMPLIANT"},
+                "vm-1002": {"overall": "ERROR", "status": 503, "error": "session expired"},
+            }
+        engine.storage_compliance_check = live_check
+        kept = engine._filter_storage_compliance(batches)
+        eq(kept, [], "one bad VM holds the whole batch back")
+
+        facts_1001 = json.loads(store.query_discovered(morefs=["vm-1001"])[0]["facts_json"])
+        eq(facts_1001["storage_compliance"]["overall"], "NON_COMPLIANT", "a real verdict is persisted")
+        facts_1002 = json.loads(store.query_discovered(morefs=["vm-1002"])[0]["facts_json"])
+        eq(facts_1002["storage_compliance"]["overall"], "COMPLIANT",
+           "a failed request (ERROR) must never overwrite the cached verdict")
         store.close()
 
 
@@ -4837,6 +5619,8 @@ def t_web_roles_settings():
             rows = {r["key"]: r for r in c.ok("GET", "/api/settings")["settings"]}
             eq((rows["batch_size"]["value"], rows["batch_size"]["overridden"]), (7, True))
             eq(c.ok("GET", "/api/info")["settings"]["batch_size"], 7, "the console uses it right away")
+            assert "rollback_failed" in c.ok("GET", "/api/settings")["events"], \
+                "the Settings channel editor renders its event chips from this list"
             # Notification channels: a secret is refused; a test message reaches the webhook
             bad = [{"type": "email", "smtp_host": "h", "from": "a@x", "to": "b@x", "password": "hunter2"}]
             eq(c.call("PUT", "/api/settings", {"changes": {"notify": bad}})[0], 400)
@@ -4860,6 +5644,38 @@ def t_web_roles_settings():
         finally:
             c.close()
             cap.close()
+
+
+@test("governance: an approved release_rollback request actually runs release_rollback, "
+      "not a plain rollback that finds nothing")
+def t_web_governance_release_rollback():
+    from vcfaimport import state as vst
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            c.ok("PUT", "/api/settings", {"changes": {"require_approval": ["rollback"]}})
+            store = c.app.store
+            _record(store, moref="vm-1", name="web-01")
+            store.create_batch("imp-1", "ns-a", "run-1", 1, "import", 1)
+            store.set_vm_state("vm-1", vst.S_ROLLBACK_FAILED, stage="rollback",
+                               batch_name="imp-1", target_resource="vm-target-1",
+                               message="ROLLBACK FAILED: ObjectDeletionFailure")
+
+            res = c.ok("POST", "/api/run/release_rollback", {"batches": ["imp-1"], "confirm": True})
+            aid = res["approval"]["id"]
+            eq(res["approval"]["stage"], "rollback", "governed under the same stage as rollback")
+
+            otto = c.ok("POST", "/api/users", {"name": "otto", "role": "operator"})["token"]
+            status, dec, _ = c.call("POST", "/api/approvals/{}/decide".format(aid),
+                                    {"approve": True}, token=otto)
+            eq(status, 200, dec)
+            assert dec["job"], "the approval must start a job, not silently do nothing"
+            eq(dec["job"]["kind"], "release_rollback",
+               "an approved release_rollback must run release_rollback, not _job_rollback")
+            job = c.wait(dec["job"])
+            assert "no batch has a VM in rollback_failed state" not in str(job.get("error") or ""), job
+        finally:
+            c.close()
 
 
 @test("e2e web: tags and apps, change window, two-person import, verification, notifications")
@@ -5717,6 +6533,7 @@ def t_precheck_max_age():
         store.conn.execute("UPDATE vms SET precheck_finished_at='2026-09-28T17:41:49Z' WHERE moref='vm-1'")
         store.conn.commit()
         cfg = Config()
+        cfg.storage_compliance_enforce = False  # not discovered from vCenter here
         engine = Engine(cfg, store, None, lambda m: None)
         eq(len(engine.eligible(STAGE_IMPORT, 1)), 2, "0 means no limit")
         cfg.precheck_max_age_hours = 24
@@ -6101,6 +6918,19 @@ def t_activity_now():
         store.set_batch_state("b1", "ns-a", vst.B_TIMEDOUT, "batch exceeded batch_timeout_minutes=90")
         now = service.activity_now(store, cfg)
         assert any(s["key"] == "stalled" and s["level"] == "bad" for s in now["signals"]), now["signals"]
+
+        # A rollback step failed: not in IN_FLIGHT_STATES, so the batch-level
+        # checks above see no in-flight member for it -- this must still
+        # raise its own signal, not rely on the generic "unwatched" one
+        # naming nothing specific (the incident this models went unnoticed
+        # for three days partly because nothing proactively said so).
+        _record(store, "vm-4", "web-4")
+        store.create_batch("b2", "ns-a", "r1", 1, "import", 1)
+        store.set_vm_state("vm-4", vst.S_ROLLBACK_FAILED, stage="rollback", batch_name="b2",
+                           message="ROLLBACK FAILED: ObjectDeletionFailure")
+        store.set_batch_state("b2", "ns-a", vst.B_ROLLING_BACK, "1 reverted, 1 rollback FAILED")
+        now = service.activity_now(store, cfg)
+        assert any(s["key"] == "rollback_stuck" and s["level"] == "bad" for s in now["signals"]), now["signals"]
         store.close()
 
 
@@ -6328,7 +7158,10 @@ UNIT = [
     t_serve_open_headless, t_python_version_message,
     t_web_docs, t_help_doc_anchors,
     t_readiness_rules, t_estimate, t_verify_checks, t_notify_channels, t_access_rules,
+    t_web_governance_release_rollback,
     t_schedule_rules, t_settings_overlay, t_tag_map_stage, t_apps_together, t_readiness_exclusion,
+    t_engine_storage_compliance_gate, t_engine_storage_compliance_live_filter,
+    t_engine_storage_compliance_live_filter_real_client,
     t_web_roles_settings,
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,
     t_precheck_no_commit,
@@ -6339,20 +7172,22 @@ UNIT = [
     t_status_classify, t_status_children, t_status_inline, t_status_empty,
     t_status_operator_precheck, t_status_child_does_not_mask_pass, t_status_operator_stall,
     t_status_child_completed_spelling, t_status_child_precheck_condition,
-    t_status_child_rollback_condition,
-    t_rollback_stop, t_plan_fresh_name_after_use,
+    t_status_child_rollback_condition, t_status_rollback_stuck_cns_unregister,
+    t_rollback_stop, t_engine_rollback_outranks_import, t_service_notify_rollback_failed,
+    t_engine_release_rollback_refusals,
+    t_plan_fresh_name_after_use,
     t_status_operator_import,
     t_status_conditions,
     t_filter_and, t_filter_folder, t_folder_map, t_folder_map_precedence, t_folder_tree,
     t_rollback_scope_warning,
     t_filter_network, t_resolve_identifiers, t_network_map,
     t_stage_namespace_precedence, t_stage_multinic, t_selection_file, t_picker_html,
-    t_vcenter_nics,
+    t_vcenter_nics, t_vcenter_storage_compliance_classify,
     t_track_transitions, t_track_no_duplicates, t_track_milestones, t_track_ledger_file,
     t_track_ledger_durable, t_track_provenance, t_track_provenance_refresh,
     t_track_migration, t_track_csv,
     t_track_target_extraction,
-    t_store_wave_moves, t_store_swap_waves, t_triage_groups, t_map_rows_roundtrip,
+    t_store_wave_moves, t_store_swap_waves, t_triage_groups, t_triage_stalled_rollback, t_map_rows_roundtrip,
     t_skip_semantics, t_web_security, t_web_jobs,
     t_http_keepalive_desync, t_http_body_limits, t_http_fuzz, t_http_host_and_paths,
     t_http_non_loopback, t_http_concurrent_edits, t_workspace_lock, t_web_lock_conflict,
@@ -6373,10 +7208,13 @@ E2E = [
     t_e2e_running_message, t_e2e_vanished_batch, t_e2e_abandon, t_e2e_abandon_refuses_live_import,
     t_e2e_circuit_breaker, t_e2e_commit_gate, t_e2e_commit_already_done, t_e2e_dry_run, t_e2e_resume,
     t_e2e_report, t_e2e_server_dry_run,
-    t_e2e_discover, t_e2e_folders, t_e2e_folder_execution, t_e2e_discover_auth, t_e2e_rediscover,
+    t_e2e_discover, t_e2e_discover_storage_compliance,
+    t_e2e_folders, t_e2e_folder_execution, t_e2e_discover_auth, t_e2e_rediscover,
     t_e2e_rediscover_changes, t_e2e_web_rediscover,
     t_e2e_tracker, t_e2e_tracker_retry,
-    t_e2e_rollback, t_e2e_run_rollback_failed, t_e2e_rollback_nowait, t_e2e_rollback_held,
+    t_e2e_rollback, t_e2e_run_rollback_failed, t_e2e_rollback_wait_reports_stuck_step,
+    t_e2e_rollback_nowait, t_e2e_rollback_held,
+    t_e2e_release_rollback, t_e2e_release_rollback_candidates,
     t_e2e_web_campaign, t_e2e_web_stop,
     t_e2e_web_circuit_breaker, t_e2e_web_commit_gate, t_e2e_web_kubectl_missing,
     t_e2e_web_preflight_problems, t_e2e_web_vcenter_failures, t_e2e_web_vanished_batch,

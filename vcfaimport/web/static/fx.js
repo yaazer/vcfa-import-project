@@ -46,7 +46,7 @@ const FX = (() => {
       '--mono': '"Roboto Mono", "Cascadia Mono", Consolas, "Courier New", monospace',
       '--s-pending': '#8c9ba5', '--s-precheck_running': '#49afd9', '--s-precheck_passed': '#00bfa9', '--s-precheck_failed': '#ff9c32',
       '--s-importing': '#a36ad4', '--s-awaiting_commit': '#ffdc0b', '--s-committed': '#60b515', '--s-failed': '#f35e44',
-      '--s-rolling_back': '#c78fe5', '--s-rolled_back': '#9460b8', '--s-skipped': '#5b6b75',
+      '--s-rolling_back': '#c78fe5', '--s-rollback_failed': '#e0458f', '--s-rolled_back': '#9460b8', '--s-skipped': '#5b6b75',
     } },
     { id: 'vcenter-classic', label: 'vCenter Classic', tag: 'Flex Web Client, blue and grey', mode: 'light', skin: 'classic',
       h1: 215, h2: 210, h3: 130, hb: 220, c: 0.6,
@@ -66,7 +66,7 @@ const FX = (() => {
       '--mono': '"Courier New", Consolas, "Lucida Console", monospace',
       '--s-pending': '#7d8da0', '--s-precheck_running': '#3d8ed8', '--s-precheck_passed': '#1b9e9e', '--s-precheck_failed': '#e07b00',
       '--s-importing': '#6a4fc2', '--s-awaiting_commit': '#d9a300', '--s-committed': '#3a9a3a', '--s-failed': '#c73131',
-      '--s-rolling_back': '#9b59b6', '--s-rolled_back': '#7e57a8', '--s-skipped': '#a9b6c3',
+      '--s-rolling_back': '#9b59b6', '--s-rollback_failed': '#c23d6e', '--s-rolled_back': '#7e57a8', '--s-skipped': '#a9b6c3',
     } },
   ];
   const RQ_DEFAULT = { soft: false, why: '', checked: false };
@@ -108,7 +108,7 @@ const FX = (() => {
         '--s-pending': ok(0.7, 0.03, hb), '--s-precheck_running': ok(0.78, 0.13, 225), '--s-precheck_passed': ok(0.8, 0.13, 185),
         '--s-precheck_failed': ok(0.76, 0.16, 55), '--s-importing': ok(0.72, 0.17, 265), '--s-awaiting_commit': ok(0.84, 0.15, 85),
         '--s-committed': ok(0.8, 0.18, 152), '--s-failed': ok(0.69, 0.21, 25), '--s-rolling_back': ok(0.75, 0.15, 305),
-        '--s-rolled_back': ok(0.67, 0.16, 295), '--s-skipped': ok(0.52, 0.02, hb),
+        '--s-rollback_failed': ok(0.69, 0.2, 345), '--s-rolled_back': ok(0.67, 0.16, 295), '--s-skipped': ok(0.52, 0.02, hb),
       });
     } else {
       const ac = Math.max(0.04, 0.19 * c);
@@ -129,7 +129,7 @@ const FX = (() => {
         '--s-pending': ok(0.62, 0.03, hb), '--s-precheck_running': ok(0.62, 0.14, 230), '--s-precheck_passed': ok(0.62, 0.12, 185),
         '--s-precheck_failed': ok(0.66, 0.17, 50), '--s-importing': ok(0.55, 0.19, 265), '--s-awaiting_commit': ok(0.72, 0.16, 80),
         '--s-committed': ok(0.6, 0.17, 152), '--s-failed': ok(0.58, 0.21, 25), '--s-rolling_back': ok(0.6, 0.16, 305),
-        '--s-rolled_back': ok(0.52, 0.17, 295), '--s-skipped': ok(0.75, 0.02, hb),
+        '--s-rollback_failed': ok(0.58, 0.2, 345), '--s-rolled_back': ok(0.52, 0.17, 295), '--s-skipped': ok(0.75, 0.02, hb),
       });
     }
     if (t.vars) Object.assign(v, t.vars);
@@ -266,7 +266,7 @@ const FX = (() => {
     const cs = getComputedStyle(document.documentElement);
     const get = (k) => cs.getPropertyValue(k).trim();
     for (const s of ['pending', 'precheck_running', 'precheck_passed', 'precheck_failed', 'importing', 'awaiting_commit',
-      'committed', 'failed', 'rolling_back', 'rolled_back', 'skipped']) colors[s] = get('--s-' + s);
+      'committed', 'failed', 'rolling_back', 'rollback_failed', 'rolled_back', 'skipped']) colors[s] = get('--s-' + s);
     colors.discovered = get('--faint');
     colors.accent = get('--accent');
     colors.accent2 = get('--accent-2');
@@ -319,7 +319,7 @@ const FX = (() => {
   const LANE_OF = {
     discovered: 'vcenter', skipped: 'vcenter', pending: 'queued', precheck_running: 'precheck', precheck_passed: 'precheck',
     importing: 'import', awaiting_commit: 'import', rolling_back: 'import', committed: 'vcfa',
-    failed: 'attn', precheck_failed: 'attn', rolled_back: 'attn',
+    failed: 'attn', precheck_failed: 'attn', rolled_back: 'attn', rollback_failed: 'attn',
   };
   const ORDER = Object.keys(LANE_OF);
   const MOVING = new Set(['precheck_running', 'importing', 'rolling_back']);
@@ -330,7 +330,7 @@ const FX = (() => {
   // Grouped streams (by wave, namespace or application): each lane is a group,
   // and its tank stacks by state -- done at the bottom, trouble on top.
   const STACK = ['committed', 'awaiting_commit', 'importing', 'rolling_back', 'precheck_passed', 'precheck_running',
-    'pending', 'rolled_back', 'precheck_failed', 'failed', 'skipped'];
+    'pending', 'rolled_back', 'precheck_failed', 'rollback_failed', 'failed', 'skipped'];
   const GROUP_BY = [['stage', 'Stage'], ['wave', 'Wave'], ['namespace', 'Namespace'], ['app', 'App']];
   const MAX_LANES = 8;
   const sumOf = (o) => Object.values(o || {}).reduce((a, b) => a + (b || 0), 0);
@@ -408,7 +408,7 @@ const FX = (() => {
     const total = d.total || 0;
     const committed = c.committed || 0;
     const moving = ['precheck_passed', 'precheck_running', 'importing', 'awaiting_commit', 'rolling_back'].reduce((a, s) => a + (c[s] || 0), 0);
-    const attn = ['failed', 'precheck_failed', 'rolled_back'].reduce((a, s) => a + (c[s] || 0), 0);
+    const attn = ['failed', 'precheck_failed', 'rolled_back', 'rollback_failed'].reduce((a, s) => a + (c[s] || 0), 0);
     const r = 86, C = 2 * Math.PI * r;
     let start = 0;
     const arcs = [['committed', committed, 'var(--s-committed)'], ['moving', moving, 'var(--accent)'], ['attn', attn, 'var(--s-failed)']]

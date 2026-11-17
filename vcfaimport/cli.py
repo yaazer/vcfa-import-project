@@ -34,7 +34,8 @@ from . import legal
 from . import report
 from . import service
 from . import state as st
-from .vcenter import VCenterClient, VCenterError, discover, resolve_credentials
+from .vcenter import (VCenterClient, VCenterError, discover, resolve_credentials,
+                      storage_compliance_checker)
 
 
 def log(msg: str = "") -> None:
@@ -259,6 +260,7 @@ def cmd_discover(args) -> int:
             with_tags=not args.no_tags,
             with_namespaces=not args.no_namespaces,
             with_subnets=not args.no_subnets,
+            with_storage_compliance=not args.no_storage_compliance,
             concurrency=args.concurrency,
             progress=progress,
             log=log,
@@ -290,6 +292,13 @@ def cmd_discover(args) -> int:
         stale = sum(1 for v in vms if "running" not in (v.tools_status or "").lower())
         if stale:
             log("  {} VM(s) are not running VM Tools (likely precheck failures)".format(stale))
+    if not args.no_storage_compliance:
+        from .vcenter import storage_compliance_ok
+        noncompliant = sum(1 for v in vms if not storage_compliance_ok(v.facts.get("storage_compliance")))
+        if noncompliant:
+            log("  {} VM(s) not known COMPLIANT/NOT_APPLICABLE on storage policy -- held back from "
+                "precheck and import until fixed (storage_compliance_enforce); see `readiness`"
+                .format(noncompliant))
     if not args.no_namespaces:
         ns = extras.get("namespaces")
         if ns is not None:
@@ -711,19 +720,44 @@ def _execute(args, stage: str) -> int:
         return code
     started = time.time()
     lock = None if args.dry_run else service.WorkspaceLock(cfg, "`{}` from the CLI".format(stage))
+    vc_client = None
+    if (stage == STAGE_IMPORT and not args.dry_run and cfg.storage_compliance_enforce
+            and not getattr(args, "no_vcenter_check", False)):
+        try:
+            # Prompt only when the person clearly asked for a live recheck
+            # (--vcenter/--user given) but left the password out -- a bare
+            # `run` with none of these given must stay silent and fall back,
+            # not block on stdin that may not be a terminal (a scheduled run,
+            # a script).
+            asked = bool(getattr(args, "vcenter", None) or getattr(args, "user", None))
+            server, user, password = resolve_credentials(
+                getattr(args, "vcenter", None), getattr(args, "user", None),
+                getattr(args, "password", None), prompt=asked)
+            vc_client = VCenterClient(server, user, password,
+                                      insecure=getattr(args, "insecure", False), log=log)
+            vc_client.connect()
+            engine.storage_compliance_check = storage_compliance_checker(vc_client)
+            log("  vCenter connected for a live storage-policy recheck at each wave's submission")
+        except VCenterError as exc:
+            vc_client = None
+            log("  (no live storage-policy recheck this run: {}; using each VM's last discover "
+                "instead -- pass --vcenter/--user/--password, or --no-vcenter-check to silence "
+                "this)".format(str(exc)[:200]))
     try:
         if lock:
             lock.acquire()
         totals = service.run_stage(
             engine, stage, waves=waves, limit=args.limit, morefs=only,
             include_failed=args.include_failed, folders=scope, folder_exact=exact,
-            rollback_failed=getattr(args, "rollback_failed", False), log=log)
+            rollback_failed=getattr(args, "rollback_failed", False), log=log, wait=True)
     except KeyboardInterrupt:
         log("\ninterrupted; state is saved -- re-run the same command to resume")
         return 130
     finally:
         if lock:
             lock.release()
+        if vc_client:
+            vc_client.close()
 
     halted = totals["halted"]
     if not args.dry_run:
@@ -757,6 +791,7 @@ def cmd_status(args) -> int:
     cfg, store, _kube, engine = _open(args)
     if args.refresh:
         counts = engine.refresh()
+        service.notify_rollback_failed(cfg, engine, wait=True)
         log("re-polled {} batch(es)".format(counts["batches"]))
         log("")
     if args.folder:
@@ -773,6 +808,10 @@ def cmd_watch(args) -> int:
     try:
         while True:
             counts = engine.refresh()
+            # wait=True: rollback_failed keeps a VM in ACTIVE_STATES, so a transition
+            # here never races the final "no batches in flight; exiting" below, but
+            # join it anyway -- it is cheap insurance against that assumption.
+            service.notify_rollback_failed(cfg, engine, wait=True)
             print("\033[2J\033[H", end="")
             log(report.render_status(store, cfg, failures=args.failures))
             log("")
@@ -864,6 +903,7 @@ def cmd_rollback(args) -> int:
     with service.WorkspaceLock(cfg, "`rollback` from the CLI"):
         result = engine.rollback(batches, action=args.action, wait=not args.no_wait,
                                  delete=args.delete, timeout_minutes=args.timeout)
+    service.notify_rollback_failed(cfg, engine, wait=True)
     log("")
     log("patched {} batch(es); {} VM(s) confirmed reverted to vCenter; {} deleted".format(
         len(result["patched"]), result["reverted"], len(result["deleted"])))
@@ -877,6 +917,48 @@ def cmd_rollback(args) -> int:
     if not args.delete and result["reverted"] and not result["pending"]:
         log("the rolled-back batch objects are still on the cluster; `cleanup` removes them")
     return 0 if not result["errors"] and not result["pending"] else 4
+
+
+def cmd_release_rollback(args) -> int:
+    cfg, store, _kube, engine = _open(args)
+    if not (args.batch or args.vm):
+        log("say what to release: --batch NAME or --vm MOREF (every VM currently rollback_failed, "
+            "or just those)")
+        return 2
+    preview = engine.release_rollback(batch_names=args.batch, morefs=args.vm, confirm=False,
+                                      target=args.target)
+    for err in preview["errors"]:
+        log("  ! " + err)
+    for group in preview["candidates"]:
+        for c in group["candidates"]:
+            log("      vcfa-import release-rollback --batch {} --target {}".format(group["batch"], c["name"]))
+    if not preview["preview"]:
+        if not preview["errors"]:
+            log("nothing eligible: a batch needs a VM in rollback_failed state (`status --refresh` first)")
+            return 0
+        return 4
+    log("this detaches each VM's CNS disk and cannot be undone by this tool. If the VM matters,")
+    log("copy its VMDK and inspect the copy read-only before going further.")
+    log("")
+    for line in preview["preview"]:
+        log("  " + line)
+    log("")
+    if not _confirm("Release {} batch(es) now?".format(len(preview["preview"])), args.yes):
+        log("aborted")
+        return 1
+    code = _gate(store, cfg, "rollback", args, {"release_rollback": True, "batches": args.batch})
+    if code is not None:
+        return code
+    with service.WorkspaceLock(cfg, "`release-rollback` from the CLI"):
+        result = engine.release_rollback(batch_names=args.batch, morefs=args.vm, confirm=True,
+                                         target=args.target)
+    log("")
+    log("released {} batch(es)".format(len(result["released"])))
+    for err in result["errors"]:
+        log("  ! " + err)
+    for line in result["leftover_checklist"]:
+        log("  * " + line)
+    return 0 if not result["errors"] else 4
 
 
 def cmd_abandon(args) -> int:
@@ -1603,6 +1685,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="skip asking vCenter for its Workload Management namespace list")
     sp.add_argument("--no-subnets", action="store_true",
                     help="skip asking vCenter for each namespace's NSX Subnet/SubnetSet list")
+    sp.add_argument("--no-storage-compliance", action="store_true",
+                    help="skip asking vCenter for each VM's storage-policy compliance "
+                         "(storage_compliance_enforce then fails closed on all of them)")
     sp.add_argument("--allow-mass-removal", action="store_true",
                     help="remove VMs gone from vCenter even when that is more than half the inventory")
 
@@ -1685,6 +1770,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  "(patches rollbackAction onto the failed batches and waits)")
             sp.add_argument("--approval", type=int, metavar="ID",
                             help="an approved request, when require_approval covers import")
+            sp.add_argument("--vcenter"); sp.add_argument("--user"); sp.add_argument("--password")
+            sp.add_argument("--insecure", action="store_true")
+            sp.add_argument("--no-vcenter-check", action="store_true",
+                            help="skip the live storage-policy recheck; use each VM's last "
+                                 "discover instead (storage_compliance_enforce still applies)")
 
     sp = add("status", cmd_status, "show campaign progress")
     add_scope(sp)
@@ -1718,6 +1808,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="minutes to wait for the revert (default rollback_timeout_minutes)")
     sp.add_argument("--delete", action="store_true",
                     help="delete each batch once its rollback is confirmed")
+    sp.add_argument("--approval", type=int, metavar="ID", help="an approved request (require_approval)")
+    sp.add_argument("-y", "--yes", action="store_true")
+
+    sp = add("release-rollback", cmd_release_rollback,
+             "the Supervisor-side way out of a rollback step that has failed (rollback_failed): "
+             "deletes the stuck VM's VirtualMachine object and the batch; never touches vCenter")
+    sp.add_argument("--batch", action="append", metavar="NAME", help="batch to release; repeatable")
+    sp.add_argument("--vm", action="append", metavar="MOREF", help="release the batch this VM is in; repeatable")
+    sp.add_argument("--target", metavar="NAME",
+                    help="the Supervisor VirtualMachine name, when it was never recorded "
+                         "(target_resource) -- only when exactly one VM in the batch is stuck; "
+                         "still checked to actually exist before anything is touched")
     sp.add_argument("--approval", type=int, metavar="ID", help="an approved request (require_approval)")
     sp.add_argument("-y", "--yes", action="store_true")
 

@@ -178,11 +178,16 @@ function elapsed(job) {
 
 // ------------------------------------------------------------ vm states
 const STATE_ORDER = ['pending', 'precheck_running', 'precheck_passed', 'precheck_failed', 'importing',
-  'awaiting_commit', 'committed', 'failed', 'rolling_back', 'rolled_back', 'skipped'];
+  'awaiting_commit', 'committed', 'failed', 'rolling_back', 'rollback_failed', 'rolled_back', 'skipped'];
 const BUSY = new Set(['precheck_running', 'importing', 'rolling_back']);
-const FAILED = new Set(['failed', 'precheck_failed']);
+const FAILED = new Set(['failed', 'precheck_failed', 'rollback_failed']);
 const RETRYABLE = new Set(['failed', 'precheck_failed', 'rolled_back']);
 const ROLLBACKABLE = new Set(['failed', 'awaiting_commit', 'importing']);
+// A batch holding any of these VM states still has live ownership questions
+// on the cluster (Abandon is refused server-side for them, engine.py
+// abandon_targets) -- the button must agree, not promise an action the
+// server will refuse (incident 2026-11-13, "What the tool did badly" #5).
+const ABANDON_BLOCKED = new Set(['importing', 'awaiting_commit', 'rolling_back', 'rollback_failed']);
 const label = (s) => (S.info && S.info.state_labels && S.info.state_labels[s]) || String(s || '').replace(/_/g, ' ');
 const pill = (s) => html`<span class="pill ${BUSY.has(s) ? 'busy' : ''}" style="--c:var(--s-${s})" data-tip="state:${s}">${label(s)}</span>`;
 const dot = (s) => html`<span class="dot" style="--c:var(--s-${s})" title="${label(s)}"></span>`;
@@ -720,6 +725,35 @@ async function doRollback(sel) {
   if (!res) return;
   await startJob('rollback', Object.assign({}, sel, { batches: p.batches.map((b) => b.name), morefs: null, failed: false, folders: null, delete: !!res.delete, confirm: true }));
 }
+async function doReleaseRollback(sel) {
+  let p;
+  try { p = await POST('/api/release_rollback/preview', sel); } catch (e) { fail(e); return; }
+  // The Supervisor VirtualMachine name is often never recorded (CLAUDE.md:
+  // "not yet observed" on a real operator) -- if that is why nothing is
+  // eligible, offer to supply it by hand. It is still checked to exist
+  // before anything is touched; this never guesses blindly.
+  const needsTarget = p.errors.some((e) => /no known Supervisor VirtualMachine name/.test(e));
+  if (!p.preview.length) {
+    const res = await modal({
+      title: 'Nothing to release', confirm: needsTarget ? 'Retry with that name' : null, cancel: 'Close',
+      body: html`<p class="muted">${needsTarget ? 'No VirtualMachine name on record for the stuck VM.' : 'No batch in the selection has a VM in rollback FAILED state.'}</p>${notesList(p.errors)}
+        ${needsTarget ? html`<label class="small">Supervisor VirtualMachine name<input data-field="target" placeholder="vm-xk6gba33ac"></label>` : ''}`,
+    });
+    if (!res || !res.target) return;
+    return doReleaseRollback(Object.assign({}, sel, { target: res.target }));
+  }
+  const ok = await modal({
+    title: 'Release ' + plural(p.preview.length, 'stuck rollback', 'stuck rollbacks') + '?', danger: true, ic: 'trash', confirm: 'Release', typeWord: 'RELEASE', wide: true,
+    body: html`<p>Deletes the stuck VM's <code>VirtualMachine</code> object and its batch on the Supervisor.
+      <b>This detaches the VM's disk and cannot be undone here.</b> If the VM matters, copy its VMDK and inspect
+      the copy read-only before going further. Nothing in vCenter is touched, and the CNS leftovers this leaves
+      behind are listed afterward for you to clear by hand.</p>
+      <ul>${p.preview.map((line) => html`<li class="small">${line}</li>`)}</ul>
+      ${notesList(p.errors)}`,
+  });
+  if (!ok) return;
+  await startJob('release_rollback', Object.assign({}, sel, { confirm: true }));
+}
 async function doAbandon(sel) {
   let p;
   try { p = await POST('/api/abandon/preview', sel); } catch (e) { fail(e); return; }
@@ -763,7 +797,11 @@ function vmDrawer(moref) {
   openDrawer(async () => {
     const d = await GET('/api/vms/' + encodeURIComponent(moref));
     const vm = d.vm, s = d.summary;
-    const retry = RETRYABLE.has(vm.state), canRb = ROLLBACKABLE.has(vm.state) && vm.batch_name;
+    // A classified issue with a specific actions list overrides the generic
+    // state-based RETRYABLE check -- e.g. "rollback" and "rollback_cns_unregister"
+    // both carry no retry, since the VM may have a detached or missing disk.
+    const retry = RETRYABLE.has(vm.state) && (!d.issue || d.issue.actions.includes('retry'));
+    const canRb = ROLLBACKABLE.has(vm.state) && vm.batch_name;
     const hasBatch = vm.batch_name || vm.precheck_batch;
     const facts = (rows) => html`<dl class="facts">${rows.filter((r) => r[1] !== '' && r[1] !== null && r[1] !== undefined).map((r) => html`<dt>${r[0]}</dt><dd>${r[1]}</dd>`)}</dl>`;
     const blocked = (vm.readiness || []).filter((f) => f.level !== 'info');
@@ -804,8 +842,9 @@ function vmDrawer(moref) {
         <button class="btn" data-act="d_wave" ${attr(s.locked, 'disabled')}>${icon('waves')} Move wave</button>
         ${vm.state === 'committed' ? html`<button class="btn" data-act="d_verify">${icon('check')} Verify</button>` : ''}
         <span class="grow"></span>
-        <button class="btn danger-ghost" data-act="d_abandon" ${attr(!hasBatch || vm.state === 'committed', 'disabled')}>${icon('trash')} Abandon batch</button>
-        <button class="btn danger-ghost" data-act="d_rollback" ${attr(!canRb, 'disabled')}>${icon('rollback')} Roll back</button>`,
+        <button class="btn danger-ghost" data-act="d_abandon" ${attr(!hasBatch || ABANDON_BLOCKED.has(vm.state), 'disabled')} data-tip="${ABANDON_BLOCKED.has(vm.state) ? 'refused while ownership is with the Supervisor -- ' + (vm.state === 'rollback_failed' ? 'use Release stuck rollback' : 'roll back first') : ''}">${icon('trash')} Abandon batch</button>
+        <button class="btn danger-ghost" data-act="d_rollback" ${attr(!canRb, 'disabled')}>${icon('rollback')} Roll back</button>
+        ${vm.state === 'rollback_failed' ? html`<button class="btn danger-ghost" data-act="d_release_rollback">${icon('trash')} Release stuck rollback</button>` : ''}`,
       act: {
         d_retry: async () => { if (await doRetry([s])) { reloadDrawer(); refreshView(); } },
         d_skip: async () => { await doSkip([vm.moref]); reloadDrawer(); refreshView(); },
@@ -814,6 +853,7 @@ function vmDrawer(moref) {
         d_rollback: () => doRollback({ morefs: [vm.moref] }),
         d_verify: () => startJob('verify', { morefs: [vm.moref] }),
         d_abandon: () => doAbandon({ morefs: [vm.moref] }),
+        d_release_rollback: () => doReleaseRollback({ morefs: [vm.moref] }),
       },
     };
   });
@@ -825,6 +865,8 @@ function batchDrawer(ns, name) {
     const counts = {};
     d.members.forEach((m) => { counts[m.state] = (counts[m.state] || 0) + 1; });
     const canRb = b.stage === 'import' && d.members.some((m) => ROLLBACKABLE.has(m.state)) && b.state !== 'deleted';
+    const liveMembers = d.members.some((m) => ABANDON_BLOCKED.has(m.state));
+    const stuckMembers = d.members.some((m) => m.state === 'rollback_failed');
     return {
       head: html`<div class="row wrap"><h2 class="mono" style="font-size:16px">${b.name}</h2>${batchTag(b.state)}<span class="tag">${b.stage}</span></div>
         <div class="small muted">${b.namespace} · wave ${b.wave} · ${plural(b.vm_count, 'VM')} · run ${b.run_id}</div>`,
@@ -841,12 +883,14 @@ function batchDrawer(ns, name) {
       foot: html`
         ${b.state === 'rolled_back' ? html`<button class="btn" data-act="b_delete">${icon('trash')} Delete from cluster</button>` : ''}
         <span class="grow"></span>
-        <button class="btn danger-ghost" data-act="b_abandon" ${attr(b.state === 'deleted', 'disabled')}>${icon('trash')} Abandon</button>
-        <button class="btn danger-ghost" data-act="b_rollback" ${attr(!canRb, 'disabled')}>${icon('rollback')} Roll back</button>`,
+        <button class="btn danger-ghost" data-act="b_abandon" ${attr(b.state === 'deleted' || liveMembers, 'disabled')} data-tip="${liveMembers ? 'refused while a VM\'s ownership is with the Supervisor' : ''}">${icon('trash')} Abandon</button>
+        <button class="btn danger-ghost" data-act="b_rollback" ${attr(!canRb, 'disabled')}>${icon('rollback')} Roll back</button>
+        ${stuckMembers ? html`<button class="btn danger-ghost" data-act="b_release_rollback">${icon('trash')} Release stuck rollback</button>` : ''}`,
       act: {
         b_rollback: () => doRollback({ batches: [b.name] }),
         b_abandon: () => doAbandon({ batches: [b.name] }),
         b_delete: () => doCleanup([b]),
+        b_release_rollback: () => doReleaseRollback({ batches: [b.name] }),
       },
     };
   });

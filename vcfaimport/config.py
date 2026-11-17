@@ -87,6 +87,19 @@ class Config:
     require_precheck: bool = True      # refuse to import VMs with no passing precheck
     readiness_exclude_blocked: bool = False  # keep VMs readiness marks "blocked" out of precheck
     precheck_max_age_hours: int = 0    # import refuses a precheck older than this; 0 = no limit
+    # Unconditional, unlike readiness_exclude_blocked: refuses to import a VM
+    # whose last-known (or, with vCenter credentials on `run`, freshly
+    # rechecked) storage-policy compliance is not COMPLIANT/NOT_APPLICABLE --
+    # including a VM never checked at all. The named override for when this
+    # is not wanted (e.g. a vCenter too old for the compliance API).
+    storage_compliance_enforce: bool = True
+    # The Supervisor's vm-operator VirtualMachine CR, release_rollback's only
+    # target. Qualified with its API group: a bare "virtualmachines" could
+    # silently resolve to nothing, or to the wrong CRD, on a cluster with a
+    # same-named resource in another group -- and a delete request kubectl
+    # cannot resolve at all is otherwise indistinguishable from one that
+    # quietly did nothing.
+    vm_resource: str = "virtualmachines.vmoperator.vmware.com"
 
     # ---- governance --------------------------------------------------------
     # Stages that need a second person: any of "import", "commit", "rollback".
@@ -273,6 +286,8 @@ max_vms_per_run         = 0      # 0 = unlimited
 require_precheck        = true
 # readiness_exclude_blocked = false   # keep VMs readiness marks "blocked" out of precheck
 # precheck_max_age_hours = 24         # import holds back VMs whose precheck is older; 0 = no limit
+storage_compliance_enforce = true   # refuse to import a VM not known COMPLIANT/NOT_APPLICABLE
+# vm_resource = "virtualmachines.vmoperator.vmware.com"  # VirtualMachine CR (release-rollback)
 
 [governance]
 # require_approval = ["import", "commit"]   # a second person approves these (console and CLI)

@@ -1574,7 +1574,7 @@ VIEWS.triage = view({
   paint(v) {
     const d = v.d;
     const total = d.groups.reduce((a, g) => a + g.count, 0);
-    const nothing = !total && !d.stalled.length && !d.rolled_back.length && !d.cleanup.length && !d.awaiting_commit.length;
+    const nothing = !total && !d.stalled.length && !d.stalled_rollback.length && !d.rolled_back.length && !d.cleanup.length && !d.awaiting_commit.length;
     if (nothing) return emptyState('check', 'Nothing needs attention', 'No failed, stalled or rolled-back VMs. Failures show up here grouped by cause as soon as they happen.');
     return html`
       <div class="kpis">${kpi('Failed VMs', total, plural(d.groups.length, 'distinct cause'), null, 'var(--s-failed)')}
@@ -1583,6 +1583,9 @@ VIEWS.triage = view({
         ${kpi('Awaiting commit', d.awaiting_commit.length, '', d.awaiting_commit.length ? 'execute' : null, 'var(--s-awaiting_commit)')}</div>
       <div class="stack mt">
         ${d.groups.map((g, i) => issueCard(v, g, i))}
+        ${d.stalled_rollback.length ? html`<div class="card issue warn"><div class="card-h"><h3>Rollback unconfirmed for a while ${tip('rolling_back')}</h3><span class="tag warn">${plural(d.stalled_rollback.length, 'VM')}</span></div>
+          <div class="card-b"><p class="muted small" style="margin-top:0">Still reverting past rollback_timeout_minutes with no failed step reported yet. The operator may still resolve it on its own -- refresh to check. If a step then shows FAILED, it moves above with Release stuck rollback offered.</p>${vmChips(d.stalled_rollback, 30)}</div>
+          <div class="card-f"><button class="btn" data-act="refreshCluster">${icon('refresh')} Refresh from cluster</button></div></div>` : ''}
         ${d.stalled.length ? html`<div class="card issue warn"><div class="card-h"><h3>Stalled in a timed-out batch ${tip('stalled')}</h3><span class="tag warn">${plural(d.stalled.length, 'VM')}</span></div>
           <div class="card-b"><p class="muted small" style="margin-top:0">The operator never reported a result within batch_timeout_minutes, so nobody is polling these. Refresh to pick up a late result; if they stay stuck, roll the batch back.</p>${vmChips(d.stalled, 30)}</div>
           <div class="card-f"><button class="btn" data-act="refreshCluster">${icon('refresh')} Refresh from cluster</button>
@@ -1602,6 +1605,7 @@ VIEWS.triage = view({
     async gSkip(t, e, v) { await doSkip(v.d.groups[+t.dataset.i].vms.map((x) => x.moref)); v.refresh(); },
     gRollback: (t, e, v) => doRollback({ morefs: v.d.groups[+t.dataset.i].vms.map((x) => x.moref) }),
     gAbandon: (t, e, v) => doAbandon({ morefs: v.d.groups[+t.dataset.i].vms.map((x) => x.moref) }),
+    gReleaseRollback: (t, e, v) => doReleaseRollback({ morefs: v.d.groups[+t.dataset.i].vms.map((x) => x.moref) }),
     gQueue: (t, e, v) => { const g = v.d.groups[+t.dataset.i]; go('queue', 'state=' + Object.keys(g.stages).map((s) => (s === 'precheck' ? 'precheck_failed' : 'failed')).join(',')); },
     async retryList(t, e, v) { if (await doRetry(v.d[t.dataset.list])) v.refresh(); },
     rbList: (t, e, v) => doRollback({ morefs: v.d[t.dataset.list].map((x) => x.moref) }),
@@ -1619,7 +1623,8 @@ function issueCard(v, g, i) {
   const acts = new Set(is ? is.actions : ['retry']);
   const hasImport = !!g.stages.import;
   const precheckOnly = !hasImport;
-  return html`<div class="card issue ${is && is.id === 'rollback' ? '' : precheckOnly ? 'warn' : ''}">
+  const isStuckRollback = is && is.id === 'rollback_cns_unregister';
+  return html`<div class="card issue ${is && (is.id === 'rollback' || isStuckRollback) ? '' : precheckOnly ? 'warn' : ''}">
     <div class="card-h"><div class="count ${precheckOnly ? 'warn-text' : 'bad-text'}">${n(g.count)}</div>
       <div class="grow"><h3>${is ? is.title : 'Unrecognised failure'}</h3>
         <div class="row wrap tiny">${Object.entries(g.stages).map(([s, c]) => html`<span class="tag ${s === 'import' ? 'bad' : 'warn'}">${c} at ${s}</span>`)}</div></div>
@@ -1637,7 +1642,8 @@ function issueCard(v, g, i) {
       ${acts.has('abandon') ? html`<button class="btn sm" data-act="gAbandon" data-i="${i}">${icon('trash')} Abandon batches</button>` : ''}
       <button class="btn sm ghost" data-act="gQueue" data-i="${i}">Open in queue</button>
       <span class="grow"></span>
-      ${hasImport ? html`<button class="btn sm danger-ghost" data-act="gRollback" data-i="${i}">${icon('rollback')} Roll back to vCenter</button>` : ''}
+      ${acts.has('release_rollback') ? html`<button class="btn sm danger-ghost" data-act="gReleaseRollback" data-i="${i}">${icon('trash')} Release stuck rollback</button>` : ''}
+      ${hasImport && !isStuckRollback ? html`<button class="btn sm danger-ghost" data-act="gRollback" data-i="${i}">${icon('rollback')} Roll back to vCenter</button>` : ''}
     </div></div>`;
 }
 

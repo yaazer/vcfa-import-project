@@ -95,6 +95,9 @@ const STATE_TIPS = {
   committed: 'Done: owned by VCF Automation. Irreversible — it can no longer be handed back to vCenter.',
   failed: 'The import failed. Roll it back to vCenter, then retry once the cause is fixed.',
   rolling_back: 'The operator is handing it back to vCenter.',
+  rollback_failed: 'The operator tried to hand it back to vCenter and a rollback step failed (kept non-terminal '
+    + 'so it is still watched, in case the operator resolves it on its own). Use Release stuck rollback once you '
+    + 'are sure it will not -- that deletes the Supervisor VirtualMachine object and the batch, detaching the disk.',
   rolled_back: 'Back in vCenter. Retry once the cause is fixed.',
   skipped: 'Left out of every precheck and import until unskipped.',
 };

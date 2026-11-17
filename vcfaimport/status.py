@@ -346,8 +346,19 @@ COND_PRECHECK_OK = "PrecheckSucceeded"
 # Reading only the import conditions kept a reverted child "running", and child
 # status wins over the batch, so `rollback` waited out its whole timeout.
 COND_ROLLBACK_DONE = "RollbackCompleted"
+# The three per-step conditions RollbackCompleted sits "alongside" (comment
+# above). Location and Property never start until CustomResourceCompleted
+# succeeds (incident 2026-11-13: a failed CNS unregister left the child at
+# RollbackCustomResourceCompleted: False (ObjectDeletionFailure), Location and
+# Property never added, RollbackCompleted never added either -- so reading
+# only COND_ROLLBACK_DONE left the whole rollback reading as "still running
+# the import", via ReadyForCommit: True, which stayed True throughout).
+COND_ROLLBACK_CR = "RollbackCustomResourceCompleted"
+COND_ROLLBACK_LOCATION = "RollbackVirtualMachineLocationCompleted"
+COND_ROLLBACK_PROPERTY = "RollbackVirtualMachinePropertyCompleted"
+ROLLBACK_STEP_CONDITIONS = (COND_ROLLBACK_CR, COND_ROLLBACK_LOCATION, COND_ROLLBACK_PROPERTY)
 OPERATOR_CONDITIONS = (COND_READY_IMPORT, COND_READY_COMMIT, COND_COMPLETE,
-                       COND_COMPLETED_ALT, COND_PRECHECK_OK, COND_ROLLBACK_DONE)
+                       COND_COMPLETED_ALT, COND_PRECHECK_OK, COND_ROLLBACK_DONE) + ROLLBACK_STEP_CONDITIONS
 REASON_WORKING = ("objectnotready", "notready", "inprogress", "pending", "reconciling")
 
 READY_OPS_KEYS = ("readyOps", "readyOperations")
@@ -431,19 +442,34 @@ def operator_status(
         return bool(cond) and not _is_true(cond) and not working(cond)
 
     rollback_done = conds.get(COND_ROLLBACK_DONE)
+    rollback_steps = [conds[c] for c in ROLLBACK_STEP_CONDITIONS if c in conds]
 
     # --- batch-level verdict -------------------------------------------------
-    if rollback_done is not None:
+    if rollback_done is not None or rollback_steps:
         # A revert outranks wherever the import stopped.
         if _is_true(rollback_done):
             bucket, phase, message = BUCKET_ROLLED_BACK, COND_ROLLBACK_DONE, message_of(rollback_done)
-        elif working(rollback_done):
-            bucket, phase, message = BUCKET_RUNNING, "RollbackInProgress", message_of(rollback_done)
-        else:
-            # Keep "Rollback" in the phase: the engine marks the VM ROLLBACK FAILED on it.
+        elif rollback_done is not None and not working(rollback_done):
+            # RollbackCompleted itself gave a verdict (False, not a transient
+            # reason): trust it over the individual steps.
             bucket = BUCKET_FAILED
             phase = "RollbackFailed: " + (reason_of(rollback_done) or COND_ROLLBACK_DONE)
             message = message_of(rollback_done)
+        else:
+            # RollbackCompleted is absent or still working: a step condition
+            # that is False with a real reason is itself the verdict (see
+            # ROLLBACK_STEP_CONDITIONS above) -- keep "Rollback" in the phase
+            # so the engine marks the VM ROLLBACK FAILED on it.
+            failed_step = next((c for c in rollback_steps if verdict(c)), None)
+            if failed_step is not None:
+                bucket = BUCKET_FAILED
+                phase = "RollbackFailed: " + (reason_of(failed_step) or "Unknown")
+                message = message_of(failed_step)
+            else:
+                bucket = BUCKET_RUNNING
+                phase = "RollbackInProgress"
+                message = (message_of(rollback_done) if rollback_done is not None else None) or next(
+                    (m for m in (message_of(c) for c in rollback_steps) if m), None)
     elif precheck and precheck_ok is not None:
         # A child ImportOperation states its precheck verdict outright. Without
         # this, a failed precheck child (PrecheckSucceeded: False, reason e.g.

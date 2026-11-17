@@ -13,6 +13,7 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -235,13 +236,19 @@ def run_stage(engine: Engine, stage: str, *, waves: Optional[Sequence[int]] = No
               limit: int = 0, morefs: Optional[Sequence[str]] = None,
               include_failed: bool = False, folders: Optional[Sequence[str]] = None,
               folder_exact: bool = False, rollback_failed: bool = False,
-              log: Optional[Log] = None, deadline: Optional[float] = None) -> Dict[str, Any]:
+              log: Optional[Log] = None, deadline: Optional[float] = None,
+              wait: bool = False) -> Dict[str, Any]:
     """engine.execute plus the optional --rollback-failed follow-up.
 
     Returns the totals with a "halted" key: the circuit breaker's reason, or None.
     `deadline` (epoch seconds) is a change window's end: no batch is started
     that its measured duration says would not finish by then.
     KeyboardInterrupt is left to the caller.
+
+    `wait`: join the notification thread(s) before returning. The CLI passes
+    True because the process is about to exit (same reason notify_run does);
+    a console job or scheduled window leaves it False since the process stays
+    up and a dead webhook's retries (2s, 4s) must never hold up the caller.
     """
     say = log or engine.log
     halted = None
@@ -258,6 +265,7 @@ def run_stage(engine: Engine, stage: str, *, waves: Optional[Sequence[int]] = No
         totals = {"applied": 0, "succeeded": 0, "failed": 1, "awaiting_commit": 0, "batches": 0}
     if stage == STAGE_IMPORT and rollback_failed and totals["failed"]:
         rollback_failed_after_run(engine, waves, folders, folder_exact, say)
+    notify_rollback_failed(engine.cfg, engine, wait=wait)
     totals["halted"] = halted
     totals["hit_deadline"] = engine.hit_deadline
     totals["holdbacks"] = list(engine.holdbacks)
@@ -332,7 +340,11 @@ def abandon_preview(store: st.Store, batches: Sequence[sqlite3.Row]) -> List[Dic
 
 
 # ---------------------------------------------------------------- snapshots
-FAILED_STATES = (st.S_FAILED, st.S_PRECHECK_FAILED)
+# rollback_failed counts as a failure for every dashboard/report that reads
+# this: it is non-terminal (refresh keeps watching it) but it needs a human
+# the same way a plain failure does -- the incident this models (2026-11-13)
+# went three days unnoticed partly because nothing counted it as trouble.
+FAILED_STATES = (st.S_FAILED, st.S_PRECHECK_FAILED, st.S_ROLLBACK_FAILED)
 IN_FLIGHT_STATES = (st.S_PRECHECK_RUNNING, st.S_IMPORTING, st.S_ROLLING_BACK)
 
 
@@ -677,6 +689,15 @@ KNOWN_ISSUES: List[Dict[str, Any]] = [
                "that: abandon the batch (committed VMs stay), delete the leftover VM in vCenter, then "
                "skip it.",
      "actions": ["rollback", "abandon", "skip"]},
+    {"id": "rollback_cns_unregister",
+     "pattern": r"failed to unregister (PVCs|associated volume)|CnsUnregisterVolume|ObjectDeletionFailure",
+     "title": "vCenter refused to unregister the VM's disk during rollback",
+     "advice": "Check vCenter's task 'Unregister a virtual disk object to be a legacy disk' for why. The "
+               "operator retries this indefinitely (seen: every ~4.5 min, for days) and the VM stays with "
+               "the Supervisor the whole time. `release-rollback` is the guided, Supervisor-side way out "
+               "once you are sure it will not resolve on its own -- it detaches the VM's disk and cannot "
+               "be undone here, so copy the VMDK first if the VM matters.",
+     "actions": ["release_rollback"]},
     {"id": "rollback", "pattern": r"ROLLBACK FAILED",
      "title": "The operator could not hand the VM back to vCenter",
      "advice": "Needs a human: check the VM in vCenter and its ImportOperation in the "
@@ -726,7 +747,7 @@ def classify_failure(message: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def failure_groups(store: st.Store) -> Dict[str, Any]:
+def failure_groups(store: st.Store, cfg: Optional[Config] = None) -> Dict[str, Any]:
     """Failed VMs grouped by what went wrong, each with advice and suggested actions."""
     groups: Dict[str, Dict[str, Any]] = {}
     for row in store.query_vms(states=list(FAILED_STATES), order="updated_at DESC"):
@@ -750,8 +771,24 @@ def failure_groups(store: st.Store) -> Dict[str, Any]:
                if (v["namespace"], v["batch_name"]) in stuck_batches
                or (v["namespace"], v["precheck_batch"]) in stuck_batches]
     rolled_back = [vm_summary(v) for v in store.query_vms(states=[st.S_ROLLED_BACK])]
+    # Still rolling_back past rollback_timeout_minutes, with no failed step
+    # reported yet (that case is rollback_failed, already in `groups` above):
+    # the incident this models had nothing here for three days. Measured from
+    # the transition INTO rolling_back, not updated_at -- updated_at moves on
+    # every poll that merely changes the operator's message, so a VM stuck
+    # for days but still chattering would never look stale by that measure.
+    timeout_s = (cfg.rollback_timeout_minutes if cfg else 30) * 60
+    cutoff = datetime.now(timezone.utc).timestamp() - timeout_s
+    stalled_rollback = []
+    for v in store.query_vms(states=[st.S_ROLLING_BACK]):
+        started = store.transitions(moref=v["moref"], to_state=st.S_ROLLING_BACK,
+                                    newest_first=True, limit=1)
+        since = st._parse_ts(started[0]["ts"]) if started else None
+        if since is not None and since.timestamp() < cutoff:
+            stalled_rollback.append(vm_summary(v))
     return {
         "groups": ordered,
+        "stalled_rollback": stalled_rollback,
         "stalled": stalled,
         "rolled_back": rolled_back,
         "cleanup": [dict(b) for b in cleanup_candidates(store)],
@@ -885,6 +922,22 @@ def activity_now(store: st.Store, cfg: Config, *, job: Optional[Dict[str, Any]] 
             "The batch passed batch_timeout_minutes ({} min). Refresh to pick up a late result, or roll back.".format(
                 cfg.batch_timeout_minutes), {"label": "Open Triage", "go": "triage"})
 
+    # A rollback step that failed: non-terminal (refresh/watch keep polling
+    # it), but IN_FLIGHT_STATES above does not include it, so a batch holding
+    # only this kind of VM carries no specific alert otherwise -- just the
+    # generic "unwatched" one below, with no mention of what is actually
+    # wrong. This is what let the incident this models go unnoticed for three
+    # days: nothing proactively said "a rollback step failed", even once the
+    # state itself stopped being misread.
+    stuck_rollback = store.query_vms(states=[st.S_ROLLBACK_FAILED])
+    if stuck_rollback:
+        add("bad", "rollback_stuck",
+            "{} failed a rollback step and needs a human".format(plural_s(len(stuck_rollback), "VM")),
+            "The operator could not finish reverting it (see Triage for why). It stays watched, in "
+            "case the operator resolves it on its own -- release-rollback is the guided way out "
+            "once you are sure it will not.",
+            {"label": "Open Triage", "go": "triage"})
+
     running = job is not None and job.get("status") == "running"
     if batches and not running and not other_holder:
         add("warn", "unwatched", "{} on the cluster and nothing is polling {}".format(
@@ -919,7 +972,7 @@ def activity_now(store: st.Store, cfg: Config, *, job: Optional[Dict[str, Any]] 
             "It starts on its own at that time.", {"label": "Change control", "go": "schedule"})
     failed = sum(counts.get(s, 0) for s in FAILED_STATES)
     if failed:
-        groups = failure_groups(store)["groups"]
+        groups = failure_groups(store, cfg)["groups"]
         top = groups[0] if groups else None
         cause = (top["issue"]["title"] if top and top["issue"] else (top["message"] if top else "")) or "see Triage"
         add("warn", "failed", "{} failed".format(plural_s(failed, "VM")),
@@ -1120,6 +1173,33 @@ def notifier(cfg: Config) -> Callable[..., Any]:
             _notify.send(channels, event, title, text, fields or {},
                          {"context": cfg.context, "workdir": str(cfg.workdir)}, record=record, wait=wait)
     return send
+
+
+def notify_rollback_failed(cfg: Config, engine: Engine, wait: bool = False) -> None:
+    """Push a notification for any VM that just failed a rollback step.
+
+    engine.newly_rollback_failed is drained here -- this is the push half of
+    the Activity page's "rollback_stuck" signal (activity_now), which only
+    helps whoever already has that page open. Call this after anything that
+    can cause the transition: execute (run_stage), rollback, and each
+    refresh in `watch` -- that last one is the only thing polling at all
+    when nobody is looking at the console, which is exactly how the incident
+    this models went unnoticed for three days.
+
+    `wait=True` (CLI one-shot commands) joins the delivery thread so the
+    process does not exit -- and kill it -- before the notification lands,
+    same as notify_run. A long-lived caller (console job, `watch`'s own
+    loop, a scheduled window) leaves it False.
+    """
+    morefs = list(engine.newly_rollback_failed)
+    engine.newly_rollback_failed.clear()
+    if not morefs:
+        return
+    send = notifier(cfg)
+    send("rollback_failed", "{} rollback FAILED".format(plural_s(len(morefs), "VM")),
+        "The operator could not finish reverting {}; see Triage or release-rollback.".format(
+            "it" if len(morefs) == 1 else "them"),
+        {"morefs": morefs}, wait)
 
 
 def notify_run(cfg: Config, kind: str, title: str, status: str, result: Dict[str, Any],

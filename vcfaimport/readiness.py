@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, List, Sequence
 
+from .vcenter import storage_compliance_ok, storage_compliance_reason
+
 BLOCK, WARN, INFO = "block", "warn", "info"
 GRADES = ("ready", "warn", "block")
 
@@ -75,7 +77,26 @@ RULES: List[Rule] = [
     {"code": "no_ip", "level": INFO, "title": "No guest IP reported",
      "advice": "Post-import verification cannot ping it or compare its IP.",
      "test": lambda r, f: _on(r) and _tools_running(r) and not (r["ip"] if "ip" in r.keys() else "")},
+    # Unlike every other rule here, this one is not advisory-only: `engine.py`'s
+    # own eligible() refuses to import a VM this flags, unconditionally (the
+    # user asked, 2026-11-16, that imports never happen "unless the VM's
+    # storage policy is compliant" -- a deliberate departure from this
+    # module's usual "advisory, the operator's precheck is the authority"
+    # convention). It is still listed here too so `readiness`/the console
+    # show it before precheck, not only at the import gate.
+    {"code": "storage_noncompliant", "level": BLOCK, "title": "Storage policy not confirmed compliant",
+     "advice": "vCenter's own storage-policy compliance check for this VM is not COMPLIANT or "
+               "NOT_APPLICABLE -- or it has never been checked at all (an older discover, or one "
+               "run with --no-storage-compliance). Call storage_compliance_detail(row) for which. "
+               "The import gate refuses to move this VM until a fresh discover shows it compliant, "
+               "or storage_compliance_enforce is set to false.",
+     "test": lambda r, f: not storage_compliance_ok(f.get("storage_compliance"))},
 ]
+
+
+def storage_compliance_detail(row: Any) -> str:
+    """Why `storage_noncompliant` fired for one discovered row, for the console/CLI."""
+    return storage_compliance_reason(_facts(row).get("storage_compliance"))
 
 
 def assess(row: Any) -> List[Dict[str, str]]:

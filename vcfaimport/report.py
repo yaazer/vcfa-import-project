@@ -23,6 +23,7 @@ STATE_ORDER = [
     st.S_COMMITTED,
     st.S_FAILED,
     st.S_ROLLING_BACK,
+    st.S_ROLLBACK_FAILED,
     st.S_ROLLED_BACK,
     st.S_SKIPPED,
 ]
@@ -37,6 +38,7 @@ STATE_LABEL = {
     st.S_COMMITTED: "committed",
     st.S_FAILED: "FAILED",
     st.S_ROLLING_BACK: "rolling back",
+    st.S_ROLLBACK_FAILED: "rollback FAILED",
     st.S_ROLLED_BACK: "rolled back",
     st.S_SKIPPED: "skipped",
 }
@@ -51,6 +53,7 @@ STATE_CLASS = {
     st.S_PRECHECK_RUNNING: "busy",
     st.S_PENDING: "idle",
     st.S_ROLLING_BACK: "busy",
+    st.S_ROLLBACK_FAILED: "bad",
     st.S_ROLLED_BACK: "hold",
     st.S_SKIPPED: "idle",
 }

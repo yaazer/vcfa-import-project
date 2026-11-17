@@ -524,6 +524,115 @@ class VCenterClient:
             })
         return out
 
+    def vm_storage_compliance(self, moref: str, live: bool = False) -> Optional[Dict[str, Any]]:
+        """Storage-policy compliance of a VM's home directory and virtual disks.
+
+        None only when this vCenter cannot be asked at all (pre-7.0 /rest-only
+        session: no VM-level storage policy API exists there). Any other
+        outcome is a dict and must be read with `storage_compliance_ok`, not
+        compared to "COMPLIANT" by hand: {"overall": "NO_POLICY", "disks": {}}
+        when the VM has no storage-policy association (nothing to be
+        non-compliant with); {"overall": "ERROR", "status": <http status or
+        None>, "error": <message>} when vCenter answered but refused or
+        failed the call -- this must never be read as compliant, only as "not
+        asked successfully"; otherwise {"overall": <COMPLIANT|NON_COMPLIANT|
+        UNKNOWN_COMPLIANCE|NOT_APPLICABLE|OUT_OF_DATE>, "disks": {disk_id:
+        {"status":..., "failure_cause":...}}, "vm_home_status":...,
+        "vm_home_cause":...}.
+
+        `live=True` asks vCenter to recompute compliance now (POST
+        .../compliance?action=check) instead of returning its last cached
+        value -- the only way to see a storage-policy edit made since the
+        last discover (the suspected cause of the 2026-11-13 incident: see
+        docs/incidents/2026-11-13-stuck-rollback-cns-unregister.md).
+
+        Response shape (Vcenter.Vm.Storage.Policy.Compliance.Info /
+        VmComplianceInfo) confirmed against VMware's own published OpenAPI
+        spec (vmware/vcf-api-specs, specifications/vsphere/openapi/automation/
+        vcenter.yaml, version 9.1.1.0, operationId Vcenter.Vm.Storage.Policy.
+        Compliance_get / _check) -- not against a live vCenter."""
+        if self._prefix != "/api":
+            return None
+        path = "/vcenter/vm/{}/storage/policy/compliance".format(urllib.parse.quote(moref))
+        try:
+            if live:
+                data = self._request("POST", self._prefix + path + "?action=check", body=None)
+            else:
+                data = self.get(path)
+        except VCenterError as exc:
+            return {"overall": "ERROR", "status": exc.status, "error": str(exc)[:200]}
+        if not isinstance(data, dict):
+            return {"overall": "NO_POLICY", "disks": {}, "vm_home_status": ""}
+        disks: Dict[str, Dict[str, str]] = {}
+        for disk_id, info in (data.get("disks") or {}).items():
+            if isinstance(info, dict):
+                disks[disk_id] = {"status": info.get("status", ""),
+                                  "failure_cause": _compliance_cause(info)}
+        vm_home = data.get("vm_home") if isinstance(data.get("vm_home"), dict) else {}
+        return {
+            "overall": data.get("overall_compliance") or "",
+            "disks": disks,
+            "vm_home_status": vm_home.get("status", ""),
+            "vm_home_cause": _compliance_cause(vm_home),
+        }
+
+
+# Pass set for Vcenter.Vm.Storage.Policy.Compliance.Info.overall_compliance,
+# plus the two sentinels vm_storage_compliance adds of its own ("NO_POLICY"
+# for a null/empty response, "ERROR" for a failed request). UNKNOWN_COMPLIANCE
+# and OUT_OF_DATE are deliberately NOT a pass: "unless compliant" (the user's
+# own words, 2026-11-16) means a status that is not a known-good answer blocks
+# the same as a known-bad one. OUT_OF_DATE is the state the 2026-11-13 incident
+# suspects caused its stuck rollback (a policy edited mid-import, not applied).
+STORAGE_COMPLIANCE_PASS = {"COMPLIANT", "NOT_APPLICABLE", "NO_POLICY"}
+
+
+def storage_compliance_ok(result: Optional[Dict[str, Any]]) -> bool:
+    """False unless vCenter's own answer says this VM's storage is fine to
+    import. None (never asked) and ERROR (asked, vCenter refused) both fail
+    closed, the same as NON_COMPLIANT / OUT_OF_DATE / UNKNOWN_COMPLIANCE."""
+    return bool(result) and result.get("overall") in STORAGE_COMPLIANCE_PASS
+
+
+def storage_compliance_reason(result: Optional[Dict[str, Any]]) -> str:
+    """One line explaining why `result` did or didn't pass, for holdback/log text."""
+    if result is None:
+        return "never checked (older vCenter, or discover ran with --no-storage-compliance)"
+    overall = result.get("overall") or "?"
+    if overall == "ERROR":
+        return "vCenter's storage/policy/compliance call failed (HTTP {}): {}".format(
+            result.get("status"), result.get("error") or "no detail")
+    if overall == "NO_POLICY":
+        return "no storage policy associated (nothing to be non-compliant with)"
+    causes = [result.get("vm_home_cause")] + [d.get("failure_cause") for d in (result.get("disks") or {}).values()]
+    detail = "; ".join(c for c in causes if c)
+    return "overall_compliance={}{}".format(overall, " ({})".format(detail) if detail else "")
+
+
+def storage_compliance_checker(
+    client: "VCenterClient", concurrency: int = 12
+) -> Callable[[Sequence[str]], Dict[str, Optional[Dict[str, Any]]]]:
+    """A moref -> live compliance-dict function, bound to one connected client.
+
+    For `engine.py`'s pre-apply gate: it must not hold a vcenter.py import, so
+    the CLI/web layer that does hold vCenter credentials builds this closure
+    and hands it to the engine instead."""
+    def check(morefs: Sequence[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        unique = list(dict.fromkeys(morefs))
+        if not unique:
+            return {}
+        workers = max(1, min(int(concurrency), 32))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(lambda m: client.vm_storage_compliance(m, live=True), unique))
+        return dict(zip(unique, results))
+    return check
+
+
+def _compliance_cause(info: Dict[str, Any]) -> str:
+    msgs = (info or {}).get("failure_cause") or []
+    return "; ".join(
+        m.get("default_message", "") for m in msgs if isinstance(m, dict) and m.get("default_message"))
+
 
 def _parse_nics(detail: Dict[str, Any], networks: Dict[str, str]) -> List[DiscoveredNic]:
     """VM detail reports NICs keyed by their device key -- exactly what we need."""
@@ -586,6 +695,7 @@ def discover(
     with_tags: bool = True,
     with_namespaces: bool = True,
     with_subnets: bool = True,
+    with_storage_compliance: bool = True,
     concurrency: int = 12,
     progress: Optional[Callable[[int, int], None]] = None,
     log: Optional[Callable[[str], None]] = None,
@@ -682,6 +792,12 @@ def discover(
             nics=_parse_nics(detail, networks),
             facts=_facts(detail),
         )
+        if with_storage_compliance:
+            # Cached (GET), not live: a per-VM live recheck for every discovered
+            # VM would be one more vCenter round trip each, for a snapshot that
+            # is only ever a precheck/import-time gate's starting point -- the
+            # gate itself re-checks live right before it matters (see engine.py).
+            vm.facts["storage_compliance"] = client.vm_storage_compliance(moref)
         if with_tools:
             vm.tools_status = client.vm_tools(moref)
             if "running" in vm.tools_status.lower() and "not" not in vm.tools_status.lower():

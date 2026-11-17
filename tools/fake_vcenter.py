@@ -43,6 +43,17 @@ NAMESPACE_SUBNETS = {
     "migration-testing-ns-kcvm5": [{"name": "subnet-local", "type": "SUBNET"}],
     "testing-vpc-k826r": [{"name": "migration-testing", "type": "SUBNET"}],
 }
+# GET/POST(?action=check) /vcenter/vm/{vm}/storage/policy/compliance. Defaults
+# every VM to COMPLIANT so existing tests that do not care about this feature
+# are unaffected. FAKE_VC_STORAGE_COMPLIANCE overrides the answer for every
+# VM: "forbidden" (403), "old" (404, as if the VM-level storage policy API did
+# not exist), "nopolicy" (200, null body), "noncompliant" / "outofdate" /
+# "unknown" (200, that overall_compliance value with a failure_cause).
+STORAGE_COMPLIANCE_CAUSE = {
+    "NON_COMPLIANT": "Datastore does not satisfy the policy's Space Efficiency rule",
+    "OUT_OF_DATE": "The policy was edited but not re-applied to this entity",
+    "UNKNOWN_COMPLIANCE": "SPBM could not reach the storage provider",
+}
 
 CLUSTERS = ["PROD-CL01", "PROD-CL02", "DMZ-CL01"]
 # A realistic nested VM-folder tree. Keys are folder ids, values are
@@ -153,6 +164,34 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         return self.headers.get("vmware-api-session-id") == TOKEN
 
+    def _storage_compliance_response(self, moref: str) -> None:
+        vm = Handler.inventory["vms"].get(moref)
+        if not vm:
+            self._send(404, {"error": "no such vm"})
+            return
+        mode = os.environ.get("FAKE_VC_STORAGE_COMPLIANCE", "")
+        if mode == "forbidden":
+            self._send(403, {"error_type": "UNAUTHORIZED",
+                             "messages": [{"default_message": "System.Read is required"}]})
+            return
+        if mode == "old":
+            self._send(404, {"error": "not found"})
+            return
+        if mode == "nopolicy":
+            self._send(200, None)
+            return
+        overall = {"noncompliant": "NON_COMPLIANT", "outofdate": "OUT_OF_DATE",
+                  "unknown": "UNKNOWN_COMPLIANCE"}.get(mode, "COMPLIANT")
+        disk_info = {"status": overall}
+        cause = STORAGE_COMPLIANCE_CAUSE.get(overall)
+        if cause:
+            disk_info["failure_cause"] = [{"id": "com.vmware.spbm.fake", "default_message": cause, "args": []}]
+        self._send(200, {
+            "overall_compliance": overall,
+            "vm_home": dict(disk_info),
+            "disks": {"2000": dict(disk_info)},
+        })
+
     def do_POST(self) -> None:  # noqa: N802
         if self.path.startswith("/api/cis/tagging/tag-association"):
             if not self._authed():
@@ -167,6 +206,14 @@ class Handler(BaseHTTPRequestHandler):
                 if vm:
                     out.append({"object_id": obj, "tag_ids": vm["_tags"]})
             self._send(200, out)
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        if (parsed.path.startswith("/api/vcenter/vm/") and parsed.path.endswith("/storage/policy/compliance")
+                and urllib.parse.parse_qs(parsed.query).get("action") == ["check"]):
+            if not self._authed():
+                self._send(401, {"error": "unauthenticated"})
+                return
+            self._storage_compliance_response(parsed.path.split("/")[4])
             return
         if self.path != "/api/session":
             self._send(404, {"error": "not found"})
@@ -239,6 +286,10 @@ class Handler(BaseHTTPRequestHandler):
             moref = path.split("/")[4]
             vm = inv["vms"].get(moref)
             self._send(200, {"run_state": vm["_tools"]} if vm else {})
+            return
+
+        if path.startswith("/api/vcenter/vm/") and path.endswith("/storage/policy/compliance"):
+            self._storage_compliance_response(path.split("/")[4])
             return
 
         if path.startswith("/api/vcenter/vm/"):

@@ -32,7 +32,7 @@
   --s-precheck_passed: oklch(0.8 0.13 185); --s-precheck_failed: oklch(0.76 0.16 55);
   --s-importing: oklch(0.72 0.17 265); --s-awaiting_commit: oklch(0.84 0.15 85);
   --s-committed: oklch(0.8 0.18 152); --s-failed: oklch(0.69 0.21 25);
-  --s-rolling_back: oklch(0.75 0.15 305); --s-rolled_back: oklch(0.67 0.16 295);
+  --s-rolling_back: oklch(0.75 0.15 305); --s-rollback_failed: oklch(0.69 0.2 345); --s-rolled_back: oklch(0.67 0.16 295);
   --s-skipped: oklch(0.52 0.02 255);
   color-scheme: dark;
 }

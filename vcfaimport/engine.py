@@ -26,6 +26,7 @@ from .planner import PlannedBatch, plan_batches, record_from_row
 from .render import LABEL_RUN
 from . import state as st
 from .status import BatchStatus, batch_status
+from .vcenter import storage_compliance_ok, storage_compliance_reason
 
 STAGE_PRECHECK = "precheck"
 STAGE_IMPORT = "import"
@@ -95,6 +96,20 @@ class Engine:
         self.hit_deadline = False
         # Why VMs were held back from the last eligibility check (apps, readiness).
         self.holdbacks: List[str] = []
+        # Set by the CLI/web layer when it holds a connected vCenter session,
+        # to re-verify storage-policy compliance live, right before each
+        # import wave is applied -- see _filter_storage_compliance. None
+        # (the default) means the cached-facts gate in eligible() is the only
+        # check; this engine never opens a vCenter session of its own.
+        self.storage_compliance_check: Optional[
+            Callable[[Sequence[str]], Dict[str, Optional[Dict[str, Any]]]]] = None
+        # Morefs that just transitioned into rollback_failed, for whoever
+        # polled to push a notification -- rendering it only when someone has
+        # the console's Activity page open (service.activity_now) is not
+        # enough to avoid the incident this models (unnoticed for three
+        # days); drained by service.notify_rollback_failed after each call
+        # that can cause this transition (execute, rollback, refresh/watch).
+        self.newly_rollback_failed: List[str] = []
 
     # ------------------------------------------------------------- signals
     def request_stop(self) -> None:
@@ -375,12 +390,77 @@ class Engine:
             if blocked:
                 self.holdbacks.append("{} VM(s) held back: readiness marks them blocked".format(len(blocked)))
                 rows = [r for r in rows if r["moref"] not in blocked]
+        # Both stages, not import only: the user's own words were "Missing
+        # prechecks for storage policy enforcement" (2026-11-16) -- a VM that
+        # fails this must not even reach precheck_passed.
+        if getattr(self.cfg, "storage_compliance_enforce", True) and rows:
+            rows = self._require_storage_compliance(rows)
         max_age = getattr(self.cfg, "precheck_max_age_hours", 0) or 0
         if stage == STAGE_IMPORT and max_age > 0 and rows:
             rows = self._fresh_prechecks(rows, max_age)
         if stage == STAGE_IMPORT and getattr(self.cfg, "app_together", False) and rows:
             rows = self._whole_apps(rows)
         return rows
+
+    def _require_storage_compliance(self, rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+        """Hold back any VM not known COMPLIANT/NOT_APPLICABLE by vCenter's own
+        storage-policy compliance check -- including one never checked at all.
+
+        This reads the facts a `discover` pass already recorded (a cheap local
+        lookup, not a vCenter call: safe to run on every plan/preview, unlike
+        the live recheck in _filter_storage_compliance). Unconditional, unlike
+        every other hold-back in eligible(): see storage_compliance_enforce
+        in config.py and the readiness.py "storage_noncompliant" rule.
+        """
+        discovered = {d["moref"]: d for d in self.store.query_discovered(
+            morefs=[r["moref"] for r in rows])}
+        keep, bad = [], []
+        for r in rows:
+            d = discovered.get(r["moref"])
+            facts = json.loads(d["facts_json"] or "{}") if d else {}
+            comp = facts.get("storage_compliance") if isinstance(facts, dict) else None
+            (bad if not storage_compliance_ok(comp) else keep).append((r, comp))
+        if bad:
+            self.holdbacks.append(
+                "{} VM(s) held back: storage-policy compliance is not COMPLIANT/NOT_APPLICABLE -- {} "
+                "(run `readiness` for detail per VM; re-discover once fixed, or set "
+                "storage_compliance_enforce=false to override)".format(
+                    len(bad), "; ".join(sorted({storage_compliance_reason(c) for _, c in bad[:5]}))))
+        return [r for r, _ in keep]
+
+    def _filter_storage_compliance(self, batches: List[PlannedBatch]) -> List[PlannedBatch]:
+        """Re-verify live, right before applying: the cached facts eligible()
+        just checked can be hours or days old, and the one thing they cannot
+        catch is a storage policy edited since (the 2026-11-13 incident's own
+        suspect). Only runs when the caller handed this engine a connected
+        vCenter session (self.storage_compliance_check); never makes a
+        vCenter call of its own.
+
+        A batch with any non-compliant VM is held back whole this cycle --
+        its manifest was already rendered for the full set, so a VM dropped
+        here is not re-batched until the next plan (which, with a real
+        verdict persisted below, eligible()'s own cached-facts gate will now
+        also hold back -- the two gates agree on the same answer). A failed
+        *request* (ERROR: a dead session, a 503) is held back for this run
+        only and never written to the cached facts -- persisting it would
+        make one bad call block the VM until the next discover, the same
+        mistake already fixed once for vc_subnets last session."""
+        morefs = [rec.moref for b in batches for rec in b.records]
+        live = self.storage_compliance_check(morefs) or {}
+        kept: List[PlannedBatch] = []
+        for b in batches:
+            bad = [(rec, live.get(rec.moref)) for rec in b.records
+                   if not storage_compliance_ok(live.get(rec.moref))]
+            for rec, comp in bad:
+                if comp is not None and comp.get("overall") != "ERROR":
+                    self.store.merge_discovered_facts(rec.moref, {"storage_compliance": comp})
+                reason = storage_compliance_reason(comp)
+                msg = "import held back: vCenter's live storage-policy compliance check says {}".format(reason)
+                self.store.log_event(msg, "warn", moref=rec.moref, batch=b.name)
+                self.log("  ~ {} ({}): {}".format(rec.moref, rec.vm_name, msg))
+            if not bad:
+                kept.append(b)
+        return kept
 
     def _fresh_prechecks(self, rows: List[sqlite3.Row], max_age_hours: int) -> List[sqlite3.Row]:
         """Hold back VMs whose precheck pass is older than precheck_max_age_hours."""
@@ -576,6 +656,13 @@ class Engine:
                     self.log("  max_vms_per_run={} caps this wave at {} VMs in {} batches".format(
                         self.cfg.max_vms_per_run, total, len(capped)))
                 pending = capped
+            if (stage == STAGE_IMPORT and pending and not self.kube.dry_run
+                    and self.storage_compliance_check is not None):
+                before = len(pending)
+                pending = self._filter_storage_compliance(pending)
+                if len(pending) != before:
+                    self.log("  live storage-policy recheck held back {} of {} batch(es)".format(
+                        before - len(pending), before))
 
         if not pending and not in_flight:
             return result
@@ -789,6 +876,14 @@ class Engine:
             if row["state"] in st.TERMINAL_STATES:
                 continue
             was_waiting = row["state"] == st.S_AWAITING_COMMIT
+            # A rollback in progress (or one whose step already failed) outranks
+            # whatever the import conditions say: ReadyForCommit/Complete can
+            # still read True while a Rollback*Completed step is failing
+            # (observed 2026-11-13: the child kept ReadyForCommit: True right
+            # through a failed CNS unregister) or simply hasn't been added yet.
+            # Only a rollback verdict (BUCKET_ROLLED_BACK below) or a vanished
+            # batch may move this VM on from here -- never an import bucket.
+            was_rolling_back = row["state"] in (st.S_ROLLING_BACK, st.S_ROLLBACK_FAILED)
             op = by_moref.get(row["moref"])
             if op is None and row["operation_name"]:
                 op = by_name.get(row["operation_name"])
@@ -801,30 +896,57 @@ class Engine:
             message = (op.message if op else bstatus.message) or ""
 
             if bucket == BUCKET_SUCCEEDED:
-                if stage == STAGE_PRECHECK:
+                if was_rolling_back:
+                    still_running = True
+                elif stage == STAGE_PRECHECK:
                     self.store.set_vm_state(row["moref"], st.S_PRECHECK_PASSED,
                                             phase=phase, message=message, stage=stage)
+                    wave_results["ok"] += 1
+                    result["succeeded"] += 1
                 else:
                     self.store.set_vm_state(row["moref"], st.S_COMMITTED,
                                             phase=phase, message=message, stage=stage,
                                             target_resource=(op.target if op else None))
-                wave_results["ok"] += 1
-                result["succeeded"] += 1
+                    wave_results["ok"] += 1
+                    result["succeeded"] += 1
             elif bucket == BUCKET_FAILED:
-                self._fail_vm(row["moref"], stage, message or phase or "operation failed", phase)
-                wave_results["bad"] += 1
-                result["failed"] += 1
+                if was_rolling_back and "rollback" in (phase + message).lower():
+                    # The step failed, not the whole VM: stay non-terminal so
+                    # refresh keeps watching (a late operator success, or the
+                    # guided `release-rollback`, can still move it on).
+                    full_message = "ROLLBACK FAILED: " + (message or phase)
+                    if row["state"] != st.S_ROLLBACK_FAILED:
+                        self.newly_rollback_failed.append(row["moref"])
+                    if (row["state"] != st.S_ROLLBACK_FAILED
+                            or row["last_phase"] != phase or row["message"] != full_message):
+                        self.store.set_vm_state(row["moref"], st.S_ROLLBACK_FAILED, stage="rollback",
+                                                phase=phase, message=full_message)
+                        self.store.log_event("rollback failed: " + (message or phase), "error",
+                                             moref=row["moref"], batch=batch_name)
+                    still_running = True
+                elif was_rolling_back:
+                    # A stale import-side failure read while a rollback is in
+                    # progress (the gap before any Rollback* condition exists,
+                    # or a lingering OperationFailed from before rollbackAction
+                    # was set): the import verdict must never win here either.
+                    still_running = True
+                else:
+                    self._fail_vm(row["moref"], stage, message or phase or "operation failed", phase)
+                    wave_results["bad"] += 1
+                    result["failed"] += 1
             elif bucket == BUCKET_ROLLED_BACK:
                 # The operator reverted this VM to vCenter ownership -- either
                 # because rollbackAction was set at creation or requested later.
                 self.store.set_vm_state(row["moref"], st.S_ROLLED_BACK, stage="rollback",
                                         phase=phase, message=message or "reverted to vCenter")
             elif bucket == BUCKET_AWAITING_COMMIT:
-                if stage == STAGE_PRECHECK:
+                if was_rolling_back:
+                    still_running = True
+                elif stage == STAGE_PRECHECK:
                     # A precheck has nothing to commit; treat this as still working.
                     still_running = True
                     continue
-                if not was_waiting:
+                elif not was_waiting:
                     self.store.set_vm_state(row["moref"], st.S_AWAITING_COMMIT,
                                             phase=phase, message=message, stage=stage,
                                             target_resource=(op.target if op else None))
@@ -843,7 +965,8 @@ class Engine:
 
         remaining = [r for r in self.store.query_vms(batch_name=batch_name)
                      if r["namespace"] == namespace
-                     and r["state"] in (st.S_PRECHECK_RUNNING, st.S_IMPORTING, st.S_ROLLING_BACK)]
+                     and r["state"] in (st.S_PRECHECK_RUNNING, st.S_IMPORTING,
+                                        st.S_ROLLING_BACK, st.S_ROLLBACK_FAILED)]
         if remaining:
             return False
 
@@ -907,7 +1030,8 @@ class Engine:
         self.log("  ! {}/{}: {}".format(ns, name, msg))
         for vm in self.store.query_vms(batch_name=name):
             if vm["namespace"] == ns and vm["state"] in (
-                    st.S_PRECHECK_RUNNING, st.S_IMPORTING, st.S_ROLLING_BACK, st.S_AWAITING_COMMIT):
+                    st.S_PRECHECK_RUNNING, st.S_IMPORTING, st.S_ROLLING_BACK,
+                    st.S_ROLLBACK_FAILED, st.S_AWAITING_COMMIT):
                 self._fail_vm(vm["moref"], stage, msg, "BatchGone")
 
     def abandon_targets(
@@ -969,13 +1093,16 @@ class Engine:
             members = [v for v in self.store.query_vms(batch_name=row["name"])
                        if v["namespace"] == row["namespace"]]
             live = [v for v in members if v["state"] in (
-                st.S_IMPORTING, st.S_AWAITING_COMMIT, st.S_ROLLING_BACK)]
+                st.S_IMPORTING, st.S_AWAITING_COMMIT, st.S_ROLLING_BACK, st.S_ROLLBACK_FAILED)]
             if row["stage"] != STAGE_PRECHECK and live:
+                rollback_failed = [v for v in live if v["state"] == st.S_ROLLBACK_FAILED]
                 notes.append(
                     "{}: refused -- {} VM(s) are {} (ownership is with the Supervisor); "
-                    "run `rollback --batch {}` first".format(
+                    "run `rollback --batch {}` first{}".format(
                         row["name"], len(live),
-                        "/".join(sorted({v["state"] for v in live})), row["name"]))
+                        "/".join(sorted({v["state"] for v in live})), row["name"],
+                        ", or `release-rollback --batch {}` if its rollback has already failed"
+                        .format(row["name"]) if rollback_failed else ""))
                 continue
             by_key[key] = row
         return list(by_key.values()), notes
@@ -1375,7 +1502,7 @@ class Engine:
                     waiting.pop((ns, name))
                     continue
                 if self._apply_rollback_status(
-                        ns, name, batch_status(obj, self.cfg, children, stage=STAGE_IMPORT)):
+                        ns, name, batch_status(obj, self.cfg, children, stage=STAGE_IMPORT), result):
                     waiting.pop((ns, name))
 
         for (ns, name), row in waiting.items():
@@ -1399,7 +1526,8 @@ class Engine:
             1 for v in self.store.query_vms(states=[st.S_ROLLED_BACK])
             if (v["namespace"], v["batch_name"]) in names)
 
-    def _apply_rollback_status(self, ns: str, name: str, bstatus: BatchStatus) -> bool:
+    def _apply_rollback_status(self, ns: str, name: str, bstatus: BatchStatus,
+                               result: Dict[str, Any]) -> bool:
         """Update VMs from a rollback poll. True once nothing is still reverting."""
         rows = [v for v in self.store.query_vms(batch_name=name) if v["namespace"] == ns]
         by_moref = bstatus.by_moref()
@@ -1418,23 +1546,47 @@ class Engine:
                                         phase=phase, message=message or "reverted to vCenter")
                 self.store.log_event("ownership reverted to vCenter", moref=vm["moref"], batch=name)
             elif bucket == BUCKET_FAILED and "rollback" in (phase + message).lower():
-                # The operator tried to revert and could not: this VM needs a human.
-                self.store.set_vm_state(vm["moref"], st.S_FAILED, stage="rollback",
+                # The operator tried to revert and could not. Non-terminal
+                # (S_ROLLBACK_FAILED, not S_FAILED): the incident this models
+                # (2026-11-13) saw the operator retry for three days without
+                # ever resolving it on its own, so `refresh` keeps watching
+                # rather than giving up on this VM, and `release-rollback` can
+                # still act on it. This wait loop itself does not keep
+                # spinning for it, though -- the incident also showed 30
+                # minutes of waiting learns nothing more than the first poll
+                # does, so it is reported now rather than at the timeout.
+                self.store.set_vm_state(vm["moref"], st.S_ROLLBACK_FAILED, stage="rollback",
                                         phase=phase, message="ROLLBACK FAILED: " + (message or phase))
                 self.store.log_event("rollback failed: " + (message or phase), "error",
                                      moref=vm["moref"], batch=name)
+                self.newly_rollback_failed.append(vm["moref"])
             else:
                 still += 1
         if still:
             return False
         outcome = [v for v in self.store.query_vms(batch_name=name) if v["namespace"] == ns]
         reverted = sum(1 for v in outcome if v["state"] == st.S_ROLLED_BACK)
-        bad = sum(1 for v in outcome if v["state"] == st.S_FAILED)
-        state = st.B_ROLLED_BACK if not bad else st.B_PARTIAL
-        self.store.set_batch_state(name, ns, state,
-                                   "{} reverted, {} rollback failures".format(reverted, bad))
-        self.log("  <- {}/{}: {} VM(s) reverted to vCenter{}".format(
-            ns, name, reverted, ", {} rollback FAILED".format(bad) if bad else ""))
+        stuck = sum(1 for v in outcome if v["state"] == st.S_ROLLBACK_FAILED)
+        if stuck:
+            # Leave the batch at B_ROLLING_BACK, not a terminal state: B_ROLLED_BACK
+            # is read elsewhere (cleanup/_delete_rolled_back) as "safe to delete,
+            # every VM confirmed back with vCenter", and refresh() only re-polls
+            # batches in [B_APPLIED, B_RUNNING, B_TIMEDOUT, B_ROLLING_BACK] -- either
+            # mistake would stop anyone, and anything, from watching this batch again
+            # (the incident this models went unwatched for three days that way).
+            msg = "{} reverted, {} rollback FAILED -- needs a human; see Triage or release-rollback".format(
+                reverted, stuck)
+            self.store.set_batch_state(name, ns, st.B_ROLLING_BACK, msg)
+            self.log("  <- {}/{}: {}".format(ns, name, msg))
+            # Without this, _wait_for_rollback pops the batch out of `waiting`
+            # as if the revert had simply succeeded -- the CLI exits 0, the web
+            # job reports no warning, and notify_run sends a success message.
+            # That is the incident's "the tool never reported any of this",
+            # just moved one layer up.
+            result["errors"].append("{}/{}: {}".format(ns, name, msg))
+        else:
+            self.store.set_batch_state(name, ns, st.B_ROLLED_BACK, "{} reverted".format(reverted))
+            self.log("  <- {}/{}: {} VM(s) reverted to vCenter".format(ns, name, reverted))
         return True
 
     def _delete_rolled_back(self, batches: Sequence[sqlite3.Row], result: Dict[str, Any]) -> None:
@@ -1455,6 +1607,307 @@ class Engine:
             self.store.log_event("batch deleted after rollback", batch=name)
             self.log("  x  deleted {}/{}".format(ns, name))
             result["deleted"].append(name)
+
+    # ---------------------------------------------------------- release_rollback
+    def release_rollback(
+        self,
+        batch_names: Optional[Sequence[str]] = None,
+        morefs: Optional[Sequence[str]] = None,
+        confirm: bool = False,
+        target: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """The guided, Supervisor-side-only way out of a rollback step that has
+        failed (S_ROLLBACK_FAILED) -- replaces the 6 manual steps the incident
+        this models needed by hand (docs/incidents/2026-11-13-stuck-rollback-
+        cns-unregister.md) with the parts that are safe to automate.
+
+        `target` supplies the Supervisor VirtualMachine name by hand when it
+        was never recorded on the VM's row -- CLAUDE.md notes that field as
+        "not yet observed" on a real operator, so this is likely needed on a
+        real Supervisor every time, not an edge case. It is accepted only
+        when exactly one VM in the targeted batch is stuck (never which of
+        several to guess for), and it is never trusted blindly: the same
+        existence check that gates a recorded target_resource (see
+        _release_rollback_one) gates a human-supplied one too.
+
+        Deletes the Supervisor VirtualMachine object (`kubectl delete
+        virtualmachines/<name>`) for each stuck VM, then the batch, then any
+        VirtualMachine the still-running child recreated empty in the gap
+        between the two (observed: it does, until the batch is gone). This
+        detaches each VM's CNS disk -- data loss has not been ruled out for a
+        detached disk in the incident this models, so it is not reversible.
+        Never touches vCenter (no CNS volume delete, no VMDK delete -- both
+        destroy data) and never patches the CnsUnregisterVolume finalizer (a
+        namespace user is refused that anyway). Those are left as a checklist
+        in the result for a human, same as the incident's own writeup.
+
+        Refuses a batch that also has a VM still plainly S_ROLLING_BACK (not
+        yet failed): that VM may still revert on its own, and deleting the
+        batch would cut that short along with the stuck one. Roll it back
+        further, or wait, first.
+
+        Without confirm=True this only previews what would happen -- nothing
+        is touched. There is no automatic trigger for this anywhere in the
+        tool; a human calls it, every time, on purpose.
+
+        UNVERIFIED: deleting the VirtualMachine with kubectl, in place of the
+        Automation console's own delete-without-persistent-volumes action,
+        has not been tried against a real Supervisor. If vCenter needs
+        something else to detach the disk the way that UI does, this will
+        not match it -- which is why a Forbidden here stops cleanly rather
+        than trying something else.
+        """
+        result: Dict[str, Any] = {"released": [], "errors": [], "preview": [], "leftover_checklist": [],
+                                  "candidates": []}
+        wanted_batches = set(batch_names or [])
+        wanted_morefs = set(morefs or [])
+        stuck = self.store.query_vms(states=[st.S_ROLLBACK_FAILED])
+        if wanted_morefs:
+            # --vm only chooses which batch(es) -- "the batch this VM is in",
+            # same as --vm elsewhere in this tool. Once chosen, every stuck VM
+            # in that batch is included: releasing only the named VM would
+            # delete the whole batch while another stuck VM's VirtualMachine
+            # is left behind with nothing watching it (the drawer's Release
+            # button sends exactly one moref, so this is the common case, not
+            # an edge one).
+            target_batches = {(r["namespace"], r["batch_name"]) for r in stuck
+                              if r["batch_name"] and r["moref"] in wanted_morefs}
+            stuck = [r for r in stuck if (r["namespace"], r["batch_name"]) in target_batches]
+        by_batch: Dict[Tuple[str, str], List[sqlite3.Row]] = {}
+        for r in stuck:
+            if not r["batch_name"] or (wanted_batches and r["batch_name"] not in wanted_batches):
+                continue
+            by_batch.setdefault((r["namespace"], r["batch_name"]), []).append(r)
+        if not by_batch:
+            result["errors"].append("no batch has a VM in rollback_failed state{}".format(
+                " matching the given --batch/--vm" if (wanted_batches or wanted_morefs) else ""))
+            return result
+        if target and len(by_batch) > 1:
+            result["errors"].append(
+                "target= was given but {} batches matched -- narrow to exactly one with "
+                "--batch/--vm, or a human-supplied name would be applied to all of them"
+                .format(len(by_batch)))
+            return result
+        for (ns, name), members in sorted(by_batch.items()):
+            still_rolling = [v for v in self.store.query_vms(batch_name=name)
+                            if v["namespace"] == ns and v["state"] == st.S_ROLLING_BACK]
+            if still_rolling:
+                result["errors"].append(
+                    "{}/{}: refused -- {} other VM(s) in this batch are still rolling back and "
+                    "may yet succeed on their own; wait or `refresh` first".format(
+                        name, ns, len(still_rolling)))
+                continue
+            missing = [m for m in members if not m["target_resource"]]
+            using_target = False
+            if missing and target and len(members) == 1:
+                # A human-supplied name, only for an unambiguous single VM.
+                # Still unverified: it must not be any other row's own
+                # target_resource (a mistyped name that happens to be a real,
+                # healthy VM elsewhere), and _release_rollback_one additionally
+                # requires the "import in progress" skip-delete annotation
+                # before trusting it -- neither guard applies to a name the
+                # operator itself reported.
+                other = [r for r in self.store.query_vms() if r["target_resource"] == target]
+                if other:
+                    result["errors"].append(
+                        "{}/{}: refused -- {} is already on record as {}'s target_resource, not "
+                        "a name to guess for {}".format(
+                            name, ns, target, other[0]["moref"], missing[0]["moref"]))
+                    continue
+                vm_names = [target]
+                using_target = True
+            elif missing:
+                # Never guess the target name: deleting the batch without it
+                # would delete the batch while its VirtualMachine is still
+                # present, an order the incident this models never observed.
+                # When target= could actually apply (exactly one VM stuck),
+                # list what a human would otherwise have to go find by hand
+                # -- never picked automatically; see _release_target_candidates.
+                # The listing itself is reported structurally (result
+                # ["candidates"]) so the CLI can print its own --target
+                # syntax and the web console its own copy field, instead of
+                # one of them having to parse the other's wording out of a
+                # free-text error string.
+                hint = ""
+                if len(members) == 1:
+                    candidates = self._release_target_candidates(ns)
+                    if candidates is None:
+                        hint = "; could not list candidate VirtualMachine(s) to suggest one"
+                    elif candidates:
+                        result["candidates"].append({"namespace": ns, "batch": name,
+                                                      "candidates": candidates})
+                        hint = "; candidate VirtualMachine(s) in {} carrying the import-in-progress " \
+                               "annotation and not already on record as another VM's target -- " \
+                               "confirm the right one yourself, then release again naming it: {}".format(
+                                   ns, ", ".join("{} (created {})".format(
+                                       c["name"], c["created_at"] or "unknown") for c in candidates))
+                result["errors"].append(
+                    "{}/{}: refused -- no known Supervisor VirtualMachine name on record for {} "
+                    "VM(s) ({}); supply one by hand (only when exactly one VM in the batch is "
+                    "stuck), or delete it by hand in Automation, then `refresh` and `skip` it here{}"
+                    .format(name, ns, len(missing), ", ".join(m["moref"] for m in missing), hint))
+                continue
+            else:
+                vm_names = sorted(m["target_resource"] for m in members)
+            if not confirm:
+                result["preview"].append(
+                    "{}/{}: would delete {} VirtualMachine object(s) ({}), then the batch -- each "
+                    "one's CNS disk detaches; copy the VMDK first if the VM matters. Nothing in "
+                    "vCenter is touched. Pass confirm=True to actually do this.".format(
+                        name, ns, len(vm_names), ", ".join(vm_names) or "none known"))
+                continue
+            self._release_rollback_one(ns, name, vm_names, result, require_annotation=using_target)
+        return result
+
+    # The incident this models saw this exact annotation on the unfinished
+    # import's VirtualMachine (docs/incidents/2026-11-13-stuck-rollback-cns-
+    # unregister.md, timeline and "operator facts"). One observation, not a
+    # confirmed invariant -- a lab VM legitimately missing it makes this
+    # refuse and ask for the Automation console instead, which fails safe.
+    SKIP_DELETE_ANNOTATION = "vmoperator.vmware.com.protected/skip-delete-platform-resource"
+    SKIP_DELETE_VALUE = "import in progress"
+
+    def _release_target_candidates(self, ns: str) -> Optional[List[Dict[str, Any]]]:
+        """Read-only: VirtualMachine objects in `ns` carrying the import-in-
+        progress skip-delete annotation, not already on record as some other
+        VM's own target_resource -- the exact facts a human-supplied target
+        is checked against, listed instead of making them find the name by
+        hand. Never used to pick one automatically: a healthy, unrelated
+        import in the same namespace can carry the same annotation, and the
+        stuck VM's own object may be gone or unannotated (observed: the
+        still-running child recreates it empty), so more than one match, or
+        the wrong one being the only match, are both real possibilities this
+        must not paper over by guessing.
+
+        Returns None (not []) on a kubectl failure (RBAC, timeout, API
+        server down): CLAUDE.md's rule against turning a timeout into
+        "missing" applies here too -- a namespace user who cannot `list`
+        VirtualMachines must not be told there are no candidates, which
+        reads as settled when it is actually unknown. This is a hint, not a
+        gate either way: the caller never refuses *more* because of it."""
+        try:
+            listing = self.kube.get_json(self.cfg.vm_resource, namespace=ns, check=False)
+        except KubectlError:
+            return None
+        if listing is None:
+            # Not-found (check=False) or unparseable output -- either way, not
+            # a confirmed "this namespace has zero VirtualMachine objects".
+            return None
+        if not listing.get("items"):
+            return []
+        claimed = {r["target_resource"] for r in self.store.query_vms() if r["target_resource"]}
+        out = []
+        for item in listing.get("items", []):
+            meta = item.get("metadata") or {}
+            cand_name = meta.get("name")
+            if not cand_name or cand_name in claimed:
+                continue
+            if (meta.get("annotations") or {}).get(self.SKIP_DELETE_ANNOTATION) != self.SKIP_DELETE_VALUE:
+                continue
+            out.append({"name": cand_name, "created_at": meta.get("creationTimestamp")})
+        return sorted(out, key=lambda c: c["name"])
+
+    def _release_rollback_one(
+        self, ns: str, name: str, vm_names: Sequence[str], result: Dict[str, Any],
+        require_annotation: bool = False,
+    ) -> None:
+        # Confirm every VirtualMachine actually exists under this exact name
+        # before touching anything: kube.delete defaults to ignore_missing, so
+        # a wrong target_resource (or a resource name that resolves to nothing)
+        # would otherwise make the delete a silent no-op -- and the batch would
+        # still get deleted next, the exact order release_rollback exists to
+        # refuse (the VirtualMachine left behind, now unreachable through here).
+        for vm_name in vm_names:
+            try:
+                exists = self.kube.get_json(self.cfg.vm_resource, vm_name, namespace=ns, check=False)
+            except KubectlError as exc:
+                result["errors"].append(
+                    "{}/{}: could not confirm VirtualMachine {} exists ({}) -- refusing to touch "
+                    "the batch".format(ns, name, vm_name, str(exc)[:200]))
+                return
+            if exists is None:
+                result["errors"].append(
+                    "{}/{}: VirtualMachine {} not found under that name -- refusing to delete the "
+                    "batch until this is confirmed by hand (wrong target_resource on record?)"
+                    .format(ns, name, vm_name))
+                return
+            if require_annotation:
+                # A human-supplied target name only, never a recorded
+                # target_resource the operator itself reported: existing is
+                # not enough on its own -- a mistyped name could be any other
+                # healthy VM in the namespace.
+                ann = ((exists.get("metadata") or {}).get("annotations") or {})
+                if ann.get(self.SKIP_DELETE_ANNOTATION) != self.SKIP_DELETE_VALUE:
+                    result["errors"].append(
+                        "{}/{}: refused -- VirtualMachine {} does not carry the '{}' annotation "
+                        "this tool has only observed on an unfinished import's own VM; a "
+                        "human-supplied target is trusted only with that present. If you are "
+                        "sure this is the right VM, delete it by hand in Automation instead"
+                        .format(ns, name, vm_name, self.SKIP_DELETE_VALUE))
+                    return
+        for vm_name in vm_names:
+            try:
+                self.kube.delete(self.cfg.vm_resource, vm_name, ns)
+            except KubectlError as exc:
+                if "forbidden" in str(exc).lower():
+                    result["errors"].append(
+                        "{}/{}: refused deleting VirtualMachine {} (Forbidden) -- stopping here; "
+                        "use the Automation console's own delete (persistent volumes unticked) "
+                        "instead".format(ns, name, vm_name))
+                else:
+                    result["errors"].append("{}/{}: delete of VirtualMachine {} failed: {}".format(
+                        ns, name, vm_name, str(exc)[:300]))
+                return
+            self.store.log_event(
+                "VirtualMachine {} deleted via kubectl to release a stuck rollback (unverified "
+                "against a real Supervisor) -- its CNS disk is now most likely detached".format(
+                    vm_name), "warn", batch=name)
+            self.log("  x  deleted VirtualMachine {}/{} to release a stuck rollback".format(ns, vm_name))
+        try:
+            self.kube.delete(self.cfg.batch_resource, name, ns)
+        except KubectlError as exc:
+            result["errors"].append(
+                "{}/{}: VirtualMachine(s) deleted but the batch delete failed: {} -- delete it by "
+                "hand (kubectl delete {} {} -n {})".format(
+                    ns, name, str(exc)[:300], self.cfg.batch_resource, name, ns))
+            return
+        # The child recreates an empty VirtualMachine while it exists (observed
+        # 2026-11-13); deleting the batch stops that, but one may already have
+        # reappeared in the gap between the two deletes above -- check once more.
+        for vm_name in vm_names:
+            try:
+                still = self.kube.get_json(self.cfg.vm_resource, vm_name, namespace=ns, check=False)
+            except KubectlError:
+                still = None
+            if still is not None:
+                try:
+                    self.kube.delete(self.cfg.vm_resource, vm_name, ns)
+                    self.log("  x  deleted the empty VirtualMachine {}/{} the child recreated".format(ns, vm_name))
+                except KubectlError as exc:
+                    result["errors"].append(
+                        "{}/{}: VirtualMachine {} reappeared and could not be deleted again: {}"
+                        .format(ns, name, vm_name, str(exc)[:300]))
+        # Not _batch_vanished: that sets S_FAILED with a message matching the
+        # "vanished" KNOWN_ISSUES pattern, which offers Retry -- and the drawer's
+        # Retry button is enabled for any S_FAILED VM regardless of which issue
+        # matched. Retrying here would re-import a VM whose disk was just
+        # detached. End at S_SKIPPED instead (where the incident itself ended),
+        # which offers no retry anywhere in the UI.
+        msg = ("rollback released by hand: VirtualMachine {} deleted, its CNS disk is now most "
+               "likely detached -- verify in vCenter before reusing this VM".format(
+                   ", ".join(vm_names)))
+        self.store.set_batch_state(name, ns, st.B_DELETED, "released by hand (release_rollback)")
+        self.store.log_event("batch deleted after release_rollback", "warn", batch=name)
+        for row in self.store.query_vms(batch_name=name):
+            if row["namespace"] == ns and row["state"] not in st.TERMINAL_STATES:
+                self.store.set_vm_state(row["moref"], st.S_SKIPPED, stage="rollback",
+                                        phase="RollbackReleased", message=msg)
+        result["released"].append(name)
+        result["leftover_checklist"].append(
+            "{}/{}: vCenter and the Supervisor still hold leftovers this never touches on purpose -- "
+            "check `kubectl -n {} get cnsunregistervolume,virtualmachine,pvc`, and once you are sure, "
+            "delete the CNS volume in vCenter's Container Volumes view (that also clears the "
+            "CnsUnregisterVolume finalizer; a namespace user cannot patch it directly)".format(ns, name, ns))
 
     def cleanup_candidates(self) -> List[sqlite3.Row]:
         """Batches safe to delete: confirmed rollbacks, and finished prechecks still on the cluster."""

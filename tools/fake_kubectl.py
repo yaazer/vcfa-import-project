@@ -8,10 +8,18 @@ Point the tool at it with:
 and set these environment variables:
 
     FAKE_KUBECTL_STATE     path to a JSON file holding simulated cluster state
-    FAKE_KUBECTL_SCENARIO  happy | flaky | import-flaky | wait | disaster   (default: happy)
-                           flaky fails some VMs at precheck; import-flaky passes precheck
-                           and fails some at import time (the case that needs rollback)
+    FAKE_KUBECTL_SCENARIO  happy | flaky | import-flaky | wait | disaster | rollback-stuck
+                           (default: happy). flaky fails some VMs at precheck; import-flaky
+                           passes precheck and fails some at import time (the case that
+                           needs rollback); rollback-stuck reaches AwaitingCommit and then,
+                           once rollbackAction is set, never reverts -- the operator's own
+                           RollbackCustomResourceCompleted step fails and keeps retrying
+                           (incident 2026-11-13: a vCenter CNS-unregister NotSupported)
     FAKE_KUBECTL_SETTLE    polls before a batch reaches a terminal phase (default 2)
+    FAKE_KUBECTL_VM_DELETE     "forbidden" makes deleting a vm-operator VirtualMachine refused
+                               (release_rollback)
+    FAKE_KUBECTL_VM_RECREATE   when set, GETting a deleted VirtualMachine recreates it empty
+                               exactly once per name (models the still-running child doing so)
 
 It is deliberately not a general kubectl: it implements only the verbs
 vcfa-import actually uses. Unlike the tool itself, it may use PyYAML.
@@ -44,6 +52,8 @@ def load_state() -> dict:
         "subnets": [],
         "batches": {},      # "ns/name" -> object
         "polls": {},        # "ns/name" -> int
+        "vms": {},          # "ns/name" -> vm-operator VirtualMachine object (release-rollback)
+        "vm_recreated": {}, # "ns/name" -> True once FAKE_KUBECTL_VM_RECREATE has recreated it once
         "applies": 0,
     }
 
@@ -70,7 +80,7 @@ def op_outcome(vm_id: str, precheck: bool) -> str:
         return "Failed"
     if scen == "import-flaky" and not precheck and tail % 5 == 0:
         return "Failed"
-    if scen == "wait" and not precheck:
+    if scen in ("wait", "rollback-stuck") and not precheck:
         return "AwaitingCommit"
     return "Succeeded"
 
@@ -188,6 +198,11 @@ def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = No
     rollback_at = obj.get("_rollback_poll")   # poll count when rollbackAction arrived
     rolling = rollback_at is not None
     reverted = rolling and polls >= rollback_at + settle()
+    # Incident 2026-11-13: a VM already AwaitingCommit when rollbackAction
+    # landed never reverted -- vCenter refused the operator's CNS unregister
+    # step (NotSupported) and it retried for three days without resolving.
+    # "RollbackStuck" never reaches RolledBack, no matter how many polls.
+    rollback_stuck = scenario() == "rollback-stuck"
 
     ops = []
     terminal = True
@@ -197,11 +212,15 @@ def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = No
         if phase == "AwaitingCommit" and committed:
             phase = "Succeeded"
         if rolling and (phase in ("Failed", "AwaitingCommit") or obj.get("_rollback_at_creation")):
-            # Only what did not commit can be handed back to vCenter -- and
-            # with the action present from the start, nothing ever commits.
-            phase = "RolledBack" if reverted else "RollingBack"
-            if not reverted:
+            if rollback_stuck and phase == "AwaitingCommit":
+                phase = "RollbackStuck"
                 terminal = False
+            else:
+                # Only what did not commit can be handed back to vCenter -- and
+                # with the action present from the start, nothing ever commits.
+                phase = "RolledBack" if reverted else "RollingBack"
+                if not reverted:
+                    terminal = False
         if not precheck and phase in ("Succeeded", "AwaitingCommit") and vm_id in (obj.get("_vm_deleted") or []):
             # Observed 2026-10-01: the VirtualMachine the import created was deleted
             # before the import completed. The operator retries for ever: the op stays
@@ -216,7 +235,8 @@ def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = No
             "message": {"Succeeded": "", "Failed": "VM Tools not running",
                         "AwaitingCommit": "waiting for commit",
                         "RollingBack": "reverting ownership to vCenter",
-                        "RolledBack": "ownership reverted to vCenter"}.get(phase, ""),
+                        "RolledBack": "ownership reverted to vCenter",
+                        "RollbackStuck": "rollback step failed: ObjectDeletionFailure"}.get(phase, ""),
         })
 
     return real_vocabulary(obj, ops, precheck, rolling, reverted)
@@ -238,7 +258,7 @@ def real_vocabulary(obj: dict, ops: list, precheck: bool, rolling: bool, reverte
     ok = [o["name"] for o in ops if o["phase"] == "Succeeded"]
     waiting = [o["name"] for o in ops if o["phase"] == "AwaitingCommit"]
     rolled = [o["name"] for o in ops if o["phase"] == "RolledBack"]
-    rolling_ops = [o["name"] for o in ops if o["phase"] == "RollingBack"]
+    rolling_ops = [o["name"] for o in ops if o["phase"] in ("RollingBack", "RollbackStuck")]
     gone = [o["name"] for o in ops if o["phase"] == "VmGone"]
     not_ready_msg = "Operations are not ready. Operation Names: " + ", ".join(gone or names)
 
@@ -381,6 +401,18 @@ def child_conditions(phase: str, message: str, precheck: bool = False) -> dict:
                 + [cond(k, reverted) for k in ("RollbackCompleted", "RollbackCustomResourceCompleted",
                                                "RollbackVirtualMachineLocationCompleted",
                                                "RollbackVirtualMachinePropertyCompleted")]}
+    if phase == "RollbackStuck":
+        # Incident 2026-11-13: the child kept ReadyForCommit (and the VM
+        # lifecycle conditions) True straight through a failed rollback --
+        # only RollbackCustomResourceCompleted appears, as False with a real
+        # reason. Location and Property never start (never observed at all),
+        # and RollbackCompleted never appears either: this is what let the
+        # tool read the whole thing as "still awaiting commit" before the fix.
+        return {"conditions": [cond("PrecheckSucceeded", True), cond("ReadyForCommit", True)] + done
+                + [{"type": "RollbackCustomResourceCompleted", "status": "False",
+                   "reason": "ObjectDeletionFailure",
+                   "message": "failed to unregister PVCs from CNS: failed to unregister associated "
+                              "volume f126123a-89a5-46e8-afd4-53cc9e8e10f7"}]}
     if phase == "VmGone":
         missing = cond("VirtualMachineCreated", False, "VMCRNotFoundPostCreation")
         missing["message"] = 'VM CR was created but not found: VirtualMachine.vmoperator.vmware.com "vm-gone" not found'
@@ -421,6 +453,8 @@ def main(argv: list) -> int:
         return 1
     verb = argv[0]
     data = load_state()
+    data.setdefault("vms", {})
+    data.setdefault("vm_recreated", {})
     ns = arg_value(argv, "-n") or arg_value(argv, "--namespace")
 
     if verb == "config":
@@ -569,6 +603,46 @@ def main(argv: list) -> int:
             sys.stderr.write("error: the server doesn't have a resource type \"{}\"\n".format(base))
             return 1
 
+        if base in ("virtualmachine", "virtualmachines", "vm"):
+            # release_rollback's own GET, re-checking for the empty VirtualMachine
+            # the still-running child recreates (observed 2026-11-13) in the gap
+            # between deleting it and deleting its batch. FAKE_KUBECTL_VM_RECREATE
+            # models exactly one such recreation per name, so a test can prove the
+            # second delete pass catches it.
+            if name is None:
+                # release_rollback's read-only candidate lookup: every stored
+                # VirtualMachine in this namespace, same shape as a real `get
+                # virtualmachines -n ns -o json` List. FAKE_KUBECTL_VM_LIST=
+                # forbidden models a namespace user without `list` on this
+                # resource -- distinct from "zero candidates", which must
+                # not read the same as "could not ask" (CLAUDE.md: never
+                # turn a refusal/timeout into "missing").
+                if os.environ.get("FAKE_KUBECTL_VM_LIST") == "forbidden":
+                    sys.stderr.write(
+                        'Error from server (Forbidden): virtualmachines.vmoperator.vmware.com is '
+                        'forbidden: User "sso:vm-user@vsphere.local" cannot list resource '
+                        '"virtualmachines" in API group "vmoperator.vmware.com" in the namespace '
+                        '"{}"\n'.format(ns))
+                    return 1
+                items = [obj for key, obj in data["vms"].items()
+                        if not ns or key.split("/", 1)[0] == ns]
+                print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+                return 0
+            key = "{}/{}".format(ns, name)
+            if (key not in data["vms"] and os.environ.get("FAKE_KUBECTL_VM_RECREATE")
+                    and not data["vm_recreated"].get(key)):
+                data["vms"][key] = {"apiVersion": "vmoperator.vmware.com/v1alpha2", "kind": "VirtualMachine",
+                                    "metadata": {"name": name, "namespace": ns},
+                                    "status": {"conditions": []}}
+                data["vm_recreated"][key] = True
+                save_state(data)
+            if key in data["vms"]:
+                print(json.dumps(data["vms"][key]))
+                return 0
+            sys.stderr.write(
+                'Error from server (NotFound): virtualmachines.vmoperator.vmware.com "{}" not found\n'.format(name))
+            return 1
+
         if base == "importoperationbatches":
             matches = []
             for key, obj in data["batches"].items():
@@ -638,10 +712,26 @@ def main(argv: list) -> int:
         return 0
 
     if verb == "delete":
+        resource = argv[1]
         name = argv[2]
+        base = resource.split(".")[0]
         if os.environ.get("FAKE_KUBECTL_DELETE_FAILS"):
             sys.stderr.write('Error from server (InternalError): etcdserver: request timed out\n')
             return 1
+        if base in ("virtualmachine", "virtualmachines", "vm"):
+            # release_rollback deleting the Supervisor VirtualMachine object --
+            # UNVERIFIED against a real Supervisor (see engine.py). FAKE_KUBECTL_VM_DELETE=forbidden
+            # models a namespace user without delete rights on it.
+            if os.environ.get("FAKE_KUBECTL_VM_DELETE") == "forbidden":
+                sys.stderr.write(
+                    'Error from server (Forbidden): virtualmachines.vmoperator.vmware.com "{}" is forbidden: '
+                    'User "sso:vm-user@vsphere.local" cannot delete resource "virtualmachines" in API group '
+                    '"vmoperator.vmware.com" in the namespace "{}"\n'.format(name, ns))
+                return 1
+            data["vms"].pop("{}/{}".format(ns, name), None)
+            save_state(data)
+            print('virtualmachine.vmoperator.vmware.com/{} deleted'.format(name))
+            return 0
         data["batches"].pop("{}/{}".format(ns, name), None)
         save_state(data)
         print('importoperationbatch.{}/{} deleted'.format(GROUP, name))

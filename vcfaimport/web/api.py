@@ -49,7 +49,8 @@ from ..discovery import (
 )
 from ..engine import STAGE_IMPORT, STAGE_PRECHECK, Engine
 from ..kube import Kubectl
-from ..vcenter import ENV_PASSWORD, ENV_SERVER, ENV_USER, VCenterClient, VCenterError, discover
+from ..vcenter import (ENV_PASSWORD, ENV_SERVER, ENV_USER, VCenterClient, VCenterError, discover,
+                       storage_compliance_checker, storage_compliance_ok)
 from .jobs import FAILED, STOPPED, WARNING, Job, JobManager
 
 
@@ -688,6 +689,13 @@ class WebApp:
                 "revert": sum(r["revert"] for r in rows),
                 "committed": sum(r["committed"] for r in rows)}
 
+    def release_rollback_preview(self, q, body) -> Dict[str, Any]:
+        with self.lock:
+            engine = self._engine()
+            return engine.release_rollback(
+                batch_names=_list(body.get("batches")), morefs=_list(body.get("morefs")),
+                confirm=False, target=(body.get("target") or "").strip() or None)
+
     def abandon_preview(self, q, body) -> Dict[str, Any]:
         with self.lock:
             engine = self._engine()
@@ -700,7 +708,7 @@ class WebApp:
 
     def triage(self, q, body) -> Dict[str, Any]:
         with self.lock:
-            return service.failure_groups(self.store)
+            return service.failure_groups(self.store, self.cfg)
 
     # ============================================================ activity
     def activity(self, q, body) -> Dict[str, Any]:
@@ -795,11 +803,17 @@ class WebApp:
     # ================================================================ jobs
     def run_job(self, q, body, kind: str) -> Dict[str, Any]:
         starter = getattr(self, "_job_" + kind)
-        stage_name = body.get("stage") if kind == "execute" else kind
-        if kind in ("execute", "commit", "rollback") and access.needs_approval(self.cfg, stage_name, body):
+        stage_name = body.get("stage") if kind == "execute" else "rollback" if kind == "release_rollback" else kind
+        if kind in ("execute", "commit", "rollback", "release_rollback") and access.needs_approval(
+                self.cfg, stage_name, body):
             _require_confirm(body)
+            # release_rollback is requested under the "rollback" governance
+            # stage (so require_approval=["rollback"] covers both), but it
+            # must not be dispatched as a plain rollback once approved -- mark
+            # which job kind this really is, read back in _run_approved.
+            req_body = dict(body, _job_kind=kind) if kind == "release_rollback" else body
             with self.lock:
-                a = access.request(self.store, stage_name, body, self._actor())
+                a = access.request(self.store, stage_name, req_body, self._actor())
             service.notifier(self.cfg)("approval_requested", "Approval #{} requested".format(a["id"]),
                                        a["summary"], {"by": a["requested_by"]})
             return {"approval": a}
@@ -825,6 +839,7 @@ class WebApp:
             "with_tags": not body.get("no_tags"),
             "with_namespaces": not body.get("no_namespaces"),
             "with_subnets": not body.get("no_subnets"),
+            "with_storage_compliance": not body.get("no_storage_compliance"),
             "concurrency": _int(body.get("concurrency"), default=12, minimum=1),
         }
         timeout = _int(body.get("timeout"), default=60, minimum=5)
@@ -873,6 +888,12 @@ class WebApp:
                 job.log("  {} VM(s) have no network adapters".format(no_nics))
             if stale:
                 job.log("  {} VM(s) are not running VM Tools (likely precheck failures)".format(stale))
+            if opts["with_storage_compliance"]:
+                noncompliant = sum(1 for v in vms if not storage_compliance_ok(v.facts.get("storage_compliance")))
+                if noncompliant:
+                    job.log("  {} VM(s) not known COMPLIANT/NOT_APPLICABLE on storage policy -- held "
+                            "back from precheck and import until fixed (storage_compliance_enforce); "
+                            "see Readiness".format(noncompliant))
             if opts["with_namespaces"]:
                 ns = extras.get("namespaces")
                 if ns is not None:
@@ -959,10 +980,25 @@ class WebApp:
                     job.log("commitAction {}".format(cfg.commit_action))
                 if dry_run:
                     job.log("DRY RUN: manifests are rendered and validated, nothing is applied")
-                totals = service.run_stage(
-                    ws.engine, stage_name, waves=waves, limit=limit, morefs=morefs,
-                    include_failed=include_failed, folders=folders, folder_exact=folder_exact,
-                    rollback_failed=rollback_failed, log=job.log)
+                vc_client = None
+                if stage_name == STAGE_IMPORT and not dry_run and cfg.storage_compliance_enforce:
+                    vc_client = self._vcenter_client(job.log)
+                    if vc_client is not None:
+                        ws.engine.storage_compliance_check = storage_compliance_checker(vc_client)
+                        job.log("vCenter connected for a live storage-policy recheck at each "
+                                "wave's submission")
+                    else:
+                        job.log("no vCenter credentials remembered; the import gate uses each "
+                                "VM's last-known storage-policy compliance from discover instead "
+                                "of a fresh recheck")
+                try:
+                    totals = service.run_stage(
+                        ws.engine, stage_name, waves=waves, limit=limit, morefs=morefs,
+                        include_failed=include_failed, folders=folders, folder_exact=folder_exact,
+                        rollback_failed=rollback_failed, log=job.log)
+                finally:
+                    if vc_client is not None:
+                        vc_client.close()
                 job.log("")
                 if totals["halted"]:
                     job.log("RUN HALTED: {}".format(totals["halted"]))
@@ -995,6 +1031,7 @@ class WebApp:
         def run(job: Job) -> Dict[str, Any]:
             with self._job_workspace(job) as ws:
                 counts = ws.engine.refresh()
+                service.notify_rollback_failed(ws.cfg, ws.engine)
             job.log("re-polled {} batch(es); {} VM result(s) recorded".format(
                 counts["batches"], counts["updated"]))
             return counts
@@ -1012,6 +1049,7 @@ class WebApp:
             with self._job_workspace(job) as ws:
                 while not stop.is_set():
                     counts = ws.engine.refresh()
+                    service.notify_rollback_failed(ws.cfg, ws.engine)
                     polls += 1
                     remaining = ws.store.counts()
                     active = sum(remaining.get(s, 0) for s in service.IN_FLIGHT_STATES)
@@ -1069,6 +1107,7 @@ class WebApp:
                     return {"patched": [], "reverted": 0, "status": WARNING if notes else None}
                 result = ws.engine.rollback(batches, action=action, wait=wait, delete=delete,
                                             timeout_minutes=timeout)
+                service.notify_rollback_failed(ws.cfg, ws.engine)
             job.log("patched {} batch(es); {} VM(s) confirmed reverted to vCenter; {} deleted".format(
                 len(result["patched"]), result["reverted"], len(result["deleted"])))
             for name in result["pending"]:
@@ -1080,6 +1119,43 @@ class WebApp:
 
         params = dict(sel, action=action, delete=delete, wait=wait)
         return self._start("rollback", "Roll back to vCenter", params, run, stoppable=True,
+                           lock=self._lock_for("rollback"))
+
+    def _job_release_rollback(self, body: Dict[str, Any]) -> Job:
+        _require_confirm(body)
+        batch_names = _list(body.get("batches"))
+        morefs = _list(body.get("morefs"))
+        target = (body.get("target") or "").strip() or None
+        if not (batch_names or morefs):
+            raise ApiError(400, "say what to release: batches or morefs")
+
+        def run(job: Job) -> Dict[str, Any]:
+            with self._job_workspace(job) as ws:
+                preview = ws.engine.release_rollback(batch_names=batch_names, morefs=morefs,
+                                                     confirm=False, target=target)
+                if not preview["preview"]:
+                    if not preview["errors"]:
+                        job.log("nothing eligible: a batch needs a VM in rollback_failed state")
+                    for err in preview["errors"]:
+                        job.log("  ! " + err)
+                    for group in preview["candidates"]:
+                        for c in group["candidates"]:
+                            job.log("      release-rollback --batch {} --target {}".format(
+                                group["batch"], c["name"]))
+                    return {"released": [], "status": WARNING if preview["errors"] else None}
+                for line in preview["preview"]:
+                    job.log("  " + line)
+                result = ws.engine.release_rollback(batch_names=batch_names, morefs=morefs,
+                                                    confirm=True, target=target)
+            job.log("released {} batch(es)".format(len(result["released"])))
+            for err in result["errors"]:
+                job.log("  ! " + err)
+            for line in result["leftover_checklist"]:
+                job.log("  * " + line)
+            return dict(result, status=WARNING if result["errors"] else None)
+
+        params = {"batches": batch_names, "morefs": morefs, "target": target}
+        return self._start("release_rollback", "Release stuck rollback", params, run,
                            lock=self._lock_for("rollback"))
 
     def _job_abandon(self, body: Dict[str, Any]) -> Job:
@@ -1283,7 +1359,7 @@ class WebApp:
         return self.legal_status(q, body)
 
     def _on_job_finish(self, job: Job) -> None:
-        kinds = ("execute", "rollback", "commit", "schedule", "abandon", "cleanup")
+        kinds = ("execute", "rollback", "release_rollback", "commit", "schedule", "abandon", "cleanup")
         if job.kind not in kinds and job.status != "failed":
             return
         result = dict(job.result or {}, error=job.error)
@@ -1378,8 +1454,12 @@ class WebApp:
 
     def _run_approved(self, a: Dict[str, Any]) -> Job:
         """Start an approved request, on behalf of both people."""
-        kind = "execute" if a["stage"] in ("import", "precheck") else a["stage"]
+        # release_rollback is requested and governed under stage "rollback"
+        # (run_job), so that alone can't tell it apart from a plain rollback
+        # approval -- _job_kind in the stored body says which it really was.
+        kind = a["body"].get("_job_kind") or ("execute" if a["stage"] in ("import", "precheck") else a["stage"])
         body = dict(a["body"], confirm=True)
+        body.pop("_job_kind", None)
         if kind == "execute":
             body["stage"] = a["stage"]
         prev = getattr(CTX, "user", None)
@@ -1677,6 +1757,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/batches/(?P<ns>[^/]+)/(?P<name>[^/]+)", "batch_detail"),
         ("POST", r"/api/execute/preview", "execute_preview"),
         ("POST", r"/api/rollback/preview", "rollback_preview"),
+        ("POST", r"/api/release_rollback/preview", "release_rollback_preview"),
         ("POST", r"/api/abandon/preview", "abandon_preview"),
         ("GET", r"/api/triage", "triage"),
         ("GET", r"/api/activity", "activity"),
@@ -1686,7 +1767,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/jobs/(?P<job_id>[\w.-]+)", "job"),
         ("POST", r"/api/jobs/(?P<job_id>[\w.-]+)/stop", "job_stop"),
         ("POST", r"/api/run/(?P<kind>discover|preflight|execute|refresh|watch|commit|rollback|"
-                 r"abandon|cleanup|verify)", "run_job"),
+                 r"release_rollback|abandon|cleanup|verify)", "run_job"),
         ("GET", r"/api/reset", "reset_preview"),
         ("POST", r"/api/reset", "reset_run"),
         ("GET", r"/api/me", "me"),

@@ -801,6 +801,7 @@ it never touches batches it did not create.
 | `retry` | return failed VMs to the queue |
 | `reset` | archive the campaign and start afresh; `--keep-discovery` keeps the vCenter inventory |
 | `rollback` | hand failed imports back to vCenter: set `rollbackAction`, wait for the revert, optionally delete |
+| `release-rollback` | the Supervisor-side way out of a rollback step that failed (`rollback_failed`): deletes the stuck VM's `VirtualMachine` object and its batch; never touches vCenter |
 | `cleanup` | delete batch objects the cluster no longer needs: every batch of a finished wave, confirmed rollbacks and finished prechecks; `--wave N` scopes it |
 | `abandon` | discard a batch without rollback (precheck-only, or nothing in flight); VMs return to `pending` |
 | `vms` | list VMs and their states (`--json` for scripting) |
@@ -962,20 +963,26 @@ What happens, in order:
    `rolling_back` and the request is written to the ledger.
 2. **Wait.** The batch is polled until the operator reports the VMs reverted
    (`RolledBack` / `RollbackComplete` phases), up to `rollback_timeout_minutes`
-   (default 30). A VM the operator could not revert is marked `failed` with
-   `ROLLBACK FAILED:` in its message — that one needs a human.
+   (default 30). A VM whose revert **step itself fails** (e.g. vCenter refuses
+   the CNS disk unregister — see *A rollback step fails* below) moves to
+   `rollback_failed`, not `failed`: it stays watched (`refresh`/`watch` keep
+   polling it, with no timeout) rather than being given up on, because the
+   operator can keep retrying for days on its own. `rollback --wait` itself
+   does not sit out the full timeout for it, though: it reports the failure as
+   soon as the first poll sees it.
 3. **Confirm.** Reverted VMs move to `rolled_back`, with `rolled_back_at`
    stamped. They are retryable: `retry` returns them to the queue.
 4. **Delete** — only with `--delete`, and **only after step 3 confirms**.
-   Deleting a batch whose rollback has not completed is refused. Batches you
-   rolled back without `--delete` stay on the cluster for inspection; remove
-   them later with `cleanup`, which likewise deletes only confirmed rollbacks
-   (and finished precheck batches, see *Preflight vs precheck*).
+   Deleting a batch whose rollback has not completed, or that has any VM at
+   `rollback_failed`, is refused. Batches you rolled back without `--delete`
+   stay on the cluster for inspection; remove them later with `cleanup`, which
+   likewise deletes only confirmed rollbacks (and finished precheck batches,
+   see *Preflight vs precheck*).
 
 ```
 importing ──> failed ──rollback──> rolling_back ──> rolled_back ──retry──> pending
                                         │
-                                        └──> failed (ROLLBACK FAILED: needs a human)
+                                        └──> rollback_failed ──release-rollback──> skipped
 ```
 
 Two things it will not do:
@@ -988,6 +995,87 @@ Two things it will not do:
 
 A batch held by `commitAction: Wait` can be rolled back instead of committed —
 that is the point of the gate.
+
+### A rollback step fails: `release-rollback`
+
+The operator's revert is itself a sequence of steps (unregister the CNS
+volume, relocate, restore properties), and the first of those can fail
+outright — observed once in the lab: vCenter refused to unregister a VM's
+disk ("the operation is not supported on the object") and the operator
+retried every ~4.5 minutes for three days without ever resolving it, while
+the VM sat at `rollback_failed`. There is no way to make vCenter accept the
+unregister from here; getting the VM back needs the same thing a human would
+do by hand, so `release-rollback` automates the part of that which is safe
+to automate:
+
+```bash
+vcfa-import release-rollback --batch imp-w1-vlan197-003-8a1c2   # preview only
+vcfa-import release-rollback --batch imp-w1-vlan197-003-8a1c2 -y
+vcfa-import release-rollback --vm vm-1483405                    # whichever batch it's in
+```
+
+Without `-y` it only previews. Confirmed, it deletes the Supervisor
+`VirtualMachine` object for each `rollback_failed` VM in the batch (**this
+detaches its disk — copy the VMDK first if the VM matters, there is no undo
+here**), then the batch itself, then cleans up an empty `VirtualMachine` the
+still-running child may have recreated in between. The VM ends at `skipped`
+(not `failed`): its disk is gone, so nothing here offers to retry it. It
+never touches vCenter directly — no CNS volume delete, no VMDK delete — and
+never patches the `CnsUnregisterVolume` finalizer a namespace user is refused
+anyway; those are printed back as a short checklist for you to clear by hand
+once you are sure. It refuses a batch where another VM is still plainly
+`rolling_back` (that one may yet succeed on its own) or where a VM's target
+`VirtualMachine` name was never recorded (never guess it) — and `--vm` only
+ever chooses *which batch*; every `rollback_failed` VM in it is released
+together, never just the one named, so none is left behind unwatched.
+
+**`--target NAME`** supplies the Supervisor `VirtualMachine` name by hand when
+it was never recorded on the VM's own row. This is likely needed on *every*
+release in the lab, not an edge case: the target-name field itself has never
+been confirmed as populated by the operator (see the VM drawer's "Resource"
+row — if it reads "not reported yet" even for a committed VM, expect to need
+`--target` here too). It only applies when exactly one VM in the batch is
+stuck, and it is trusted only after two more checks beyond the usual
+existence one: the name must not already be on record as some *other* VM's
+target (a typo must never land on a real, unrelated VM), and the object
+itself must carry the annotation
+`vmoperator.vmware.com.protected/skip-delete-platform-resource: "import in
+progress"` — observed once, on the incident's own unfinished import, not
+confirmed as a general rule. A VM legitimately missing it is refused, and you
+are pointed back to the Automation console to finish by hand -- fails safe,
+at the cost of `--target` not working everywhere it might need to.
+
+When no `target_resource` is on record, the refusal lists *candidates*
+instead of leaving you to go find the name by hand: every `VirtualMachine`
+in that namespace carrying the annotation above, not already on record as
+some other VM's own target (a read-only `kubectl get` — nothing is touched).
+This is a hint, not a pick: even when exactly one candidate turns up,
+`release-rollback` never uses it on its own — the same annotation can sit on
+a healthy, unrelated import in the same namespace, and the stuck VM's own
+object may itself be gone or missing the annotation (observed: the
+still-running child recreates it empty). Confirm it's the right one yourself
+(check it against the Automation console, or the VM drawer's "Resource" row
+if that VM still has one), then pass it as `--target NAME` as usual.
+
+**Unverified:** deleting the `VirtualMachine` object with `kubectl`, in place
+of the Automation console's own delete-without-persistent-volumes action, has
+not been tried against a real Supervisor. If a namespace user's RBAC refuses
+the delete, it stops cleanly and tells you to use the console instead.
+
+**Notification:** nothing polls the Supervisor on its own in the background.
+A `rollback_failed` notification only fires when `run`, `rollback --wait`,
+`watch`, `status --refresh` or a console job next reads the batch's status —
+if you ran `rollback --no-wait` and walked away with nothing else watching,
+you won't hear about it until one of those runs again. Leave `watch` running
+after a rollback (or schedule `status --refresh`) if you want to be told
+without asking.
+
+**Governance note:** `release-rollback` is requested and approved under the
+same two-person-rule stage as `rollback` (`require_approval = ["rollback"]`
+covers both). An approval granted for one is technically usable to run the
+other from the CLI's `--approval`; the web console does not have this gap
+(it dispatches the exact action that was requested). Treat an approval as
+scoped to its own request, not interchangeable, until this is tightened.
 
 ### Why rollback is never in the manifest
 
@@ -1351,6 +1439,44 @@ It is advice: the operator's precheck is the authority. To keep VMs graded
 *likely to fail* out of precheck batches, set `readiness_exclude_blocked = true`
 (Settings -> Safety); the run says how many it held back.
 
+### Storage-policy compliance -- on by default, not advisory
+
+Unlike everything else in this section, this one is **on from the start** and
+is a hard gate, not advice: `discover` records vCenter's own storage-policy
+compliance verdict for each VM (`GET .../storage/policy/compliance`), and
+neither `precheck` nor `run` will move a VM that is not known `COMPLIANT` or
+`NOT_APPLICABLE` -- including one that has **never been checked at all**.
+"Unless compliant" means fail closed, the same way as everywhere else in this
+tool: an unknown answer is treated the same as a known-bad one, never as a
+pass.
+
+> **Breaking change for existing campaigns.** A VM discovered before this
+> feature existed, or loaded straight from an inventory CSV with no
+> `discover` pass, has no compliance verdict on record and is held back by
+> this gate until a fresh `discover` runs. Re-run `discover`, or set
+> `storage_compliance_enforce = false` (Settings -> Safety) if this vCenter
+> is too old for the compliance API or you need the old behaviour back.
+
+`run` can also recheck live, right before each wave's batch is applied --
+closing the gap a cached `discover` snapshot cannot (a policy edited mid
+campaign, which is the suspected cause of the rollback incident below):
+
+```bash
+vcfa-import run --vcenter vc01.lab --user administrator@vsphere.local   # prompts for the password
+VCFA_VC_PASSWORD=... vcfa-import run --vcenter vc01.lab --user admin@vsphere.local --insecure  # non-interactive
+vcfa-import run                                                         # cached-only (from the last discover)
+vcfa-import run --no-vcenter-check                                      # silence the "no live recheck" note
+```
+
+Without `--vcenter`/`--user` (or the `VCFA_VC_SERVER`/`VCFA_VC_USER`
+environment variables), `run` simply uses each VM's last `discover` and says
+so; the cached gate above still applies either way. In the console, the
+live recheck only runs if a prior `discover` job ticked "remember these
+credentials" -- otherwise it falls back the same way, with a log line saying
+so. `readiness` shows the per-VM reason (`storage_noncompliant`), and the
+console's Settings page has the
+same `storage_compliance_enforce` override.
+
 ### vCenter tags and applications
 
 Discovery reads each VM's vCenter tags (`--no-tags` skips it). Tags can select
@@ -1519,7 +1645,12 @@ password_env = "VCFA_SMTP_PASSWORD"   # the password itself is never stored
 
 Events: `job_succeeded`, `job_warning`, `job_failed`, `circuit_breaker`,
 `awaiting_commit`, `approval_requested`, `approval_decided`,
-`schedule_started`, `schedule_finished`, `schedule_missed`, `verify_failed`.
+`schedule_started`, `schedule_finished`, `schedule_missed`, `verify_failed`,
+`rollback_failed` (a rollback step the operator could not finish; sent by
+whichever of `run`, `rollback --wait`, `watch`, `status --refresh` or a
+console job first sees it, with no console tab needed -- keep `watch`
+running after a rollback to be told without having to ask again; see
+[`release-rollback`](#a-rollback-step-fails-release-rollback)).
 No `events` means all of them. `webhook` posts a JSON document with the event,
 severity, title, text and fields; delivery is retried and a failure is logged,
 never fatal.
