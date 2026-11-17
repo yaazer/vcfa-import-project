@@ -617,12 +617,27 @@ In the console, every folder and tag row and the bar next to the *Stage* button 
 new VMs land (*3 new VMs ready to stage → Wave 6*). The maps' own *Wave* column is only shown while
 *As the maps say* is chosen; its values stay in the map files either way.
 
+**Changing the wave of VMs already queued.** You don't have to use the Waves page: change the
+wave on *Map & Stage* and stage again. With *Also move VMs already queued* ticked (the default;
+`--keep-queued-waves` on the CLI turns it off):
+
+- *Wave…* (`--wave N`) moves every **selected** VM already in the queue to wave N.
+- *As the maps say* (`--wave maps`) moves each queued VM to the wave its tag, folder or portgroup
+  map entry names. This beats a wave set by an earlier drag on the Waves page. A VM whose entry
+  names no wave gets the wave staging gives it otherwise.
+- *Next wave* never moves a queued VM, so staging again can't merge the whole campaign into one
+  new wave.
+- The preview shows each move in the *Wave* column (`3 → 5`) before you stage.
+- A move is the same as a drag on the Waves page: an event is logged, a precheck pass is kept
+  (a wave is not a state), and with `app_together` the whole application moves.
+- A VM already in a batch never moves.
+
+Unticked, VMs already in the queue keep their wave (*As the maps say* still re-applies the maps
+to pending VMs, as before). Staging again always refreshes their namespace and subnets.
+
 Whatever the choice:
 
-- **VMs already in the queue keep their wave.** Staging again still refreshes their namespace and
-  subnets; moving them between waves is the Waves page's job (or `--wave maps`, which re-applies
-  the maps to pending VMs as before).
-- **A wave set on a VM in Select** (the picker, the selection bar, `select --wave`) wins.
+- **A wave set on a new VM in Select** (the picker, the selection bar, `select --wave`) wins.
 - **With `app_together`,** a new VM whose application is already queued joins that application's wave.
 
 ```bash
@@ -1476,6 +1491,35 @@ credentials" -- otherwise it falls back the same way, with a log line saying
 so. `readiness` shows the per-VM reason (`storage_noncompliant`), and the
 console's Settings page has the
 same `storage_compliance_enforce` override.
+
+#### The right policy, not just a compliant one
+
+Compliance only says a VM's disks match **whatever policy is attached to
+them**. A disk can be perfectly `COMPLIANT` with a policy its target namespace
+does not offer. So the same gate also checks *which* policy each part of the VM
+uses:
+
+- `discover` reads which storage policy each VM's home and each of its disks is
+  on (`GET /vcenter/vm/{vm}/storage/policy`), and which policies each
+  Supervisor namespace offers (the `storage_specs` of
+  `GET /vcenter/namespaces/instances/{namespace}`). It asks for every namespace
+  vCenter lists, plus every namespace the import queue already targets.
+- `precheck` and `run` hold back a VM if its home or **any** disk:
+  - is on a policy its target namespace does not offer;
+  - has no storage policy at all (a VM with no policy now blocks, where it
+    used to pass as `NO_POLICY`).
+- If the tool cannot tell which policies a VM or a namespace uses, the VM is
+  held back too (fail closed). That covers a failed read, a namespace vCenter
+  never described, and a VM discovered before this release.
+- The plan shows why, for example
+  `disk 2000 uses 'Bronze'; namespace ns-a offers: 'DS2-Thick', 'Gold'`.
+  `discover` lists queued VMs that do not fit, and `readiness` flags a home or
+  disk with no policy (`storage_policy_missing`).
+- With vCenter credentials on `run`, the live recheck before each wave re-reads
+  both sides as well.
+
+Fix the policy in vCenter and re-run `discover`. `storage_compliance_enforce =
+false` turns off both checks.
 
 ### vCenter tags and applications
 

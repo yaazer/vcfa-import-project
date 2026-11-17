@@ -984,8 +984,10 @@ def t_vcenter_storage_compliance_classify():
     from vcfaimport.vcenter import storage_compliance_ok, storage_compliance_reason
 
     # Pass: a known-good answer, or nothing to be non-compliant with.
-    for overall in ("COMPLIANT", "NOT_APPLICABLE", "NO_POLICY"):
+    for overall in ("COMPLIANT", "NOT_APPLICABLE"):
         assert storage_compliance_ok({"overall": overall}), overall
+    # A VM with no storage policy cannot be on one its namespace offers (2026-11-17).
+    assert not storage_compliance_ok({"overall": "NO_POLICY"})
     # Fail closed: a known-bad answer, an answer that is not known-good, a
     # failed request, and never having been asked at all -- "unless
     # compliant" (2026-11-16) means every one of these blocks the same way.
@@ -3615,6 +3617,24 @@ def t_http_fuzz():
             c.close()
 
 
+GOLD_POLICY, BRONZE_POLICY = "pol-gold-0001", "pol-bronze-0002"
+
+
+def _good_storage_facts(policy=GOLD_POLICY):
+    """Discovery facts for a VM whose storage is compliant with `policy` on home and disk 2000."""
+    return {"storage_compliance": {"overall": "COMPLIANT", "disks": {}},
+            "storage_policies": {"vm_home": policy, "disks": {"2000": policy}},
+            "disk_ids": ["2000"]}
+
+
+def _offer_policies(store, namespace, policies=(GOLD_POLICY,)):
+    """Record that `namespace` offers `policies`, as discover's vc_storage_policies snapshot would."""
+    snap = dict(store.get_meta("vc_storage_policies") or {})
+    snap["namespaces"] = dict(snap.get("namespaces") or {}, **{namespace: list(policies)})
+    snap["names"] = {GOLD_POLICY: "Gold", BRONZE_POLICY: "Bronze"}
+    store.set_meta("vc_storage_policies", snap)
+
+
 def _seed_store_with_vms(store, count, waves=(1, 2), folders=("Prod/Web", "Prod/DB", "DMZ")):
     """Discovered + queued VMs straight into a store, for API tests that need data."""
     from vcfaimport.inventory import Nic, VmRecord
@@ -3626,16 +3646,17 @@ def _seed_store_with_vms(store, count, waves=(1, 2), folders=("Prod/Web", "Prod/
                      "folder": folder, "datacenter": "DC1", "cluster": "CL1",
                      "tools_status": "RUNNING",
                      "nics": [{"device_key": 4000, "network_name": "VLAN1"}],
-                     # A real discover() would have recorded a compliance verdict
-                     # (storage_compliance_enforce is on by default, 2026-11-16);
-                     # a test of that gate itself overwrites this on purpose.
-                     "facts": {"storage_compliance": {"overall": "COMPLIANT", "disks": {}}}})
+                     # A real discover() would have recorded a compliance verdict and
+                     # which policies the VM uses (storage_compliance_enforce is on by
+                     # default, 2026-11-16); a test of that gate overwrites this on purpose.
+                     "facts": _good_storage_facts()})
         recs.append(VmRecord(moref=moref, vm_name="vm{:04d}".format(i), namespace="ns-a",
                              nics=[Nic(4000, "sub-a", "Subnet", "crd.nsx.vmware.com")],
                              wave=waves[i % len(waves)], group=folder.replace("/", "-").lower()))
     store.upsert_discovered(disc)
     store.set_selected([d["moref"] for d in disc], True)
     store.sync_inventory(recs)
+    _offer_policies(store, "ns-a")
     for d in disc:
         store._provenance_from_discovery(d["moref"])
     store.conn.commit()
@@ -4911,8 +4932,8 @@ class _FakeSmtp:
 def t_readiness_rules():
     from vcfaimport import readiness
     good = dict(ip="10.0.0.5", facts_json=json.dumps(
-        {"hw_version": "VMX_19", "disk_backings": ["VMDK_FILE"], "nic_states": ["CONNECTED"],
-         "storage_compliance": {"overall": "COMPLIANT"}}))
+        dict(_good_storage_facts(), hw_version="VMX_19", disk_backings=["VMDK_FILE"],
+             nic_states=["CONNECTED"])))
     eq(readiness.grade(readiness.assess(_disc_row(**good))), "ready")
     codes = lambda **kw: {f["code"] for f in readiness.assess(_disc_row(**dict(good, **kw)))}  # noqa: E731
     eq(codes(tools_status="toolsNotRunning"), {"tools_not_running"})
@@ -5380,11 +5401,12 @@ def t_engine_storage_compliance_live_filter_real_client():
             # the cached gate) is what this test exercises.
             store.upsert_discovered([{"moref": m, "name": m, "power_state": "POWERED_ON",
                                       "folder": "Prod/Web", "nics": [],
-                                      "facts": {"storage_compliance": {"overall": "COMPLIANT"}}}
+                                      "facts": _good_storage_facts()}
                                      for m in morefs])
             store.sync_inventory([VmRecord(moref=m, vm_name=m, namespace="ns-a",
                                            nics=[Nic(4000, "sub-a", "Subnet", "crd.nsx.vmware.com")],
                                            wave=1) for m in morefs])
+            _offer_policies(store, "ns-a")
             for m in morefs:
                 store.set_vm_state(m, vst.S_PRECHECK_PASSED, stage="precheck")
             cfg = Config()
@@ -5457,6 +5479,264 @@ def t_engine_storage_compliance_live_filter():
         eq(facts_1002["storage_compliance"]["overall"], "COMPLIANT",
            "a failed request (ERROR) must never overwrite the cached verdict")
         store.close()
+
+
+@test("storage policy vs namespace: the pure check fails closed on never-read, errors, unknown "
+      "namespaces, missing policies and policies the namespace does not offer")
+def t_vcenter_storage_policy_problems():
+    from vcfaimport.vcenter import storage_policy_problems as spp
+    names = {GOLD_POLICY: "Gold", BRONZE_POLICY: "Bronze"}
+    good = {"vm_home": GOLD_POLICY, "disks": {"2000": GOLD_POLICY}}
+    eq(spp(good, ["2000"], "ns-a", [GOLD_POLICY], names), [])
+    assert "never read" in spp(None, ["2000"], "ns-a", [GOLD_POLICY])[0]
+    assert "HTTP 403" in spp({"error": "nope", "status": 403}, [], "ns-a", [GOLD_POLICY])[0]
+    assert "unknown" in spp(good, ["2000"], "ns-a", None)[0], "an unknown namespace is not a pass"
+    wrong = spp({"vm_home": GOLD_POLICY, "disks": {"2000": BRONZE_POLICY}}, ["2000"], "ns-a",
+                [GOLD_POLICY], names)
+    assert "disk 2000 uses 'Bronze'" in wrong, wrong
+    assert "namespace ns-a offers: 'Gold'" in wrong, wrong
+    # vCenter leaves a disk with no policy out of the map: the VM's own disk list catches it.
+    missing = spp({"vm_home": GOLD_POLICY, "disks": {}}, ["2000"], "ns-a", [GOLD_POLICY])
+    assert "disk 2000 has no storage policy" in missing, missing
+    assert "VM home has no storage policy" in spp({"vm_home": "", "disks": {}}, [], "ns-a", [GOLD_POLICY])
+    nothing = spp(good, ["2000"], "ns-a", [])
+    assert any("offers: none" in x for x in nothing), "a namespace with no storage blocks everything"
+
+
+@test("storage policy vs namespace: eligible() holds back a COMPLIANT VM on a policy its namespace "
+      "does not offer, at precheck and at import, and names VM, disk and the offered policies")
+def t_engine_storage_policy_gate():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _seed_store_with_vms(store, 5, waves=(1,))
+        facts = {
+            # compliant -- with the wrong policy (the lab report, 2026-11-17)
+            "vm-1001": _good_storage_facts(BRONZE_POLICY),
+            # disk 2000 has no policy: vCenter leaves it out of the map
+            "vm-1002": dict(_good_storage_facts(), storage_policies={"vm_home": GOLD_POLICY, "disks": {}}),
+            # discovered before this release: policies never read
+            "vm-1003": {"storage_compliance": {"overall": "COMPLIANT"}, "disk_ids": ["2000"]},
+        }
+        for moref, f in facts.items():
+            store.conn.execute("UPDATE discovered SET facts_json=? WHERE moref=?", (json.dumps(f), moref))
+        store.conn.commit()
+        cfg = Config()
+        cfg.kubectl, cfg.workdir = "vcfa-test-no-such-kubectl", tmp
+        engine = Engine(cfg, store, None, lambda m: None)
+
+        for stage in ("precheck", "import"):
+            if stage == "import":
+                for m in ("vm-1000", "vm-1001", "vm-1002", "vm-1003", "vm-1004"):
+                    store.set_vm_state(m, vst.S_PRECHECK_PASSED, stage="precheck")
+            eligible = {r["moref"] for r in engine.eligible(stage, 1)}
+            eq(eligible, {"vm-1000", "vm-1004"}, stage)
+            note = next(h for h in engine.holdbacks if "target namespace offers" in h)
+            assert note.startswith("3 VM(s) held back"), note
+            assert "disk 2000 uses 'Bronze'" in note and "namespace ns-a offers: 'Gold'" in note, note
+
+        # The namespace is unknown to the snapshot: nothing passes (never guess).
+        store.set_meta("vc_storage_policies", {"namespaces": {}, "names": {}})
+        eq(engine.eligible("import", 1), [])
+        # The named override still lets them all through.
+        cfg.storage_compliance_enforce = False
+        eq(len(engine.eligible("import", 1)), 5)
+        store.close()
+
+
+@test("storage policy vs namespace: the live recheck holds back a batch whose VM moved to a "
+      "policy the namespace does not offer, and refreshes the cached facts and snapshot")
+def t_engine_storage_policy_live_filter():
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _seed_store_with_vms(store, 2, waves=(1,), folders=("Prod/Web",))
+        for m in ("vm-1000", "vm-1001"):
+            store.set_vm_state(m, vst.S_PRECHECK_PASSED, stage="precheck")
+        cfg = Config()
+        cfg.kubectl, cfg.workdir, cfg.batch_size = "vcfa-test-no-such-kubectl", tmp, 10
+        engine = Engine(cfg, store, None, lambda m: None)
+        batches = engine.plan("import", wave=1, write_manifests=False)
+        eq(len(batches), 1)
+
+        seen = {}
+
+        def live(morefs, namespaces):
+            seen["namespaces"] = list(namespaces)
+            return {"vms": {"vm-1000": {"vm_home": GOLD_POLICY, "disks": {"2000": GOLD_POLICY}},
+                            "vm-1001": {"vm_home": GOLD_POLICY, "disks": {"2000": BRONZE_POLICY}}},
+                    "namespaces": {"ns-a": [GOLD_POLICY, "pol-new"]},
+                    "names": {BRONZE_POLICY: "Bronze"}}
+        engine.storage_policy_check = live
+        eq(engine._filter_storage_compliance(batches), [], "one wrong VM holds the batch back")
+        eq(seen["namespaces"], ["ns-a"])
+        f1001 = json.loads(store.query_discovered(morefs=["vm-1001"])[0]["facts_json"])
+        eq(f1001["storage_policies"]["disks"]["2000"], BRONZE_POLICY, "the live answer is persisted")
+        eq(store.get_meta("vc_storage_policies")["namespaces"]["ns-a"], [GOLD_POLICY, "pol-new"])
+        assert "vm-1001" not in {r["moref"] for r in engine.eligible("import", 1)}, \
+            "the cached gate now agrees with the live answer"
+
+        # A failed read holds back for this run only and never overwrites the cache.
+        engine.storage_policy_check = lambda m, n: {"vms": {"vm-1000": {"error": "503", "status": 503}},
+                                                    "namespaces": {"ns-a": None}, "names": {}}
+        b0 = [b for b in engine.plan("import", wave=1, write_manifests=False)]
+        eq(engine._filter_storage_compliance(b0), [])
+        f1000 = json.loads(store.query_discovered(morefs=["vm-1000"])[0]["facts_json"])
+        eq(f1000["storage_policies"]["vm_home"], GOLD_POLICY)
+        eq(store.get_meta("vc_storage_policies")["namespaces"]["ns-a"], [GOLD_POLICY, "pol-new"])
+        store.close()
+
+
+@test("storage policy vs namespace: discover against a real client records each VM's policies and "
+      "each namespace's, and precheck then holds back a VM on the wrong policy")
+def t_discover_storage_policy_real_client():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from vcfaimport import service
+    from vcfaimport.engine import Engine
+    from vcfaimport.inventory import Nic, VmRecord
+    from vcfaimport.vcenter import VCenterClient, discover
+
+    ns = "migration-testing-ns-kcvm5"
+    server, port = fake_vcenter.serve(count=3)
+    saved = {k: os.environ.get(k) for k in ("FAKE_VC_VM_POLICY", "FAKE_VC_NS_POLICY")}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            cfg = Config()
+            cfg.kubectl, cfg.workdir = "vcfa-test-no-such-kubectl", tmp
+            engine = Engine(cfg, store, None, lambda m: None)
+
+            def run_discover(vm_mode):
+                os.environ["FAKE_VC_VM_POLICY"] = vm_mode
+                client = VCenterClient("http://127.0.0.1:{}".format(port), fake_vcenter.USER,
+                                       fake_vcenter.PASSWORD)
+                client.connect()
+                try:
+                    extras = {}
+                    vms = discover(client, with_tools=True, extras=extras,
+                                   policy_namespaces=store.namespaces())
+                finally:
+                    client.close()
+                store.upsert_discovered(vms)
+                service.record_discovery(store, "fake", extras)
+                return vms
+
+            vms = run_discover("wrong")
+            morefs = sorted(v.moref for v in vms)
+            facts = vms[0].facts
+            eq(facts["storage_policies"]["disks"]["2000"], "pol-bronze-0002")
+            eq(facts["storage_compliance"]["overall"], "COMPLIANT", "compliant -- with the wrong policy")
+            assert "2000" in facts["disk_ids"], facts
+            snap = store.get_meta("vc_storage_policies")
+            eq(snap["namespaces"][ns], ["pol-ds2-0003", "pol-gold-0001"])
+            eq(snap["names"]["pol-bronze-0002"], "Bronze")
+
+            store.sync_inventory([VmRecord(moref=m, vm_name=m, namespace=ns,
+                                           nics=[Nic(4000, "sub-a", "Subnet", "crd.nsx.vmware.com")],
+                                           wave=1) for m in morefs])
+            eq(engine.eligible("precheck", 1), [], "every VM has disk 2000 on Bronze")
+            note = next(h for h in engine.holdbacks if "target namespace offers" in h)
+            assert "'Bronze'" in note and "'DS2-Thick'" in note and "'Gold'" in note, note
+            report = service.storage_policy_report(store)
+            assert report and report[0].startswith("  3 queued VM(s)"), report
+
+            # Fixed in vCenter and re-discovered: they pass.
+            run_discover("")
+            eq(sorted(r["moref"] for r in engine.eligible("precheck", 1)), morefs)
+            eq(service.storage_policy_report(store), [])
+
+            # A namespace vCenter will not describe keeps the last snapshot (never "offers none").
+            os.environ["FAKE_VC_NS_POLICY"] = "forbidden"
+            run_discover("")
+            eq(store.get_meta("vc_storage_policies")["namespaces"][ns], ["pol-ds2-0003", "pol-gold-0001"])
+            store.close()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        server.shutdown()
+
+
+@test("staging moves already-queued VMs: Wave N and the maps' wave push them, Next never does, "
+      "in-batch VMs stay, and the Waves page's drag is no longer the only way (lab, 2026-11-17)")
+def t_stage_moves_queued_vms():
+    from vcfaimport import service, state as vst
+    from vcfaimport.discovery import folder_map_from_rows, stage
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        _seed_store_with_vms(store, 6, waves=(1,), folders=("Prod/Web", "Prod/DB"))
+        store.set_vm_state("vm-1001", vst.S_PRECHECK_PASSED, stage="precheck")
+        store.set_vm_state("vm-1002", vst.S_IMPORTING, stage="import")
+        cfg = Config()
+        cfg.workdir = tmp
+        fmap = folder_map_from_rows([{"folder": "Prod/Web", "namespace": "ns-a", "wave": "2"},
+                                     {"folder": "Prod/DB", "namespace": "ns-a", "wave": ""}])
+
+        def staged(mode, number=None, move=True):
+            rows = store.query_discovered(selected=True)
+            res = stage(rows, cfg, folder_mapping=fmap)
+            choice = service.place_new_vms(store, cfg, rows, res.records, mode, number,
+                                           move_queued=move, mapped_waves=res.mapped_waves)
+            return res, choice
+        waves = lambda: {r["moref"]: r["wave"] for r in store.query_vms()}  # noqa: E731
+
+        # The user's report: dragged on the Waves page, then a different wave picked on Map & Stage.
+        service.move_wave(store, cfg, ["vm-1000"], 3)
+        res, choice = staged("wave", 5)
+        eq(sorted(m["moref"] for m in choice["moves"]), ["vm-1000", "vm-1001", "vm-1003", "vm-1004", "vm-1005"])
+        eq([m["moref"] for m in choice["locked"]], ["vm-1002"], "in a batch: listed, never moved")
+        store.sync_inventory(res.records)
+        done = service.apply_wave_moves(store, cfg, choice)
+        eq(done["moved"], 5)
+        w = waves()
+        eq((w["vm-1000"], w["vm-1001"], w["vm-1002"]), (5, 5, 1))
+        eq(store.get_vm("vm-1001")["state"], vst.S_PRECHECK_PASSED, "a wave is not a state: the pass is kept")
+        assert any("moved from wave 3 to wave 5" in e["message"] for e in store.recent_events()), \
+            "an event per VM, as a drag on the Waves page records"
+        lines = "\n".join(service.wave_choice_lines(choice))
+        assert "5 already queued move to wave 5" in lines and "1 already in a batch keep" in lines, lines
+
+        # "As the maps say": the map entry's wave beats the earlier move (a VM-level wave);
+        # a folder whose entry names no wave keeps the VM where it is.
+        res, choice = staged("maps")
+        eq(sorted((m["moref"], m["to"]) for m in choice["moves"]),
+           [("vm-1000", 2), ("vm-1004", 2)], "Prod/Web says wave 2; Prod/DB names none")
+        store.sync_inventory(res.records)
+        service.apply_wave_moves(store, cfg, choice)
+        w = waves()
+        eq((w["vm-1000"], w["vm-1001"], w["vm-1004"]), (2, 5, 2))
+
+        # Next wave places new VMs only; the box unticked keeps today's behaviour.
+        eq(staged("next")[1]["moves"], [])
+        eq(staged("wave", 7, move=False)[1]["moves"], [])
+        store.close()
+
+
+@test("console: Stage with a wave named moves VMs already queued, and says so; unticked it does not")
+def t_web_stage_moves_queued():
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            store = c.app.store
+            _seed_store_with_vms(store, 3, waves=(1,), folders=("Prod/Web",))
+            body = {"folder_rows": [{"folder": "Prod/Web", "namespace": "ns-a", "wave": ""}],
+                    "network_rows": [{"portgroup": "VLAN1", "subnet": "sub-a", "namespace": ""}],
+                    "wave_mode": "wave", "wave": 4}
+            p = c.ok("POST", "/api/stage/preview", dict(body, move_queued=False))
+            eq({r["wave"] for r in p["records"]}, {1})
+            p = c.ok("POST", "/api/stage/preview", body)
+            eq({(r["wave"], r["wave_from"]) for r in p["records"]}, {(4, 1)}, "preview: where each lands, and from")
+            assert any("3 already queued move to wave 4" in x for x in p["wave_notes"]), p["wave_notes"]
+            r = c.ok("POST", "/api/stage", body)
+            eq(r["wave_moves"]["moved"], 3)
+            eq(store.waves(), [4])
+        finally:
+            c.close()
 
 
 @test("web console: password sign-in -- sessions, throttle, expiry, disable, logout, password changes")
@@ -6842,8 +7122,14 @@ def t_web_stage_next_wave():
             p = c.ok("POST", "/api/stage/preview", dict(body, wave_mode="maps"))
             eq({r["wave"] for r in p["records"]}, {2})
             eq(c.call("POST", "/api/stage/preview", dict(body, wave_mode="wave"))[0], 400, "Wave… needs a number")
-            eq({r["wave"] for r in c.ok("POST", "/api/stage/preview", dict(body, wave_mode="wave", wave=9))["records"]}, {4},
-               "a queued VM keeps its wave even when a wave is named")
+            # Naming a wave moves a queued VM there too (lab, 2026-11-17) -- unless asked not to.
+            p9 = c.ok("POST", "/api/stage/preview", dict(body, wave_mode="wave", wave=9))
+            eq({r["wave"] for r in p9["records"]}, {9})
+            eq([(m["moref"], m["from"], m["to"]) for m in p9["wave_choice"]["moves"]], [("vm-106", 4, 9), ("vm-107", 4, 9), ("vm-108", 4, 9)],
+               "every selected queued VM, the earlier selection included")
+            eq({r["wave"] for r in c.ok("POST", "/api/stage/preview", dict(
+                body, wave_mode="wave", wave=9, move_queued=False))["records"]}, {4},
+               "with the box unticked a queued VM keeps its wave")
         finally:
             c.close()
 
@@ -7162,6 +7448,9 @@ UNIT = [
     t_schedule_rules, t_settings_overlay, t_tag_map_stage, t_apps_together, t_readiness_exclusion,
     t_engine_storage_compliance_gate, t_engine_storage_compliance_live_filter,
     t_engine_storage_compliance_live_filter_real_client,
+    t_stage_moves_queued_vms, t_web_stage_moves_queued,
+    t_vcenter_storage_policy_problems, t_engine_storage_policy_gate,
+    t_engine_storage_policy_live_filter, t_discover_storage_policy_real_client,
     t_web_roles_settings,
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,
     t_precheck_no_commit,

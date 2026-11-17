@@ -833,6 +833,7 @@ VIEWS.stage = view({
       if (S.view === v) v.render();
     },
     defWave(t, e, v) { v.defaults.wave = t.value; schedulePreview(v); },
+    moveQueued(t, e, v) { v.defaults.moveQueued = t.checked; schedulePreview(v); },
     page(t, e, v) { v.recPage = +t.dataset.page; mount($('#stage-preview'), stagePreview(v)); },
     async saveMaps(t, e, v) {
       const m = await PUT('/api/maps', { folder_rows: v.fr, network_rows: v.nr, tag_rows: v.tr });
@@ -845,9 +846,11 @@ VIEWS.stage = view({
       await runPreview(v);
       const p = v.preview;
       const already = p.records.filter((r) => r.queue_state).length, locked = p.records.filter((r) => r.locked).length;
+      const moving = p.records.filter((r) => r.wave_from != null).length;
       const ok = await modal({
         title: 'Stage ' + plural(p.records.length, 'VM') + ' into the import queue?', ic: 'stage', confirm: 'Stage',
         body: html`<p>${n(p.records.length - already)} new · ${n(already - locked)} already queued and updated · ${n(locked)} in flight or done and left untouched.</p>
+          ${moving ? html`<div class="note info">${plural(moving, 'VM')} already queued will change wave, as the Wave column under Result shows (from → to).</div>` : ''}
           ${p.problems.length ? html`<div class="note warn">${plural(p.problems.length, 'VM')} cannot be placed and will be left out (see the list under Result).</div>` : ''}
           ${(p.ns_conflicts || []).length ? html`<div class="note warn mt-s">${plural(p.ns_conflicts.length, 'VM')} have conflicting namespace entries; each goes to the first one (see Result).</div>` : ''}
           <p class="small muted">The maps are saved at the same time. Nothing is sent to the cluster.</p>`,
@@ -857,7 +860,8 @@ VIEWS.stage = view({
       v.saved = mapsSig(v);
       await modal({
         title: 'Staged ' + plural(r.staged, 'VM'), ic: 'check', confirm: 'Arrange waves', cancel: 'Stay here',
-        body: html`<div class="kpis">${kpi('Added', r.added, '')}${kpi('Updated', r.updated, '')}${kpi('Unchanged', r.unchanged, '')}${kpi('Locked', r.locked, 'in flight or done')}</div>
+        body: html`<div class="kpis">${kpi('Added', r.added, '')}${kpi('Updated', r.updated, '')}${kpi('Unchanged', r.unchanged, '')}${kpi('Locked', r.locked, 'in flight or done')}${(r.wave_moves || {}).moved ? kpi('Changed wave', r.wave_moves.moved, 'already queued') : ''}</div>
+          ${((r.wave_moves || {}).refused || []).length ? html`<div class="note warn mt"><ul class="plain">${r.wave_moves.refused.slice(0, 10).map((c) => html`<li>${c}</li>`)}</ul></div>` : ''}
           ${r.conflicts.length ? html`<div class="note warn mt"><ul class="plain">${r.conflicts.slice(0, 10).map((c) => html`<li>${c}</li>`)}</ul></div>` : ''}
           ${(r.app_moves || []).length ? html`<div class="note info mt"><b>Applications kept together:</b><ul class="plain">${r.app_moves.slice(0, 10).map((c) => html`<li>${c}</li>`)}</ul></div>` : ''}`,
       }).then((go2) => { if (go2) go('waves'); else v.refresh(); });
@@ -881,7 +885,8 @@ function markField(input, kind) {
 const markNs = (input) => markField(input, 'namespace');
 function stageBody(v) {
   return { folder_rows: v.fr, network_rows: v.nr, tag_rows: v.tr, default_namespace: v.defaults.ns,
-    wave_mode: v.defaults.waveMode || 'auto', wave: v.defaults.waveMode === 'wave' ? parseInt(v.defaults.wave, 10) || null : null };
+    wave_mode: v.defaults.waveMode || 'auto', wave: v.defaults.waveMode === 'wave' ? parseInt(v.defaults.wave, 10) || null : null,
+    move_queued: v.defaults.moveQueued !== false };
 }
 // Where VMs new to the queue go. Until the user picks, the server decides ("auto"):
 // the maps on a campaign's first staging, the next wave after that.
@@ -893,7 +898,8 @@ function waveChoiceControl(v) {
       <option value="next" ${attr(mode === 'next', 'selected')}>Next wave (${wc.next_wave})</option>
       <option value="maps" ${attr(mode === 'maps', 'selected')}>As the maps say</option>
       <option value="wave" ${attr(mode === 'wave', 'selected')}>Wave…</option></select>
-    ${mode === 'wave' ? html`<input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px">` : ''}</label>`;
+    ${mode === 'wave' ? html`<input class="input sm" id="def-wave" type="number" min="1" data-input="defWave" value="${v.defaults.wave}" style="width:64px">` : ''}</label>
+    ${mode === 'wave' || mode === 'maps' ? html`<label class="check small" style="margin-left:10px"><input type="checkbox" id="stage-move-queued" data-change="moveQueued" ${attr(v.defaults.moveQueued !== false, 'checked')}> Also move VMs already queued ${tip('stage_move_queued')}</label>` : ''}`;
 }
 const mapsSig = (v) => JSON.stringify([v.fr, v.nr, v.tr]);
 const rowsOf = (v, m) => (m === 'f' ? v.fr : m === 't' ? v.tr : v.nr);
@@ -970,16 +976,19 @@ function waveDest(w, title) { return html`<span class="wave-dest" title="${title
 function mapWave(wave, wc) {
   if (mapsDecideWaves(wc)) return wave ? html` ${waveDest(wave, 'The wave this map entry gives')}` : '';
   return html` ${waveDest(wc.wave, (wc.mode === 'next' ? 'The next wave' : 'The wave chosen under Wave for new VMs') +
-    (wave ? ' (the map says wave ' + wave + '; choose “As the maps say” to use it)' : '') + '. VMs already queued keep their wave.')}`;
+    (wave ? ' (the map says wave ' + wave + '; choose “As the maps say” to use it)' : '') +
+    (wc.mode === 'wave' && wc.move_queued ? '. VMs already queued move there too.' : '. VMs already queued keep their wave.'))}`;
 }
 // "3 new VMs ready to stage → Wave 6", said where the Stage button is. Only VMs new to the queue
 // are placed; the ones already queued keep their wave, so they are counted, not sent anywhere.
 function stageCountTitle(p) {
   const fresh = p.records.filter((r) => !r.queue_state), queued = p.records.length - fresh.length;
-  if (!fresh.length) return html`${plural(p.records.length, 'VM')} ready to stage <span class="small muted">· all already queued, nothing new</span>`;
+  const moving = p.records.filter((r) => r.wave_from != null).length;
+  const moveNote = moving ? html` <span class="small">· ${plural(moving, 'queued VM')} change wave</span>` : '';
+  if (!fresh.length) return html`${plural(p.records.length, 'VM')} ready to stage <span class="small muted">· all already queued${moving ? '' : ', nothing new'}</span>${moveNote}`;
   const waves = uniq(fresh.map((r) => r.wave)).sort((a, b) => a - b);
   const where = waves.length === 1 ? waveDest(waves[0]) : html`<span class="wave-dest">→ waves ${waves.join(', ')}</span>`;
-  return html`${plural(fresh.length, 'new VM')} ready to stage ${where}${queued ? html` <span class="small muted">· ${n(queued)} already queued keep their wave</span>` : ''}`;
+  return html`${plural(fresh.length, 'new VM')} ready to stage ${where}${moveNote}${queued - moving ? html` <span class="small muted">· ${n(queued - moving)} already queued keep their wave</span>` : ''}`;
 }
 function covFolders(cov, wc) {
   if (!cov.folders.length) return html`<span class="small muted">—</span>`;
@@ -1029,7 +1038,7 @@ function stagePreview(v) {
   </div>
   ${p.records.length ? html`<div class="table-wrap" style="border-top:1px solid var(--line)"><table class="t compact"><thead><tr><th>VM</th><th>Folder</th><th>App</th><th>Namespace</th><th>Wave</th><th>Subnets</th><th>Notes</th><th>Queue</th></tr></thead><tbody>
     ${recs.map((r) => html`<tr><td><span class="vm-name">${r.vm_name}<small>${r.moref}</small></span></td><td class="small">${r.folder || '/'}</td><td>${appTag(r.app)}</td><td class="mono small ${nsKnown(r.namespace) === false ? 'warn-text' : ''}"${nsKnown(r.namespace) === false ? raw(' title="' + esc(nsMissingText()) + '"') : ''}>${r.namespace}</td>
-      <td class="num">${r.wave}</td><td class="mono small">${r.subnets.join(', ') || html`<span class="warn-text">none</span>`}</td><td class="small muted">${r.notes}</td>
+      <td class="num">${r.wave_from != null ? html`<span class="faint" title="Moves from wave ${r.wave_from} when you stage">${r.wave_from} →</span> <b>${r.wave}</b>` : r.wave}</td><td class="mono small">${r.subnets.join(', ') || html`<span class="warn-text">none</span>`}</td><td class="small muted">${r.notes}</td>
       <td>${r.queue_state ? html`${pill(r.queue_state)}${r.locked ? html` <span class="tag" title="In flight or done: staging will not change it">locked</span>` : ''}` : html`<span class="tag info">new</span>`}</td></tr>`)}</tbody></table></div>
     ${pager(p.records.length, v.recPage, 50)}` : ''}`;
 }

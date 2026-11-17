@@ -55,6 +55,21 @@ STORAGE_COMPLIANCE_CAUSE = {
     "UNKNOWN_COMPLIANCE": "SPBM could not reach the storage provider",
 }
 
+# Storage policies (GET /vcenter/storage/policies), which ones each namespace
+# offers (storage_specs of GET /vcenter/namespaces/instances/{ns}), and which one
+# each VM's home and disks use (GET /vcenter/vm/{vm}/storage/policy). By default
+# every VM uses Gold everywhere, which every namespace offers, so tests that do
+# not care about this feature are unaffected. FAKE_VC_VM_POLICY overrides every
+# VM: "wrong" (disk 2000 on Bronze, which no namespace offers), "nodisk" (disk
+# 2000 has no policy: left out of the map, as vCenter does), "none" (no policy
+# at all), "forbidden" (403). FAKE_VC_NS_POLICY: "forbidden" (403 on the
+# namespace instance), "nostorage" (no storage_specs).
+STORAGE_POLICIES = {"pol-gold-0001": "Gold", "pol-ds2-0003": "DS2-Thick", "pol-bronze-0002": "Bronze"}
+NAMESPACE_STORAGE = {
+    "migration-testing-ns-kcvm5": ["pol-gold-0001", "pol-ds2-0003"],
+    "testing-vpc-k826r": ["pol-gold-0001"],
+}
+
 CLUSTERS = ["PROD-CL01", "PROD-CL02", "DMZ-CL01"]
 # A realistic nested VM-folder tree. Keys are folder ids, values are
 # (parent id, display name). "group-v1" is the datacenter's hidden root.
@@ -192,6 +207,26 @@ class Handler(BaseHTTPRequestHandler):
             "disks": {"2000": dict(disk_info)},
         })
 
+    def _vm_policy_response(self, moref: str) -> None:
+        vm = Handler.inventory["vms"].get(moref)
+        if not vm:
+            self._send(404, {"error": "no such vm"})
+            return
+        mode = os.environ.get("FAKE_VC_VM_POLICY", "")
+        if mode == "forbidden":
+            self._send(403, {"error_type": "UNAUTHORIZED",
+                             "messages": [{"default_message": "StorageProfile.View is required"}]})
+            return
+        if mode == "none":
+            self._send(200, {"disks": {}})
+            return
+        disks = {key: "pol-gold-0001" for key in vm["_detail"].get("disks", {})}
+        if mode == "wrong":
+            disks["2000"] = "pol-bronze-0002"
+        if mode == "nodisk":
+            disks.pop("2000", None)
+        self._send(200, {"vm_home": "pol-gold-0001", "disks": disks})
+
     def do_POST(self) -> None:  # noqa: N802
         if self.path.startswith("/api/cis/tagging/tag-association"):
             if not self._authed():
@@ -290,6 +325,34 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/vcenter/vm/") and path.endswith("/storage/policy/compliance"):
             self._storage_compliance_response(path.split("/")[4])
+            return
+
+        if path.startswith("/api/vcenter/vm/") and path.endswith("/storage/policy"):
+            self._vm_policy_response(path.split("/")[4])
+            return
+
+        if path == "/api/vcenter/storage/policies":
+            self._send(200, [{"policy": pid, "name": name, "description": ""}
+                             for pid, name in STORAGE_POLICIES.items()])
+            return
+
+        if path.startswith("/api/vcenter/namespaces/instances/"):
+            namespace = urllib.parse.unquote(path.split("/")[5])
+            mode = os.environ.get("FAKE_VC_NS_POLICY", "")
+            if mode == "forbidden":
+                self._send(403, {"error_type": "UNAUTHORIZED",
+                                 "messages": [{"default_message": "System.Read is required"}]})
+                return
+            known = {n["namespace"]: n for n in NAMESPACE_INSTANCES}
+            if namespace not in known:
+                self._send(404, {"error": "no such namespace"})
+                return
+            info = {"cluster": known[namespace]["cluster"], "config_status": "RUNNING",
+                    "description": known[namespace]["description"]}
+            if mode != "nostorage":
+                info["storage_specs"] = [{"policy": pid, "limit": 262144}
+                                         for pid in NAMESPACE_STORAGE.get(namespace, [])]
+            self._send(200, info)
             return
 
         if path.startswith("/api/vcenter/vm/"):

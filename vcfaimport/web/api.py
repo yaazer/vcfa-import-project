@@ -50,7 +50,7 @@ from ..discovery import (
 from ..engine import STAGE_IMPORT, STAGE_PRECHECK, Engine
 from ..kube import Kubectl
 from ..vcenter import (ENV_PASSWORD, ENV_SERVER, ENV_USER, VCenterClient, VCenterError, discover,
-                       storage_compliance_checker, storage_compliance_ok)
+                       storage_compliance_checker, storage_compliance_ok, storage_policy_checker)
 from .jobs import FAILED, STOPPED, WARNING, Job, JobManager
 
 
@@ -421,13 +421,16 @@ class WebApp:
         default_wave = _int(body.get("default_wave"), default=1, minimum=1)
         wave_mode = str(body.get("wave_mode") or "auto")
         wave_no = _int(body.get("wave"), minimum=1)
+        # On by default (the console's checkbox): the wave chosen here moves VMs already queued too.
+        move_queued = body.get("move_queued") is not False
         with self.lock:
             selected = self.store.query_discovered(selected=True)
             result = stage(selected, self.cfg, mapping=network_mapping,
                            folder_mapping=folder_mapping, default_namespace=default_ns,
                            default_wave=default_wave, tag_mapping=tag_mapping)
             result.wave_choice = service.place_new_vms(self.store, self.cfg, selected, result.records,
-                                                       wave_mode, wave_no)
+                                                       wave_mode, wave_no, move_queued=move_queued,
+                                                       mapped_waves=result.mapped_waves)
             stale = service.stale_map_entries(self.store, folder_mapping, tag_mapping)
         coverage = service.mapping_coverage(selected, folder_mapping, network_mapping)
         coverage["tags"] = self._tag_coverage(selected, tag_mapping)
@@ -443,13 +446,17 @@ class WebApp:
         by_wave: Dict[int, int] = {}
         by_ns: Dict[str, int] = {}
         records = []
+        # A queued VM staging will move shows where it lands, and where it comes from.
+        moving = {m["moref"]: m["to"] for m in result.wave_choice.get("moves") or []}
         for rec in result.records:
-            by_wave[rec.wave] = by_wave.get(rec.wave, 0) + 1
+            wave = moving.get(rec.moref, rec.wave)
+            by_wave[wave] = by_wave.get(wave, 0) + 1
             by_ns[rec.namespace] = by_ns.get(rec.namespace, 0) + 1
             state = queued.get(rec.moref)
             records.append({
                 "moref": rec.moref, "vm_name": rec.vm_name, "namespace": rec.namespace,
-                "wave": rec.wave, "group": rec.group, "folder": folder_of.get(rec.moref, ""),
+                "wave": wave, "wave_from": rec.wave if rec.moref in moving else None,
+                "group": rec.group, "folder": folder_of.get(rec.moref, ""),
                 "subnets": [n.subnet for n in rec.nics if n.subnet], "notes": rec.notes,
                 "queue_state": state, "app": rec.app,
                 "locked": state is not None and state not in (
@@ -482,6 +489,7 @@ class WebApp:
         with self.lock:
             summary = self.store.sync_inventory(result.records)
             wc = result.wave_choice
+            moved = service.apply_wave_moves(self.store, self.cfg, wc)
             self.store.log_event("staged {} VM(s) from the web console ({} added, {} updated); {}"
                                  .format(len(result.records), summary["added"], summary["updated"],
                                          "waves as the maps say" if wc["mode"] == "maps" else
@@ -491,6 +499,7 @@ class WebApp:
         summary["app_moves"] = result.app_moves
         summary["ns_conflicts"] = result.ns_conflicts
         summary["wave_choice"] = result.wave_choice
+        summary["wave_moves"] = moved
         return summary
 
     # =============================================================== queue
@@ -856,8 +865,11 @@ class WebApp:
             try:
                 client.connect()
                 extras: Dict[str, Any] = {}
+                with self._job_workspace(job) as ws:
+                    queued_namespaces = ws.store.namespaces()
                 vms = discover(client, progress=lambda d, t: job.set_progress(
-                    d, t, "VM details read"), log=job.log, extras=extras, **opts)
+                    d, t, "VM details read"), log=job.log, extras=extras,
+                    policy_namespaces=queued_namespaces, **opts)
                 with self._job_workspace(job) as ws:
                     summary = ws.store.upsert_discovered(vms)
                     # before meta "vcenter" moves to this server: it tells which vCenter the cache came from
@@ -869,6 +881,8 @@ class WebApp:
                     ws.store.set_meta("discovered_at", _local_now())
                     counts = ws.store.discovered_counts()
                     kept_namespaces = ws.store.get_meta("vc_namespaces")
+                    policy_lines = (service.storage_policy_report(ws.store)
+                                    if opts["with_storage_compliance"] else [])
             finally:
                 client.close()
             # A fresh vc_namespaces/vc_networks snapshot just landed: drop the
@@ -894,6 +908,8 @@ class WebApp:
                     job.log("  {} VM(s) not known COMPLIANT/NOT_APPLICABLE on storage policy -- held "
                             "back from precheck and import until fixed (storage_compliance_enforce); "
                             "see Readiness".format(noncompliant))
+                for line in policy_lines:
+                    job.log(line)
             if opts["with_namespaces"]:
                 ns = extras.get("namespaces")
                 if ns is not None:
@@ -985,6 +1001,7 @@ class WebApp:
                     vc_client = self._vcenter_client(job.log)
                     if vc_client is not None:
                         ws.engine.storage_compliance_check = storage_compliance_checker(vc_client)
+                        ws.engine.storage_policy_check = storage_policy_checker(vc_client)
                         job.log("vCenter connected for a live storage-policy recheck at each "
                                 "wave's submission")
                     else:

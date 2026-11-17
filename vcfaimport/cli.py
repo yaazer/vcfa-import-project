@@ -35,7 +35,7 @@ from . import report
 from . import service
 from . import state as st
 from .vcenter import (VCenterClient, VCenterError, discover, resolve_credentials,
-                      storage_compliance_checker)
+                      storage_compliance_checker, storage_policy_checker)
 
 
 def log(msg: str = "") -> None:
@@ -261,6 +261,7 @@ def cmd_discover(args) -> int:
             with_namespaces=not args.no_namespaces,
             with_subnets=not args.no_subnets,
             with_storage_compliance=not args.no_storage_compliance,
+            policy_namespaces=store.namespaces(),
             concurrency=args.concurrency,
             progress=progress,
             log=log,
@@ -299,6 +300,8 @@ def cmd_discover(args) -> int:
             log("  {} VM(s) not known COMPLIANT/NOT_APPLICABLE on storage policy -- held back from "
                 "precheck and import until fixed (storage_compliance_enforce); see `readiness`"
                 .format(noncompliant))
+        for line in service.storage_policy_report(store):
+            log(line)
     if not args.no_namespaces:
         ns = extras.get("namespaces")
         if ns is not None:
@@ -506,7 +509,9 @@ def cmd_stage(args) -> int:
     choice_arg = str(args.stage_wave or "auto").strip().lower()
     mode, number = (("wave", int(choice_arg)) if choice_arg.isdigit() else (choice_arg, None))
     try:
-        choice = service.place_new_vms(store, cfg, rows, result.records, mode, number)
+        choice = service.place_new_vms(store, cfg, rows, result.records, mode, number,
+                                       move_queued=not args.keep_queued_waves,
+                                       mapped_waves=result.mapped_waves)
     except SelectionError as exc:
         log(str(exc))
         return 2
@@ -557,11 +562,18 @@ def cmd_stage(args) -> int:
         return 0
 
     summary = store.sync_inventory(result.records)
+    moved = service.apply_wave_moves(store, cfg, choice)
     log("staged {} VM(s) into the import queue".format(len(result.records)))
     log("  added {} | updated {} | unchanged {} | locked (in flight) {}".format(
         summary["added"], summary["updated"], summary["unchanged"], summary["locked"]))
     for line in service.wave_choice_lines(choice):
         log(line)
+    if moved["moved"] or moved["refused"]:
+        log("  moved {} already-queued VM(s){}".format(
+            moved["moved"], " (+{} pulled along with their app)".format(moved["pulled_with_app"])
+            if moved["pulled_with_app"] else ""))
+    for note in moved["refused"][:10]:
+        log("  ! " + note)
     for conflict in summary["conflicts"][:10]:
         log("  ! " + conflict)
     log("")
@@ -737,6 +749,7 @@ def _execute(args, stage: str) -> int:
                                       insecure=getattr(args, "insecure", False), log=log)
             vc_client.connect()
             engine.storage_compliance_check = storage_compliance_checker(vc_client)
+            engine.storage_policy_check = storage_policy_checker(vc_client)
             log("  vCenter connected for a live storage-policy recheck at each wave's submission")
         except VCenterError as exc:
             vc_client = None
@@ -1724,6 +1737,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="folder -> namespace[,wave][,group] mapping CSV; most specific folder wins")
     sp.add_argument("--tag-map", help="vCenter tag -> namespace[,wave][,group] mapping CSV")
     sp.add_argument("--default-namespace", help="namespace for VMs no map covers")
+    sp.add_argument("--keep-queued-waves", action="store_true",
+                    help="leave VMs already in the queue in their wave (by default --wave N, or "
+                         "--wave maps with a map entry naming a wave, moves them too)")
     sp.add_argument("--wave", dest="stage_wave", default="auto", metavar="next|maps|N",
                     help="where VMs new to the queue go: next (one past the highest wave), maps (the "
                          "maps' wave, as before), or a wave number. Default: maps for the first "

@@ -576,6 +576,81 @@ class VCenterClient:
             "vm_home_cause": _compliance_cause(vm_home),
         }
 
+    def vm_storage_policies(self, moref: str) -> Optional[Dict[str, Any]]:
+        """Which storage policy the VM's home directory and each virtual disk is
+        associated with -- what the compliance check above cannot tell: a disk can
+        be perfectly COMPLIANT with a policy its target namespace does not offer.
+
+        None only when this vCenter cannot be asked at all (pre-7.0 /rest-only
+        session). {"error": <message>, "status": <http status or None>} when the
+        call failed -- never read as "no policy", only as "not asked successfully".
+        Otherwise {"vm_home": <policy id or "">, "disks": {disk_key: policy id}}.
+        A disk with no policy is *absent* from `disks` (it is not listed with an
+        empty value), so callers compare against the VM's own disk list
+        (facts["disk_ids"]) to spot one.
+
+        Response shape (Vcenter.Vm.Storage.Policy.Info: `vm_home` a policy id
+        string, `disks` a map of disk key -> policy id string, unpolicied disks
+        omitted) per the vmware.vmware_rest vcenter_vm_storage_policy_info
+        documentation -- not against a live vCenter. The Spec-shaped
+        {"type": ..., "policy": ...} form is tolerated too."""
+        if self._prefix != "/api":
+            return None
+        try:
+            data = self.get("/vcenter/vm/{}/storage/policy".format(urllib.parse.quote(moref)))
+        except VCenterError as exc:
+            return {"error": str(exc)[:200], "status": exc.status}
+
+        def policy_of(value: Any) -> str:
+            if isinstance(value, dict):
+                value = value.get("policy")
+            return str(value) if value else ""
+        data = data if isinstance(data, dict) else {}
+        raw = data.get("disks") if isinstance(data.get("disks"), dict) else {}
+        disks = {str(k): policy_of(v) for k, v in raw.items() if policy_of(v)}
+        return {"vm_home": policy_of(data.get("vm_home")), "disks": disks}
+
+    def namespace_storage_policies(self, namespace: str) -> Optional[List[str]]:
+        """Storage policy ids a Supervisor namespace offers (its storage_specs).
+
+        None when it could not be asked (older vCenter, no privilege, the
+        namespace is unknown to vCenter, or no answer): never read as "it offers
+        none". An empty list is a real answer -- no storage assigned -- and blocks
+        every VM targeting that namespace.
+
+        Response shape (Vcenter.Namespaces.Instances.Info.storage_specs, a list of
+        {policy, limit}) per govmomi's vapi/namespace NamespacesInstanceInfo /
+        StorageSpec -- not against a live vCenter."""
+        if self._prefix != "/api":
+            return None
+        try:
+            data = self.get("/vcenter/namespaces/instances/{}".format(
+                urllib.parse.quote(namespace, safe="")))
+        except VCenterError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        specs = data.get("storage_specs")
+        if specs is None:
+            return []
+        if not isinstance(specs, list):
+            return None
+        return sorted({str(s["policy"]) for s in specs if isinstance(s, dict) and s.get("policy")})
+
+    def storage_policy_names(self) -> Dict[str, str]:
+        """{policy id: display name}, for messages only. {} when it could not be
+        asked: ids are then shown as they are, nothing is decided on names."""
+        if self._prefix != "/api":
+            return {}
+        try:
+            items = self.get("/vcenter/storage/policies")
+        except VCenterError:
+            return {}
+        if not isinstance(items, list):
+            return {}
+        return {str(i["policy"]): str(i.get("name") or i["policy"])
+                for i in items if isinstance(i, dict) and i.get("policy")}
+
 
 # Pass set for Vcenter.Vm.Storage.Policy.Compliance.Info.overall_compliance,
 # plus the two sentinels vm_storage_compliance adds of its own ("NO_POLICY"
@@ -584,7 +659,9 @@ class VCenterClient:
 # own words, 2026-11-16) means a status that is not a known-good answer blocks
 # the same as a known-bad one. OUT_OF_DATE is the state the 2026-11-13 incident
 # suspects caused its stuck rollback (a policy edited mid-import, not applied).
-STORAGE_COMPLIANCE_PASS = {"COMPLIANT", "NOT_APPLICABLE", "NO_POLICY"}
+# NO_POLICY is not a pass either (2026-11-17): a VM with no storage policy cannot
+# be on one its target namespace offers, so it blocks like a wrong one.
+STORAGE_COMPLIANCE_PASS = {"COMPLIANT", "NOT_APPLICABLE"}
 
 
 def storage_compliance_ok(result: Optional[Dict[str, Any]]) -> bool:
@@ -603,7 +680,7 @@ def storage_compliance_reason(result: Optional[Dict[str, Any]]) -> str:
         return "vCenter's storage/policy/compliance call failed (HTTP {}): {}".format(
             result.get("status"), result.get("error") or "no detail")
     if overall == "NO_POLICY":
-        return "no storage policy associated (nothing to be non-compliant with)"
+        return "no storage policy associated (assign one the target namespace offers)"
     causes = [result.get("vm_home_cause")] + [d.get("failure_cause") for d in (result.get("disks") or {}).values()]
     detail = "; ".join(c for c in causes if c)
     return "overall_compliance={}{}".format(overall, " ({})".format(detail) if detail else "")
@@ -625,6 +702,70 @@ def storage_compliance_checker(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(lambda m: client.vm_storage_compliance(m, live=True), unique))
         return dict(zip(unique, results))
+    return check
+
+
+def storage_policy_problems(attached: Optional[Dict[str, Any]], disk_ids: Sequence[str],
+                            namespace: str, allowed: Optional[Sequence[str]],
+                            names: Optional[Dict[str, str]] = None) -> List[str]:
+    """Why a VM's storage policies do not fit its target namespace; [] when they do.
+
+    `attached` is a vm_storage_policies() result, `disk_ids` the VM's own disk
+    keys (a disk with no policy is missing from `attached`), `allowed` the policy
+    ids `namespace` offers (namespace_storage_policies). Fails closed: never
+    read, a failed read, an unknown namespace, a home or disk with no policy, and
+    a policy the namespace does not offer all come back as a problem."""
+    names = names or {}
+
+    def label(pid: str) -> str:
+        return "'{}'".format(names[pid]) if names.get(pid) else pid
+    if attached is None:
+        return ["its storage policies were never read (an older discover, or one run "
+                "with --no-storage-compliance)"]
+    if attached.get("error"):
+        return ["vCenter's VM storage-policy call failed (HTTP {}): {}".format(
+            attached.get("status"), attached.get("error"))]
+    if not namespace:
+        return ["it has no target namespace"]
+    if allowed is None:
+        return ["the storage policies namespace {} offers are unknown (vCenter did not list "
+                "them at the last discover)".format(namespace)]
+    allowed_set = set(allowed)
+    problems: List[str] = []
+    home = attached.get("vm_home") or ""
+    if not home:
+        problems.append("VM home has no storage policy")
+    elif home not in allowed_set:
+        problems.append("VM home uses {}".format(label(home)))
+    disks = attached.get("disks") or {}
+    for disk in sorted(set(str(d) for d in (disk_ids or [])) | set(disks)):
+        pid = disks.get(disk) or ""
+        if not pid:
+            problems.append("disk {} has no storage policy".format(disk))
+        elif pid not in allowed_set:
+            problems.append("disk {} uses {}".format(disk, label(pid)))
+    if problems:
+        offers = ", ".join(sorted(label(p) for p in allowed_set)) or "none"
+        problems.append("namespace {} offers: {}".format(namespace, offers))
+    return problems
+
+
+def storage_policy_checker(
+    client: "VCenterClient", concurrency: int = 12
+) -> Callable[[Sequence[str], Sequence[str]], Dict[str, Any]]:
+    """(morefs, namespaces) -> live {"vms": {moref: vm_storage_policies()},
+    "namespaces": {ns: namespace_storage_policies()}, "names": {id: name}},
+    bound to one connected client -- the policy half of engine.py's pre-apply
+    recheck, built by the CLI/web layer like storage_compliance_checker."""
+    def check(morefs: Sequence[str], namespaces: Sequence[str]) -> Dict[str, Any]:
+        unique = list(dict.fromkeys(morefs))
+        spaces = sorted(set(n for n in namespaces if n))
+        workers = max(1, min(int(concurrency), 32))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            vms = list(pool.map(client.vm_storage_policies, unique))
+            allowed = list(pool.map(client.namespace_storage_policies, spaces))
+        return {"vms": dict(zip(unique, vms)), "namespaces": dict(zip(spaces, allowed)),
+                "names": client.storage_policy_names()}
     return check
 
 
@@ -677,7 +818,16 @@ def _facts(detail: Dict[str, Any]) -> Dict[str, Any]:
             return [i.get("value", i) for i in raw if isinstance(i, dict)]
         return []
     cdroms = entries("cdroms")
+    raw_disks = (detail or {}).get("disks")
+    if isinstance(raw_disks, dict):
+        disk_ids = [str(k) for k in raw_disks]
+    elif isinstance(raw_disks, list):
+        disk_ids = [str(i["key"]) for i in raw_disks if isinstance(i, dict) and "key" in i]
+    else:
+        disk_ids = []
     return {
+        # every disk key, so a disk missing from vm_storage_policies (no policy) shows
+        "disk_ids": disk_ids,
         "hw_version": ((detail or {}).get("hardware") or {}).get("version", ""),
         "disk_backings": [((d.get("backing") or {}).get("type") or "") for d in entries("disks")],
         "iso_connected": any((c.get("backing") or {}).get("type") == "ISO_FILE"
@@ -696,6 +846,7 @@ def discover(
     with_namespaces: bool = True,
     with_subnets: bool = True,
     with_storage_compliance: bool = True,
+    policy_namespaces: Sequence[str] = (),
     concurrency: int = 12,
     progress: Optional[Callable[[int, int], None]] = None,
     log: Optional[Callable[[str], None]] = None,
@@ -748,6 +899,27 @@ def discover(
                     else:
                         say("  vCenter could not be asked for any namespace's subnet list")
 
+    if extras is not None and with_storage_compliance:
+        # Which storage policies each namespace offers: the namespaces vCenter
+        # listed plus any the queue already targets (`policy_namespaces`), so a
+        # login that cannot list namespaces still learns about the ones in use.
+        # Uncapped, unlike subnets: a namespace left out here would block its VMs.
+        listed = [n["namespace"] for n in (extras.get("namespaces") or []) if n.get("namespace")]
+        names = sorted(set(listed) | set(n for n in policy_namespaces if n))
+        if names:
+            workers = max(1, min(int(concurrency), 32))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                per_ns = list(pool.map(client.namespace_storage_policies, names))
+            answered = {ns: found for ns, found in zip(names, per_ns) if found is not None}
+            # None = not one namespace could be asked: keep the last snapshot.
+            extras["storage_policies"] = ({"namespaces": answered,
+                                           "names": client.storage_policy_names()}
+                                          if answered else None)
+            if answered:
+                say("  storage policies read for {} of {} namespace(s)".format(len(answered), len(names)))
+            else:
+                say("  vCenter could not be asked which storage policies any namespace offers")
+
     folder_of: Dict[str, str] = {}
     dc_of: Dict[str, str] = {}
     cluster_of: Dict[str, str] = {}
@@ -798,6 +970,7 @@ def discover(
             # is only ever a precheck/import-time gate's starting point -- the
             # gate itself re-checks live right before it matters (see engine.py).
             vm.facts["storage_compliance"] = client.vm_storage_compliance(moref)
+            vm.facts["storage_policies"] = client.vm_storage_policies(moref)
         if with_tools:
             vm.tools_status = client.vm_tools(moref)
             if "running" in vm.tools_status.lower() and "not" not in vm.tools_status.lower():

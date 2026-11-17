@@ -413,6 +413,10 @@ class StageResult:
     ns_conflicts: List[Dict[str, Any]] = field(default_factory=list)
     # Where VMs entering the queue were placed (service.place_new_vms), once decided.
     wave_choice: Dict[str, Any] = field(default_factory=dict)
+    # moref -> the wave a folder/tag/network map entry names for it (only where one
+    # does), before a wave set on the VM and the default are considered. Lets
+    # place_new_vms move an already-queued VM to the wave its map entry now gives.
+    mapped_waves: Dict[str, int] = field(default_factory=dict)
 
 
 def stage(
@@ -545,6 +549,8 @@ def stage(
                 app=app_of(row, cfg),
             )
         )
+        if mapped_wave:
+            result.mapped_waves[row["moref"]] = int(mapped_wave)
 
     if getattr(cfg, "app_together", False):
         first: Dict[str, int] = {}

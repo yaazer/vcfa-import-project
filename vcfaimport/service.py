@@ -379,24 +379,72 @@ def next_wave(store: st.Store) -> int:
 
 
 def place_new_vms(store: st.Store, cfg: Config, rows: Sequence[sqlite3.Row], records: Sequence[Any],
-                  mode: str = "auto", wave: Optional[int] = None) -> Dict[str, Any]:
+                  mode: str = "auto", wave: Optional[int] = None, move_queued: bool = False,
+                  mapped_waves: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """Settle the wave of every staged record, in place. Returns what was decided.
 
-    Under "next" and "wave", only VMs entering the queue are placed: a VM already
-    queued keeps its wave (re-staging still refreshes its namespace and subnets;
-    moving it is the Waves page's job), a wave set on the VM in Select still wins,
-    and with app_together a new VM joins its application's wave if the app is
-    already queued. "maps" leaves stage()'s waves exactly as they were.
+    Under "next" and "wave", VMs entering the queue are placed: a wave set on the
+    VM in Select still wins, and with app_together a new VM joins its
+    application's wave if the app is already queued. "maps" leaves stage()'s
+    waves exactly as they were for new VMs.
+
+    A VM already queued keeps its wave (re-staging still refreshes its namespace
+    and subnets) unless `move_queued` (lab request, 2026-11-17: changing the wave
+    on Map & Stage must move it): then "wave" moves it to that wave, and "maps"
+    moves it to the wave its map entry names (`mapped_waves`, from stage()) --
+    beating an earlier drag on the Waves page. "next" never moves a queued VM,
+    so a restage cannot collapse the campaign into one new wave. The moves are
+    only planned here (out["moves"]); apply_wave_moves() carries them out after
+    sync_inventory, through move_wave like the Waves page. A VM already in a
+    batch (WAVE_LOCKED_STATES) is never moved (out["locked"]).
     """
     mode = (mode or "auto").lower()
     if mode not in WAVE_MODES:
         raise SelectionError("wave choice must be one of: {}".format(", ".join(WAVE_MODES)))
-    queued = {r["moref"]: (r["wave"], r["app"]) for r in store.conn.execute("SELECT moref, wave, app FROM vms")}
+    queued_rows = {r["moref"]: r for r in store.conn.execute("SELECT moref, vm_name, wave, app, state FROM vms")}
+    queued = {m: (r["wave"], r["app"]) for m, r in queued_rows.items()}
     nxt = (max(w for w, _ in queued.values()) + 1) if queued else 1
     resolved = mode if mode != "auto" else ("next" if queued else "maps")
     out: Dict[str, Any] = {"mode": resolved, "asked": mode, "next_wave": nxt, "wave": None,
-                           "placed": 0, "kept": 0, "explicit": 0, "with_app": 0, "maps_overridden": 0}
+                           "placed": 0, "kept": 0, "explicit": 0, "with_app": 0, "maps_overridden": 0,
+                           "move_queued": bool(move_queued), "moves": [], "locked": []}
+
+    def plan_queued_moves(target_of: Callable[[Any], Optional[int]]) -> None:
+        """Queued records keep their current wave in the record (sync_inventory must not
+        move them itself); the ones whose target differs are listed as moves."""
+        wanted: Dict[str, int] = {}
+        for rec in records:
+            if rec.moref in queued_rows:
+                to = target_of(rec)
+                if to:
+                    wanted[rec.moref] = int(to)
+        if getattr(cfg, "app_together", False):
+            # One app, one wave: the earliest any member's entry names (as stage() does).
+            first: Dict[str, int] = {}
+            for m, to in wanted.items():
+                app = queued_rows[m]["app"]
+                if app:
+                    first[app] = min(first.get(app, to), to)
+            wanted = {m: first.get(queued_rows[m]["app"], to) for m, to in wanted.items()}
+        for rec in records:
+            row = queued_rows.get(rec.moref)
+            if row is None:
+                continue
+            rec.wave = row["wave"]
+            to = wanted.get(rec.moref)
+            if not to or to == row["wave"]:
+                continue
+            move = {"moref": rec.moref, "vm_name": row["vm_name"], "from": row["wave"], "to": to,
+                    "state": row["state"]}
+            (out["locked"] if row["state"] in st.WAVE_LOCKED_STATES else out["moves"]).append(move)
+
     if resolved == "maps":
+        if move_queued:
+            # The wave a map entry names beats a wave set on the VM (an earlier drag on
+            # the Waves page writes one); without one, what stage() gave (the VM's own
+            # wave, else the default) -- as "As the maps say" always re-applied.
+            staged = {rec.moref: rec.wave for rec in records}
+            plan_queued_moves(lambda rec: (mapped_waves or {}).get(rec.moref) or staged[rec.moref])
         return out
     if resolved == "wave":
         if not wave or int(wave) < 1:
@@ -411,10 +459,14 @@ def place_new_vms(store: st.Store, cfg: Config, rows: Sequence[sqlite3.Row], rec
         for w, app in queued.values():
             if app:
                 app_wave[app] = min(app_wave.get(app, w), w)
+    if move_queued and resolved == "wave":
+        plan_queued_moves(lambda rec: target)
+    moving = {m["moref"] for m in out["moves"]}
     for rec in records:
         if rec.moref in queued:
             rec.wave = queued[rec.moref][0]
-            out["kept"] += 1
+            if rec.moref not in moving:
+                out["kept"] += 1
         elif explicit.get(rec.moref):
             rec.wave = explicit[rec.moref]
             out["explicit"] += 1
@@ -429,10 +481,48 @@ def place_new_vms(store: st.Store, cfg: Config, rows: Sequence[sqlite3.Row], rec
     return out
 
 
+def apply_wave_moves(store: st.Store, cfg: Config, choice: Dict[str, Any]) -> Dict[str, Any]:
+    """Move the already-queued VMs place_new_vms planned to move, after sync_inventory.
+
+    Goes through move_wave, exactly as a drag on the Waves page does: an event per
+    VM (a wave is not a state), the discovery row updated so the next staging keeps
+    the choice, apps pulled along with app_together, and a VM that entered a batch
+    since the preview refused rather than moved."""
+    by_wave: Dict[int, List[str]] = {}
+    for move in choice.get("moves") or []:
+        by_wave.setdefault(int(move["to"]), []).append(move["moref"])
+    totals: Dict[str, Any] = {"moved": 0, "refused": [], "pulled_with_app": 0}
+    for wave in sorted(by_wave):
+        res = move_wave(store, cfg, by_wave[wave], wave)
+        totals["moved"] += res["moved"]
+        totals["refused"].extend(res["refused"])
+        totals["pulled_with_app"] += res["pulled_with_app"]
+    if totals["moved"]:
+        store.log_event("staging moved {} already-queued VM(s) to the wave{} Map & Stage gives".format(
+            totals["moved"], "s" if len(by_wave) > 1 else ""), "info")
+    return totals
+
+
+def _move_lines(choice: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    moves = choice.get("moves") or []
+    if moves:
+        lines.append("    {} already queued move to {}:".format(
+            len(moves), "the wave the maps give" if choice["mode"] == "maps" else "wave {}".format(choice["wave"])))
+        for m in moves[:10]:
+            lines.append("      {} ({}): wave {} -> {}".format(m["vm_name"], m["moref"], m["from"], m["to"]))
+        if len(moves) > 10:
+            lines.append("      ... and {} more".format(len(moves) - 10))
+    if choice.get("locked"):
+        lines.append("    {} already in a batch keep their wave (it can no longer change)".format(len(choice["locked"])))
+    return lines
+
+
 def wave_choice_lines(choice: Dict[str, Any]) -> List[str]:
     """What place_new_vms decided, for the CLI and the console log."""
     if choice["mode"] == "maps":
-        return ["  waves: as the maps say{}".format(" (first staging of the campaign)" if choice["asked"] == "auto" else "")]
+        return (["  waves: as the maps say{}".format(" (first staging of the campaign)" if choice["asked"] == "auto" else "")]
+                + _move_lines(choice))
     if choice["placed"]:
         lines = ["  waves: {} new VM(s) into wave {}{}".format(
             choice["placed"], choice["wave"], " (the next wave)" if choice["mode"] == "next" else "")]
@@ -441,8 +531,11 @@ def wave_choice_lines(choice: Dict[str, Any]) -> List[str]:
     if choice["maps_overridden"]:
         lines.append("    the maps named another wave for {} of them; choose \"As the maps say\" "
                      "(--wave maps) to follow the maps".format(choice["maps_overridden"]))
+    lines.extend(_move_lines(choice))
     if choice["kept"]:
-        lines.append("    {} already queued keep their wave (move them on the Waves page)".format(choice["kept"]))
+        lines.append("    {} already queued keep their wave{}".format(
+            choice["kept"], "" if choice.get("move_queued") and choice["mode"] == "wave"
+            else " (pick a wave number with \"move already-queued VMs\" on, or use the Waves page)"))
     if choice["explicit"]:
         lines.append("    {} keep the wave set on them in Select".format(choice["explicit"]))
     if choice["with_app"]:
@@ -1381,6 +1474,40 @@ def record_discovery(store: st.Store, server: str, extras: Optional[Dict[str, An
         store.set_meta("vc_namespaces", {"server": server, "namespaces": extras["namespaces"]})
     if extras and extras.get("subnets") is not None:
         store.set_meta("vc_subnets", {"server": server, "subnets": extras["subnets"]})
+    if extras and extras.get("storage_policies") is not None:
+        store.set_meta("vc_storage_policies", dict(extras["storage_policies"], server=server))
+
+
+def storage_policy_report(store: st.Store) -> List[str]:
+    """Discover-log lines: queued VMs whose storage policy does not fit their
+    target namespace -- the same verdict engine.eligible() applies at precheck
+    and import, said up front instead of only when a run holds them back."""
+    from .vcenter import storage_policy_problems
+    snapshot = store.get_meta("vc_storage_policies") or {}
+    offered, names = snapshot.get("namespaces") or {}, snapshot.get("names") or {}
+    rows = store.conn.execute(
+        "SELECT v.moref, v.vm_name, v.namespace, d.facts_json FROM vms v "
+        "JOIN discovered d ON d.moref = v.moref WHERE v.state IN (?, ?)",
+        (st.S_PENDING, st.S_PRECHECK_PASSED)).fetchall()
+    wrong = []
+    for r in rows:
+        try:
+            facts = json.loads(r["facts_json"] or "{}") or {}
+        except ValueError:
+            facts = {}
+        problems = storage_policy_problems(facts.get("storage_policies"), facts.get("disk_ids") or [],
+                                           r["namespace"], offered.get(r["namespace"]), names)
+        if problems:
+            wrong.append((r, problems))
+    if not wrong:
+        return []
+    lines = ["  {} queued VM(s) use a storage policy their target namespace does not offer -- held "
+             "back from precheck and import until fixed (storage_compliance_enforce):".format(len(wrong))]
+    for r, problems in wrong[:10]:
+        lines.append("    {} ({}) -> {}: {}".format(r["vm_name"], r["moref"], r["namespace"], "; ".join(problems)))
+    if len(wrong) > 10:
+        lines.append("    ... and {} more (the precheck plan lists them)".format(len(wrong) - 10))
+    return lines
 
 
 # ------------------------------------------------------------ rediscovery

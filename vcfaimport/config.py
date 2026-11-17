@@ -87,11 +87,13 @@ class Config:
     require_precheck: bool = True      # refuse to import VMs with no passing precheck
     readiness_exclude_blocked: bool = False  # keep VMs readiness marks "blocked" out of precheck
     precheck_max_age_hours: int = 0    # import refuses a precheck older than this; 0 = no limit
-    # Unconditional, unlike readiness_exclude_blocked: refuses to import a VM
-    # whose last-known (or, with vCenter credentials on `run`, freshly
-    # rechecked) storage-policy compliance is not COMPLIANT/NOT_APPLICABLE --
-    # including a VM never checked at all. The named override for when this
-    # is not wanted (e.g. a vCenter too old for the compliance API).
+    # Unconditional, unlike readiness_exclude_blocked: refuses to precheck or
+    # import a VM whose last-known (or, with vCenter credentials on `run`,
+    # freshly rechecked) storage-policy compliance is not COMPLIANT/NOT_APPLICABLE
+    # -- including a VM never checked at all -- or whose home or any disk has no
+    # storage policy or one its target namespace does not offer. The named
+    # override for when this is not wanted (e.g. a vCenter too old for the
+    # compliance or namespace API).
     storage_compliance_enforce: bool = True
     # The Supervisor's vm-operator VirtualMachine CR, release_rollback's only
     # target. Qualified with its API group: a bare "virtualmachines" could
@@ -286,7 +288,7 @@ max_vms_per_run         = 0      # 0 = unlimited
 require_precheck        = true
 # readiness_exclude_blocked = false   # keep VMs readiness marks "blocked" out of precheck
 # precheck_max_age_hours = 24         # import holds back VMs whose precheck is older; 0 = no limit
-storage_compliance_enforce = true   # refuse to import a VM not known COMPLIANT/NOT_APPLICABLE
+storage_compliance_enforce = true   # refuse a VM not COMPLIANT, or on a policy its namespace does not offer
 # vm_resource = "virtualmachines.vmoperator.vmware.com"  # VirtualMachine CR (release-rollback)
 
 [governance]

@@ -38,10 +38,15 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   = nothing reset), archives `state.db` + local ledger + job logs to `<workdir>/archive/`, then
   empties `Store.CAMPAIGN_TABLES`. Users, settings and maps survive; a shared `ledger_path` is never moved.
   `POST /api/reset` needs `"confirm_phrase": "RESET"` as well as `confirm` (the HTTP fuzz test sends `confirm: true`).
-- **Staging decides waves only for VMs entering the queue** (`service.place_new_vms`): "auto" =
+- **Staging places VMs entering the queue** (`service.place_new_vms`): "auto" =
   the maps on a campaign's first staging (empty queue), the next wave (highest + 1) after that;
-  "next" / "maps" / a number on request. Queued VMs keep their wave unless "maps" (the old
-  behaviour, which re-applies the maps to pending VMs); a wave set in Select always wins.
+  "next" / "maps" / a number on request; a wave set in Select wins for a new VM.
+  **Queued VMs move too when `move_queued`** (console checkbox, default on; CLI default on,
+  `--keep-queued-waves` off; lab, 2026-11-17): a number moves every selected queued VM there,
+  "maps" moves each to its map entry's wave (`StageResult.mapped_waves`, beating a drag), "next"
+  never moves one. Moves are planned in `wave_choice["moves"]` (records keep their current wave so
+  `sync_inventory` does not move them itself) and applied after it by `service.apply_wave_moves`
+  through `move_wave`; `WAVE_LOCKED_STATES` VMs land in `wave_choice["locked"]`, never moved.
 - A wave's **name and notes** (`wave_info`, often the tenant it moves) belong to its VMs, not its
   number: `swap_waves` moves them along. Setting them is an event (`Store.set_wave_info`), and
   every "Wave N" label in the UI goes through `waveLabel()` (names arrive with `/api/pulse`).
@@ -93,6 +98,11 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   changed since its facts were recorded; `precheck_max_age_hours` (0 = off) holds stale passes
   back at import. Deselecting never unqueues: plans name every VM and flag left-over entries
   (`service.run_members`). A golden image was imported on a three-day-old pass (2026-10-01).
+- **Compliant is not enough: the policy must be one the namespace offers** (lab, 2026-11-17).
+  `eligible()` (both stages) also holds back a VM whose home or any disk has no policy or one
+  outside its target namespace's `storage_specs` (`vcenter.storage_policy_problems`, snapshot in
+  meta `vc_storage_policies`, per-VM `facts.storage_policies` + `facts.disk_ids`). vCenter omits
+  an unpolicied disk from the policy map, so always compare against `disk_ids`. `NO_POLICY` blocks.
 - Verification never changes a VM's state (a committed import stays committed); it
   writes `verifications` rows and `vms.verify_*` only.
 - Secrets never hit disk: SMTP passwords via `password_env`, user tokens stored as

@@ -91,7 +91,25 @@ RULES: List[Rule] = [
                "The import gate refuses to move this VM until a fresh discover shows it compliant, "
                "or storage_compliance_enforce is set to false.",
      "test": lambda r, f: not storage_compliance_ok(f.get("storage_compliance"))},
+    # Namespace-independent half of the policy gate (engine.eligible() also
+    # checks each policy is one the VM's target namespace offers, which needs the
+    # namespace a discovered VM does not have yet): a home or disk with no
+    # policy, or policies never read, can never pass.
+    {"code": "storage_policy_missing", "level": BLOCK, "title": "Storage policy missing or not read",
+     "advice": "The VM's home or a disk has no storage policy, or discover never read which "
+               "policies it uses. Assign one of the target namespace's storage policies in vCenter "
+               "and re-discover; precheck and import hold it back until then "
+               "(storage_compliance_enforce).",
+     "test": lambda r, f: _policy_missing(f)},
 ]
+
+
+def _policy_missing(facts: Dict[str, Any]) -> bool:
+    attached = facts.get("storage_policies")
+    if not isinstance(attached, dict) or attached.get("error"):
+        return True
+    disks = attached.get("disks") or {}
+    return not attached.get("vm_home") or any(not disks.get(str(d)) for d in facts.get("disk_ids") or [])
 
 
 def storage_compliance_detail(row: Any) -> str:

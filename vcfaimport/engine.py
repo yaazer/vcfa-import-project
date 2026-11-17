@@ -26,7 +26,7 @@ from .planner import PlannedBatch, plan_batches, record_from_row
 from .render import LABEL_RUN
 from . import state as st
 from .status import BatchStatus, batch_status
-from .vcenter import storage_compliance_ok, storage_compliance_reason
+from .vcenter import storage_compliance_ok, storage_compliance_reason, storage_policy_problems
 
 STAGE_PRECHECK = "precheck"
 STAGE_IMPORT = "import"
@@ -103,6 +103,11 @@ class Engine:
         # check; this engine never opens a vCenter session of its own.
         self.storage_compliance_check: Optional[
             Callable[[Sequence[str]], Dict[str, Optional[Dict[str, Any]]]]] = None
+        # The policy half of the same live recheck (vcenter.storage_policy_checker):
+        # (morefs, namespaces) -> which policy each VM uses now and which each
+        # namespace offers now. Set alongside storage_compliance_check.
+        self.storage_policy_check: Optional[
+            Callable[[Sequence[str], Sequence[str]], Dict[str, Any]]] = None
         # Morefs that just transitioned into rollback_failed, for whoever
         # polled to push a notification -- rendering it only when someone has
         # the console's Activity page open (service.activity_now) is not
@@ -426,7 +431,30 @@ class Engine:
                 "(run `readiness` for detail per VM; re-discover once fixed, or set "
                 "storage_compliance_enforce=false to override)".format(
                     len(bad), "; ".join(sorted({storage_compliance_reason(c) for _, c in bad[:5]}))))
-        return [r for r, _ in keep]
+        # Compliant is not enough (2026-11-17, lab): a disk can be COMPLIANT with a
+        # policy its target namespace does not offer. Each VM's home and every disk
+        # must use one of the policies its own namespace offers.
+        snapshot = self.store.get_meta("vc_storage_policies") or {}
+        offered = snapshot.get("namespaces") or {}
+        names = snapshot.get("names") or {}
+        matched, wrong = [], []
+        for r, _ in keep:
+            d = discovered.get(r["moref"])
+            facts = json.loads(d["facts_json"] or "{}") if d else {}
+            facts = facts if isinstance(facts, dict) else {}
+            problems = storage_policy_problems(
+                facts.get("storage_policies"), facts.get("disk_ids") or [], r["namespace"],
+                offered.get(r["namespace"]), names)
+            (wrong if problems else matched).append((r, problems))
+        if wrong:
+            examples = ["{} ({}): {}".format(r["vm_name"] or r["moref"], r["moref"], "; ".join(p))
+                        for r, p in wrong[:3]]
+            self.holdbacks.append(
+                "{} VM(s) held back: storage policy is not one its target namespace offers -- {}{} "
+                "(fix the policy in vCenter and re-discover, or set storage_compliance_enforce=false "
+                "to override)".format(len(wrong), " | ".join(examples),
+                                      " | ..." if len(wrong) > 3 else ""))
+        return [r for r, _ in matched]
 
     def _filter_storage_compliance(self, batches: List[PlannedBatch]) -> List[PlannedBatch]:
         """Re-verify live, right before applying: the cached facts eligible()
@@ -446,21 +474,58 @@ class Engine:
         make one bad call block the VM until the next discover, the same
         mistake already fixed once for vc_subnets last session."""
         morefs = [rec.moref for b in batches for rec in b.records]
-        live = self.storage_compliance_check(morefs) or {}
+        live = (self.storage_compliance_check(morefs) or {}) if self.storage_compliance_check else None
+        policy = None
+        if self.storage_policy_check is not None:
+            policy = self.storage_policy_check(morefs, [b.namespace for b in batches]) or {}
+            self._remember_policy_snapshot(policy)
+        disk_ids: Dict[str, List[str]] = {}
+        if policy is not None:
+            for d in self.store.query_discovered(morefs=morefs):
+                facts = json.loads(d["facts_json"] or "{}") or {}
+                disk_ids[d["moref"]] = (facts.get("disk_ids") or []) if isinstance(facts, dict) else []
         kept: List[PlannedBatch] = []
         for b in batches:
-            bad = [(rec, live.get(rec.moref)) for rec in b.records
-                   if not storage_compliance_ok(live.get(rec.moref))]
-            for rec, comp in bad:
-                if comp is not None and comp.get("overall") != "ERROR":
-                    self.store.merge_discovered_facts(rec.moref, {"storage_compliance": comp})
-                reason = storage_compliance_reason(comp)
-                msg = "import held back: vCenter's live storage-policy compliance check says {}".format(reason)
-                self.store.log_event(msg, "warn", moref=rec.moref, batch=b.name)
-                self.log("  ~ {} ({}): {}".format(rec.moref, rec.vm_name, msg))
-            if not bad:
+            held = False
+            for rec in b.records:
+                if live is not None:
+                    comp = live.get(rec.moref)
+                    if not storage_compliance_ok(comp):
+                        held = True
+                        if comp is not None and comp.get("overall") != "ERROR":
+                            self.store.merge_discovered_facts(rec.moref, {"storage_compliance": comp})
+                        msg = "import held back: vCenter's live storage-policy compliance check says {}".format(
+                            storage_compliance_reason(comp))
+                        self.store.log_event(msg, "warn", moref=rec.moref, batch=b.name)
+                        self.log("  ~ {} ({}): {}".format(rec.moref, rec.vm_name, msg))
+                if policy is not None:
+                    attached = (policy.get("vms") or {}).get(rec.moref)
+                    if attached is not None and not attached.get("error"):
+                        self.store.merge_discovered_facts(rec.moref, {"storage_policies": attached})
+                    problems = storage_policy_problems(
+                        attached, disk_ids.get(rec.moref, []), b.namespace,
+                        (policy.get("namespaces") or {}).get(b.namespace), policy.get("names") or {})
+                    if problems:
+                        held = True
+                        msg = ("import held back: vCenter says its storage policy does not fit "
+                               "namespace {} -- {}".format(b.namespace, "; ".join(problems)))
+                        self.store.log_event(msg, "warn", moref=rec.moref, batch=b.name)
+                        self.log("  ~ {} ({}): {}".format(rec.moref, rec.vm_name, msg))
+            if not held:
                 kept.append(b)
         return kept
+
+    def _remember_policy_snapshot(self, policy: Dict[str, Any]) -> None:
+        """Fold namespaces a live recheck could ask into the cached snapshot, so the
+        next plan's cached gate agrees with what was just seen. A namespace that
+        could not be asked (None) leaves its cached entry alone."""
+        answered = {ns: v for ns, v in (policy.get("namespaces") or {}).items() if v is not None}
+        if not answered:
+            return
+        snapshot = dict(self.store.get_meta("vc_storage_policies") or {})
+        snapshot["namespaces"] = dict(snapshot.get("namespaces") or {}, **answered)
+        snapshot["names"] = dict(snapshot.get("names") or {}, **(policy.get("names") or {}))
+        self.store.set_meta("vc_storage_policies", snapshot)
 
     def _fresh_prechecks(self, rows: List[sqlite3.Row], max_age_hours: int) -> List[sqlite3.Row]:
         """Hold back VMs whose precheck pass is older than precheck_max_age_hours."""
@@ -657,7 +722,8 @@ class Engine:
                         self.cfg.max_vms_per_run, total, len(capped)))
                 pending = capped
             if (stage == STAGE_IMPORT and pending and not self.kube.dry_run
-                    and self.storage_compliance_check is not None):
+                    and (self.storage_compliance_check is not None
+                         or self.storage_policy_check is not None)):
                 before = len(pending)
                 pending = self._filter_storage_compliance(pending)
                 if len(pending) != before:
