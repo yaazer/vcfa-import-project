@@ -74,6 +74,12 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   means and how to fix it. The Execute plan (`held`, shown even when nothing is eligible), the Import queue badges
   (`/api/eligibility`), the CLI and the discover log all render those records. A new reason for holding a VM back needs a
   code and a CAUSES entry, never only a string. Unknown still means held (fail closed).
+- **Select shows the storage verdict per VM** (`service.storage_breakdown`, served in `/api/discovered` as `storage`):
+  same inputs and predicates as the gate (`storage_compliance_ok`, `storage_policy_findings`); a test asserts "pass" exactly
+  where the engine keeps the VM, so never add a rule to one and not the other. Target namespace = queued, else set in Select,
+  else what `stage()` would assign from the saved maps; none = "no target", never a guess. Cached facts only, no vCenter call.
+  Per-disk `facts.disks` (datastore from the VMDK path) is absent in old caches: say "Discover again", never infer.
+  No thin/thick flag is read: REST reports none, the compliance cause carries it. Do not invent provisioning rules.
 - **`service.read_catalog` / `catalog`** re-reads namespaces, subnets and per-namespace policies with no VMs, and refuses a
   vCenter other than the cache's. Discover uses the same `vcenter.read_namespace_catalog`.
 - **No floating panels over the work.** The Activity pane (`#pane`, views.js "PANE") is the third column of

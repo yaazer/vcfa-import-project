@@ -296,11 +296,38 @@ class WebApp:
                     "discovered_at": self.store.get_meta("discovered_at")}
             queued = {r["moref"]: r["state"] for r in self.store.conn.execute(
                 "SELECT moref, state FROM vms")}
+        # Where each VM would go: its queued namespace, else the one set in Select, else what the saved maps
+        # would assign (the same stage() the next step runs). None of the three means "no target yet".
+        where: Dict[str, Tuple[str, str]] = {}
+        try:
+            folder_rows, network_rows = self._map_rows()
+            staged = stage(rows, self.cfg, mapping=network_map_from_rows(network_rows),
+                           folder_mapping=folder_map_from_rows(folder_rows),
+                           tag_mapping=tag_map_from_rows(self._tag_rows()))
+            where = {rec.moref: (rec.namespace, "maps") for rec in staged.records}
+        except Exception:  # a bad map file is reported where the maps are edited, not here
+            where = {}
+        with self.lock:
+            queued_ns = {r["moref"]: r["namespace"] for r in self.store.conn.execute(
+                "SELECT moref, namespace FROM vms") if r["namespace"]}
+            sp_snapshot = self.store.get_meta("vc_storage_policies") or {}
         out = []
         for r in rows:
             nics = json.loads(r["nics_json"] or "[]")
             found = readiness.assess(r)
+            if r["moref"] in queued_ns:
+                ns, src = queued_ns[r["moref"]], "queue"
+            elif (r["namespace"] or "").strip():
+                ns, src = r["namespace"].strip(), "set in Select"
+            else:
+                ns, src = where.get(r["moref"], ("", ""))
+            try:
+                facts = json.loads(r["facts_json"] or "{}")
+            except ValueError:
+                facts = {}
+            sb = service.storage_breakdown(facts, ns, sp_snapshot, src)
             out.append({
+                "storage": sb, "storage_verdict": sb["verdict"],
                 "tags": row_tags(r), "app": app_of(r, self.cfg), "ip": r["ip"],
                 "readiness": readiness.grade(found), "findings": [f["title"] for f in found],
                 "moref": r["moref"], "name": r["name"], "power_state": r["power_state"],
@@ -311,6 +338,14 @@ class WebApp:
                 "selected": bool(r["selected"]), "namespace": r["namespace"],
                 "wave": r["wave"] or None, "queue_state": queued.get(r["moref"]),
             })
+        # The namespaces' storage policies, read from vCenter: the reference every VM above is measured against.
+        names = sp_snapshot.get("names") or {}
+        meta["storage_catalog"] = {
+            "read": bool(sp_snapshot.get("namespaces")),
+            "namespaces": [{"name": ns, "offers": [{"id": p, "name": names.get(p) or p,
+                                                    "limit": ((sp_snapshot.get("limits") or {}).get(ns) or {}).get(p)}
+                                                   for p in ids]}
+                           for ns, ids in sorted((sp_snapshot.get("namespaces") or {}).items())]}
         return {"vms": out, "meta": meta}
 
     def folders(self, q, body) -> Dict[str, Any]:

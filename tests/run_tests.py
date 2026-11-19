@@ -5602,6 +5602,81 @@ def t_eligibility_causes_and_plan():
             c.close()
 
 
+@test("storage breakdown: each VM measured part by part against its namespace, never passing what the gate "
+      "holds back; datastore and size come from the VMDK path; stale caches say 'read again', not pass")
+def t_storage_breakdown():
+    import copy
+    from vcfaimport import service, vcenter
+    snap = {"namespaces": {"ns-a": [GOLD_POLICY]}, "names": {GOLD_POLICY: "Gold", BRONZE_POLICY: "Bronze"},
+            "limits": {"ns-a": {GOLD_POLICY: 262144}}}
+    ok = {"storage_compliance": {"overall": "COMPLIANT", "vm_home_status": "COMPLIANT",
+                                 "disks": {"2000": {"status": "COMPLIANT", "failure_cause": ""}}},
+          "storage_policies": {"vm_home": GOLD_POLICY, "disks": {"2000": GOLD_POLICY}}, "disk_ids": ["2000"],
+          "disks": {"2000": {"label": "Hard disk 1", "datastore": "ds1", "backing": "VMDK_FILE", "capacity_gb": 20.0}}}
+    sb = service.storage_breakdown(ok, "ns-a", snap, "maps")
+    eq(sb["verdict"], "pass")
+    eq([p["key"] for p in sb["parts"]], ["home", "2000"])
+    eq((sb["parts"][1]["datastore"], sb["parts"][1]["policy_name"], sb["parts"][1]["offered"]), ("ds1", "Gold", True))
+    eq(sb["offers"], [{"id": GOLD_POLICY, "name": "Gold", "limit": 262144}])
+    eq((sb["ns_source"], sb["provisioned"]), ("maps", None))
+    # a disk on a policy the namespace does not offer: that disk fails, the home still passes
+    bad = copy.deepcopy(ok)
+    bad["storage_policies"]["disks"]["2000"] = BRONZE_POLICY
+    sb = service.storage_breakdown(bad, "ns-a", snap)
+    eq(sb["verdict"], "fail")
+    eq([p["policy_check"] for p in sb["parts"]], ["pass", "fail"])
+    assert any("Bronze" in i for i in sb["issues"]), sb["issues"]
+    # vCenter's own enforcement verdict (thin vs thick, datastore rules) fails the disk with its cause
+    nc = copy.deepcopy(ok)
+    nc["storage_compliance"] = {"overall": "NON_COMPLIANT", "vm_home_status": "COMPLIANT",
+                                "disks": {"2000": {"status": "NON_COMPLIANT", "failure_cause": "thin disk, policy wants thick"}}}
+    sb = service.storage_breakdown(nc, "ns-a", snap)
+    eq(sb["verdict"], "fail")
+    eq((sb["parts"][0]["compliance"], sb["parts"][1]["compliance"], sb["parts"][1]["cause"]),
+       ("pass", "fail", "thin disk, policy wants thick"))
+    eq(service.storage_breakdown(nc, "", snap)["verdict"], "fail", "a known compliance failure is a fail with no namespace too")
+    # nothing to judge against yet: not a fail, and never a pass
+    eq(service.storage_breakdown(ok, "", snap)["verdict"], "no_target")
+    # not read / unknown: held back like a fail, said as unknown
+    eq(service.storage_breakdown(ok, "ns-b", snap)["verdict"], "unknown")
+    eq(service.storage_breakdown({}, "ns-a", snap)["verdict"], "unknown")
+    eq(service.storage_breakdown(dict(ok, storage_compliance={"overall": "ERROR", "status": 403}), "ns-a", snap)["verdict"], "unknown")
+    # an older cache has no per-disk detail: say so, never invent a datastore
+    old = {k: v for k, v in ok.items() if k != "disks"}
+    sb = service.storage_breakdown(old, "ns-a", snap)
+    eq((sb["verdict"], sb["disks_read"], sb["parts"][1]["datastore"]), ("pass", False, ""))
+    # per-disk facts from the VM detail vCenter already returned
+    f = vcenter._facts({"disks": {"2000": {"label": "Hard disk 1", "capacity": 21474836480,
+                                           "backing": {"type": "VMDK_FILE", "vmdk_file": "[DS2-Thick] vm/vm.vmdk"}}}})
+    eq(f["disks"]["2000"], {"label": "Hard disk 1", "backing": "VMDK_FILE", "datastore": "DS2-Thick", "capacity_gb": 20.0})
+
+    # The grid and the gate cannot disagree: pass exactly when the engine keeps the VM.
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            store = c.app.store
+            _seed_store_with_vms(store, 5, waves=(1,))
+            facts = {
+                "vm-1001": _good_storage_facts(BRONZE_POLICY),
+                "vm-1002": dict(_good_storage_facts(), storage_policies={"vm_home": GOLD_POLICY, "disks": {}}),
+                "vm-1003": {"storage_compliance": {"overall": "COMPLIANT"}, "disk_ids": ["2000"]},
+                "vm-1004": {"storage_compliance": {"overall": "NON_COMPLIANT"}, "disk_ids": []},
+            }
+            for moref, fx in facts.items():
+                store.conn.execute("UPDATE discovered SET facts_json=? WHERE moref=?", (json.dumps(fx), moref))
+            store.conn.commit()
+            held = set(c.ok("GET", "/api/eligibility")["by_moref"])
+            disc = c.ok("GET", "/api/discovered")
+            verdict = {v["moref"]: v["storage_verdict"] for v in disc["vms"]}
+            eq({m for m, v in verdict.items() if v != "pass"}, held, "pass exactly where the gate keeps the VM")
+            assert held and len(held) < len(verdict), "the case must have both"
+            eq(next(v for v in disc["vms"] if v["moref"] == "vm-1001")["storage"]["ns_source"], "queue")
+            cat = disc["meta"]["storage_catalog"]
+            assert cat["read"] and any(n["name"] == "ns-a" for n in cat["namespaces"]), cat
+        finally:
+            c.close()
+
+
 @test("catalog: reading namespaces, subnets and policies on their own (no VMs) clears the namespace-unknown "
       "hold, names what vCenter lists and what it does not, and refuses another vCenter's cache")
 def t_read_catalog():
@@ -7567,7 +7642,7 @@ UNIT = [
     t_engine_storage_compliance_gate, t_engine_storage_compliance_live_filter,
     t_engine_storage_compliance_live_filter_real_client,
     t_stage_moves_queued_vms, t_web_stage_moves_queued,
-    t_vcenter_storage_policy_problems, t_engine_storage_policy_gate, t_eligibility_causes_and_plan, t_read_catalog,
+    t_vcenter_storage_policy_problems, t_engine_storage_policy_gate, t_eligibility_causes_and_plan, t_storage_breakdown, t_read_catalog,
     t_engine_storage_policy_live_filter, t_discover_storage_policy_real_client,
     t_web_roles_settings,
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,

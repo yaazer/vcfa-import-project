@@ -259,10 +259,83 @@ function buildTree(vms) {
   return dcs;
 }
 
+// ---- Storage: every VM measured against the policies its target namespace offers (service.storage_breakdown).
+const STORAGE = { pass: ['ok', 'pass'], fail: ['bad', 'fail'], unknown: ['warn', 'unknown'], no_target: ['', 'no target'] };
+const CHECK = { pass: ['ok', '✓'], fail: ['bad', '✗'], unknown: ['warn', '?'] };
+const gib = (mib) => (mib === null || mib === undefined ? '' : mib >= 1024 ? n(Math.round(mib / 1024)) + ' GiB' : n(mib) + ' MiB');
+function storageTag(x) {
+  const s = x.storage;
+  if (!s) return '';
+  const [c, l] = STORAGE[s.verdict] || ['', s.verdict];
+  const open = VIEWS.select.sopen && VIEWS.select.sopen.has(x.moref);
+  return html`<button class="tag stag ${c}" data-act="storageOpen" data-moref="${x.moref}" aria-expanded="${open ? 'true' : 'false'}"
+      title="${(s.issues || []).join('\n') || 'Click for the policy of each disk and what the namespace offers'}">${l} <span class="caret-s">${open ? '▾' : '▸'}</span></button>
+    ${s.verdict === 'fail' || s.verdict === 'unknown' ? html`<div class="tiny faint clip stag-why">${(s.issues || [])[0] || ''}</div>` : ''}`;
+}
+function storageDetail(x, cols) {
+  const s = x.storage;
+  const offers = s.offers.map((o) => o.name + (o.limit !== null && o.limit !== undefined ? ' (limit ' + gib(o.limit) + ')' : '')).join(', ');
+  const target = s.namespace
+    ? html`<b class="mono">${s.namespace}</b> <span class="faint">from ${s.ns_source}</span>`
+    : html`<b>none yet</b> <span class="faint">— set a namespace above, or map its folder in the next step</span>`;
+  const row = (p) => html`<tr class="${p.policy_check === 'fail' || p.compliance === 'fail' ? 'bad-row' : ''}">
+    <td><b>${p.label}</b>${p.key !== 'home' ? html`<div class="tiny faint">${p.backing || 'disk ' + p.key}${p.capacity_gb ? ' · ' + p.capacity_gb + ' GB' : ''}</div>` : ''}</td>
+    <td>${p.policy ? html`<b>${p.policy_name}</b>` : html`<span class="bad-text">no policy</span>`}</td>
+    <td>${p.offered === null ? html`<span class="tag warn">? namespace not read</span>` : html`<span class="tag ${CHECK[p.policy_check][0]}">${CHECK[p.policy_check][1]} ${p.offered ? 'offered' : 'not offered'}</span>`}</td>
+    <td><span class="tag ${CHECK[p.compliance][0]}">${CHECK[p.compliance][1]} ${p.status ? p.status.toLowerCase().replace(/_/g, ' ') : 'no answer'}</span>${p.cause ? html`<div class="tiny bad-text">${p.cause}</div>` : ''}</td>
+    <td>${p.datastore ? html`<span class="mono">${p.datastore}</span>` : html`<span class="faint">${p.key === 'home' ? '—' : s.disks_read ? 'not reported' : 'Discover again'}</span>`}</td></tr>`;
+  return html`<tr class="subrow"><td colspan="${cols}"><div class="sdetail">
+    <div class="small"><b>Target namespace:</b> ${target}${s.offers_known ? html` · <b>offers:</b> ${offers || html`<span class="bad-text">no storage policy</span>`}` : (s.namespace ? html` · <span class="warn-text">which policies it offers has not been read — use <i>Read from vCenter</i> below</span>` : '')}</div>
+    <table class="t sparts"><thead><tr><th>Part</th><th>Storage policy</th><th>Namespace offers it?</th><th>vCenter's compliance check</th><th>Datastore</th></tr></thead>
+      <tbody>${s.parts.map(row)}</tbody></table>
+    ${s.issues.length ? html`<ul class="plain small">${s.issues.map((i) => html`<li>${i}</li>`)}</ul>` : ''}
+    <div class="tiny faint">Thin or thick provisioning and datastore placement are enforced by the policy: a disk that breaks the rule reads <i>non compliant</i> above, with vCenter's own cause. vCenter's API does not report a per-disk thin/thick flag, so the tool shows the verdict, not the setting. ${tip('storage_check')}</div>
+  </div></td></tr>`;
+}
+// What each namespace offers and how the VMs aimed at it measure up: the reference the column compares against.
+function storageCatalog(v) {
+  const cat = (v.meta && v.meta.storage_catalog) || { read: false, namespaces: [] };
+  const per = new Map();
+  for (const x of v.vms) {
+    if (!x.selected || !x.storage || !x.storage.namespace) continue;
+    const c = per.get(x.storage.namespace) || { pass: 0, fail: 0, unknown: 0, no_target: 0 };
+    c[x.storage.verdict] = (c[x.storage.verdict] || 0) + 1;
+    per.set(x.storage.namespace, c);
+  }
+  const listed = new Set(cat.namespaces.map((c) => c.name));
+  const extra = [...per.keys()].filter((k) => !listed.has(k)).sort();
+  const tally = (c) => (c ? html`${c.pass ? html`<span class="tag ok">${n(c.pass)} pass</span> ` : ''}${c.fail ? html`<span class="tag bad">${n(c.fail)} fail</span> ` : ''}${c.unknown ? html`<span class="tag warn">${n(c.unknown)} unknown</span>` : ''}` : html`<span class="faint">none selected</span>`);
+  return html`<div class="card"><div class="card-h"><h3>Storage policies each namespace offers ${tip('storage_check')}</h3>
+      <span class="sub">read from vCenter · the VMs you selected are measured against these</span>
+      <div class="tools"><button class="btn xs" data-act="readCatalog" title="Ask vCenter again which storage policies each namespace offers (no VMs are read)">${icon('discover')} Read from vCenter</button></div></div>
+    ${cat.read ? '' : html`<div class="note warn" style="margin:12px 18px">No namespace's storage policies are on record yet, so every VM reads <b>unknown</b>. Run Discover, or <i>Read from vCenter</i>.</div>`}
+    <div class="table-wrap"><table class="t"><thead><tr><th>Namespace</th><th>Storage policies it offers (limit)</th><th>Selected VMs aimed at it</th></tr></thead>
+      <tbody>${cat.namespaces.map((c) => html`<tr><td class="mono">${c.name}</td>
+        <td>${c.offers.length ? c.offers.map((o) => html`<span class="tag vtag" title="${o.id}">${o.name}${o.limit !== null && o.limit !== undefined ? ' · ' + gib(o.limit) : ''}</span> `) : html`<span class="bad-text">no storage policy assigned</span>`}</td>
+        <td>${tally(per.get(c.name))}</td></tr>`)}
+        ${extra.map((k) => html`<tr><td class="mono">${k}</td><td><span class="warn-text">not read from vCenter — not a namespace vCenter lists, or this login cannot read it</span></td><td>${tally(per.get(k))}</td></tr>`)}
+        ${!cat.namespaces.length && !extra.length ? html`<tr><td colspan="3" class="faint">Nothing read yet.</td></tr>` : ''}</tbody></table></div></div>`;
+}
+
+function storageProblems(v) { return v.vms.filter((x) => x.selected && ['fail', 'unknown'].includes(x.storage_verdict)).length; }
+// The headline of the storage check: how many of the selected VMs pass, and a way straight to the ones that do not.
+function storageBar(v, selCount) {
+  const pool = v.vms.filter((x) => x.storage && (selCount ? x.selected : true));
+  const c = { pass: 0, fail: 0, unknown: 0, no_target: 0 };
+  pool.forEach((x) => { c[x.storage_verdict] = (c[x.storage_verdict] || 0) + 1; });
+  const bad = c.fail + c.unknown;
+  const chip = (k, label) => html`<button class="chip ${v.f.storage === k ? 'on' : ''}" data-act="storageSet" data-k="${v.f.storage === k ? '' : k}"><span class="tag ${STORAGE[k][0]}">${label}</span> <span class="n">${n(c[k])}</span></button>`;
+  return html`<div class="storagebar ${bad ? 'bad' : ''}"><span><b>Storage policy check</b> of ${selCount ? 'the ' + n(selCount) + ' selected VMs' : 'all ' + n(pool.length) + ' VMs'}:</span>
+    <div class="chips">${chip('pass', 'pass')}${chip('fail', 'fail')}${chip('unknown', 'unknown')}${c.no_target ? chip('no_target', 'no target yet') : ''}</div>
+    ${bad ? html`<span class="bad-text small"><b>${plural(bad, 'VM')}</b> will be held back from precheck. <button class="btn xs" data-act="storageSet" data-k="problem">Show them</button> Click a tag for the disk-by-disk reason.</span>` : html`<span class="muted small">Click a tag for each disk's policy, compliance and datastore.</span>`}</div>`;
+}
+
 VIEWS.select = view({
   title: 'Select VMs', sub: 'Step 2 · choose what to import; folders are the unit of collection',
   init(v, p) {
-    v.f = v.f || { q: '', dc: null, folder: null, cluster: '', network: '', power: '', tools: '', show: 'all', ready: '', tag: '', app: '' };
+    v.f = v.f || { q: '', dc: null, folder: null, cluster: '', network: '', power: '', tools: '', show: 'all', ready: '', tag: '', app: '', storage: '' };
+    v.sopen = v.sopen || new Set();
+    if (p.storage !== undefined) v.f.storage = p.storage;
     if (p.folder !== undefined) { v.f.folder = p.folder; v.f.dc = null; }
     if (p.readiness !== undefined) v.f.ready = p.readiness;
     v.sort = v.sort || { key: 'name', dir: 1 };
@@ -287,6 +360,7 @@ VIEWS.select = view({
       if (f.show === 'sel' && !x.selected) return false;
       if (f.show === 'unsel' && x.selected) return false;
       if (f.ready && x.readiness !== f.ready) return false;
+      if (f.storage === 'problem' ? !['fail', 'unknown'].includes(x.storage_verdict) : f.storage && x.storage_verdict !== f.storage) return false;
       if (f.tag && !(x.tags || []).includes(f.tag)) return false;
       if (f.app && (f.app === '(none)' ? x.app : x.app !== f.app)) return false;
       if (q.length) {
@@ -328,11 +402,13 @@ VIEWS.select = view({
             <select class="select" data-change="filter" data-k="power"><option value="">Any power</option><option value="on" ${attr(f.power === 'on', 'selected')}>Powered on</option><option value="off" ${attr(f.power === 'off', 'selected')}>Powered off</option></select>
             <select class="select" data-change="filter" data-k="tools"><option value="">Any Tools</option><option value="ok" ${attr(f.tools === 'ok', 'selected')}>Tools running</option><option value="bad" ${attr(f.tools === 'bad', 'selected')}>Tools not running</option></select>
             <select class="select" data-change="filter" data-k="ready"><option value="">Any readiness</option>${[['ready', 'Ready'], ['warn', 'Check first'], ['block', 'Likely to fail']].map(([k, l]) => html`<option value="${k}" ${attr(f.ready === k, 'selected')}>${l}</option>`)}</select>
+            <select class="select" data-change="filter" data-k="storage"><option value="">Any storage</option>${[['problem', 'Storage: fail or unknown'], ['pass', 'Storage: pass'], ['fail', 'Storage: fail'], ['unknown', 'Storage: unknown'], ['no_target', 'Storage: no target yet']].map(([k, l]) => html`<option value="${k}" ${attr(f.storage === k, 'selected')}>${l}</option>`)}</select>
             ${apps.length ? html`<select class="select" data-change="filter" data-k="app"><option value="">Any app</option><option value="(none)" ${attr(f.app === '(none)', 'selected')}>No app</option>${apps.map((a) => html`<option ${attr(f.app === a, 'selected')}>${a}</option>`)}</select>` : ''}
             ${tags.length ? html`<select class="select" data-change="filter" data-k="tag"><option value="">Any tag</option>${tags.map((t) => html`<option ${attr(f.tag === t, 'selected')}>${t}</option>`)}</select>` : ''}
             <div class="seg">${[['all', 'All'], ['sel', 'Selected'], ['unsel', 'Not selected']].map(([k, l]) => html`<button class="${f.show === k ? 'on' : ''}" data-act="show" data-k="${k}">${l}</button>`)}</div>
           </div>
           <div class="toolbar thin">${savedViews('select')}</div>
+          ${storageBar(v, selCount)}
           <div class="bulkbar">
             <span><b>${n(rows.length)}</b> match · <b>${n(inViewSel)}</b> of them selected</span>
             <button class="btn sm" data-act="selMatching" data-on="1" ${attr(!rows.length, 'disabled')}>Select all ${n(rows.length)}</button>
@@ -352,7 +428,7 @@ VIEWS.select = view({
           <div class="table-wrap"><table class="t">
             <thead><tr><th class="chk"><input type="checkbox" data-act="selPage" title="Select this page" ${attr(allOnPage, 'checked')}></th>
               ${th(v, 'name', 'VM')}${th(v, 'folder', 'Folder · cluster')}${th(v, 'networks', 'Networks')}
-              ${th(v, 'cpu_count', 'Size')}${th(v, 'power_state', 'Power · Tools')}${th(v, 'readiness', html`Ready ${tip('readiness')}`)}${th(v, 'app', html`App · tags ${tip('app')}`)}${th(v, 'namespace', 'Namespace')}${th(v, 'wave', 'Wave')}<th>Queue</th></tr></thead>
+              ${th(v, 'cpu_count', 'Size')}${th(v, 'power_state', 'Power · Tools')}${th(v, 'readiness', html`Ready ${tip('readiness')}`)}${th(v, 'storage_verdict', html`Storage ${tip('storage_check')}`)}${th(v, 'app', html`App · tags ${tip('app')}`)}${th(v, 'namespace', 'Namespace')}${th(v, 'wave', 'Wave')}<th>Queue</th></tr></thead>
             <tbody>${pageRows.map((x, i) => html`<tr class="${x.selected ? 'on' : ''}">
               <td class="chk"><input type="checkbox" data-act="sel" data-moref="${x.moref}" data-i="${v.page * PAGE + i}" ${attr(x.selected, 'checked')}></td>
               <td><span class="vm-name">${x.name}<small>${x.moref}</small></span></td>
@@ -362,14 +438,16 @@ VIEWS.select = view({
               <td class="nowrap"><span class="tag ${x.power_state === 'POWERED_ON' ? 'ok' : ''}">${(x.power_state || '?').replace('POWERED_', '').toLowerCase()}</span>
                 <span class="small ${x.tools_status && !/running/i.test(x.tools_status) ? 'warn-text' : 'muted'}">${(x.tools_status || '—').replace(/^TOOLS_/, '').replace(/_/g, ' ').toLowerCase()}</span></td>
               <td>${gradeTag(x.readiness, (x.findings || []).join('\n'))}</td>
+              <td class="stcell">${storageTag(x)}</td>
               <td class="nowrap">${appTag(x.app)} ${tagChips((x.tags || []).filter((t) => !x.app || !t.endsWith(':' + x.app)), 2)}</td>
               <td class="small mono">${x.namespace || html`<span class="faint">from map</span>`}</td>
               <td class="num">${x.wave || html`<span class="faint">—</span>`}</td>
-              <td>${x.queue_state ? pill(x.queue_state) : ''}</td></tr>`)}</tbody></table></div>
+              <td>${x.queue_state ? pill(x.queue_state) : ''}</td></tr>${v.sopen.has(x.moref) && x.storage ? storageDetail(x, 12) : ''}`)}</tbody></table></div>
           ${pager(rows.length, v.page, PAGE)}
         </div>`, selCount ? '' : 'now')}
+      ${flowSec(3, storageCatalog(v), storageProblems(v) ? 'warn' : '')}
       ${flowNext('select', plural(selCount, 'VM') + ' selected',
-        html`${noNs ? plural(noNs, 'selected VM') + ' without a namespace — the folder or portgroup map decides in the next step.' : 'Namespace and wave can come from the maps in the next step.'}${v.meta.discovered_at ? ' · discovered ' + v.meta.discovered_at : ''}`,
+        html`${storageProblems(v) ? plural(storageProblems(v), 'selected VM') + ' fail or cannot be checked against their namespace\'s storage policies and will be held back. ' : ''}${noNs ? plural(noNs, 'selected VM') + ' without a namespace — the folder or portgroup map decides in the next step.' : 'Namespace and wave can come from the maps in the next step.'}${v.meta.discovered_at ? ' · discovered ' + v.meta.discovered_at : ''}`,
         html`<button class="btn danger-ghost sm" data-act="clearAll" ${attr(!selCount, 'disabled')}>Clear selection</button>
           <button class="btn primary" data-act="go" data-to="stage" ${attr(!selCount, 'disabled')}>Next: Map & Stage ${icon('arrow')}</button>`)}
     </div>`;
@@ -383,6 +461,8 @@ VIEWS.select = view({
     filter(t, e, v) { v.f[t.dataset.k] = t.value; v.page = 0; v.render(); },
     show(t, e, v) { v.f.show = t.dataset.k; v.page = 0; v.render(); },
     bulkOpen(t, e, v) { v.bulkOpen = t.open; },
+    storageOpen(t, e, v) { const m = t.dataset.moref; if (v.sopen.has(m)) v.sopen.delete(m); else v.sopen.add(m); v.render(); },
+    storageSet(t, e, v) { v.f.storage = t.dataset.k; v.page = 0; v.render(); },
     sort(t, e, v) { const k = t.dataset.key; v.sort = { key: k, dir: v.sort.key === k ? -v.sort.dir : 1 }; v.render(); },
     page(t, e, v) { v.page = +t.dataset.page; v.render(); window.scrollTo(0, 0); },
     folder(t, e, v) {

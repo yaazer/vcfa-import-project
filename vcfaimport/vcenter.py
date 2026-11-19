@@ -611,7 +611,12 @@ class VCenterClient:
         return {"vm_home": policy_of(data.get("vm_home")), "disks": disks}
 
     def namespace_storage_policies(self, namespace: str) -> Optional[List[str]]:
-        """Storage policy ids a Supervisor namespace offers (its storage_specs).
+        """Storage policy ids a Supervisor namespace offers (its storage_specs); see namespace_storage_specs."""
+        specs = self.namespace_storage_specs(namespace)
+        return None if specs is None else sorted({s["policy"] for s in specs})
+
+    def namespace_storage_specs(self, namespace: str) -> Optional[List[Dict[str, Any]]]:
+        """What a Supervisor namespace offers for storage: [{"policy": id, "limit": MiB or None}].
 
         None when it could not be asked (older vCenter, no privilege, the
         namespace is unknown to vCenter, or no answer): never read as "it offers
@@ -635,7 +640,14 @@ class VCenterClient:
             return []
         if not isinstance(specs, list):
             return None
-        return sorted({str(s["policy"]) for s in specs if isinstance(s, dict) and s.get("policy")})
+        out: Dict[str, Dict[str, Any]] = {}
+        for s in specs:
+            if isinstance(s, dict) and s.get("policy"):
+                limit = s.get("limit")
+                out[str(s["policy"])] = {
+                    "policy": str(s["policy"]),
+                    "limit": limit if isinstance(limit, (int, float)) and not isinstance(limit, bool) else None}
+        return [out[k] for k in sorted(out)]
 
     def storage_policy_names(self) -> Dict[str, str]:
         """{policy id: display name}, for messages only. {} when it could not be
@@ -836,9 +848,28 @@ def _facts(detail: Dict[str, Any]) -> Dict[str, Any]:
         disk_ids = [str(i["key"]) for i in raw_disks if isinstance(i, dict) and "key" in i]
     else:
         disk_ids = []
+    # Per disk, keyed like disk_ids: what Select shows beside the policy. The datastore is the one in the
+    # VMDK path ("[ds1] vm/vm.vmdk"); vCenter's REST API reports no thin/thick flag, so none is kept.
+    disks: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_disks, dict):
+        pairs = [(str(k), v) for k, v in raw_disks.items() if isinstance(v, dict)]
+    elif isinstance(raw_disks, list):
+        pairs = [(str(i["key"]), i.get("value", i)) for i in raw_disks if isinstance(i, dict) and "key" in i]
+    else:
+        pairs = []
+    for key, d in pairs:
+        backing = d.get("backing") if isinstance(d.get("backing"), dict) else {}
+        vmdk = str(backing.get("vmdk_file") or "")
+        cap = d.get("capacity")
+        disks[key] = {
+            "label": str(d.get("label") or ""), "backing": str(backing.get("type") or ""),
+            "datastore": vmdk[1:vmdk.index("]")] if vmdk.startswith("[") and "]" in vmdk else "",
+            "capacity_gb": (round(cap / 1024 ** 3, 1)
+                            if isinstance(cap, (int, float)) and not isinstance(cap, bool) else None)}
     return {
         # every disk key, so a disk missing from vm_storage_policies (no policy) shows
         "disk_ids": disk_ids,
+        "disks": disks,
         "hw_version": ((detail or {}).get("hardware") or {}).get("version", ""),
         "disk_backings": [((d.get("backing") or {}).get("type") or "") for d in entries("disks")],
         "iso_connected": any((c.get("backing") or {}).get("type") == "ISO_FILE"
@@ -923,10 +954,14 @@ def read_namespace_catalog(client: VCenterClient, extras: Dict[str, Any], *, wit
         if names:
             workers = max(1, min(int(concurrency), 32))
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                per_ns = list(pool.map(client.namespace_storage_policies, names))
-            answered = {ns: found for ns, found in zip(names, per_ns) if found is not None}
+                per_ns = list(pool.map(client.namespace_storage_specs, names))
+            answered = {ns: sorted(s["policy"] for s in found)
+                        for ns, found in zip(names, per_ns) if found is not None}
+            # The storage limit (MiB) each namespace sets per policy: shown beside the policy, never decided on.
+            limits = {ns: {s["policy"]: s["limit"] for s in found if s["limit"] is not None}
+                      for ns, found in zip(names, per_ns) if found}
             # None = not one namespace could be asked: keep the last snapshot.
-            extras["storage_policies"] = ({"namespaces": answered,
+            extras["storage_policies"] = ({"namespaces": answered, "limits": limits,
                                            "names": client.storage_policy_names()}
                                           if answered else None)
             if answered:

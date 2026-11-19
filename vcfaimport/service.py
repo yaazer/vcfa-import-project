@@ -1560,6 +1560,96 @@ def read_catalog(client: Any, store: st.Store, server: str, *, concurrency: int 
             "still_held": len([l for l in report if l.startswith("  held back:")])}
 
 
+# Compliance answers that are a known "no" (a fail) as opposed to "vCenter could not say" (unknown).
+_COMPLIANCE_UNKNOWN = {"ERROR", "UNKNOWN_COMPLIANCE", ""}
+
+
+def storage_breakdown(facts: Any, namespace: str, snapshot: Optional[Dict[str, Any]],
+                      ns_source: str = "") -> Dict[str, Any]:
+    """One VM's storage picture against one namespace, part by part: what Select shows and the gate decides.
+
+    Built from the same inputs and the same predicates as Engine._require_storage_compliance
+    (`storage_compliance_ok`, `storage_policy_findings`), so the grid can never say pass for a VM the
+    engine holds back -- tests assert that. Reads cached discovery facts and the `vc_storage_policies`
+    snapshot only; no vCenter call.
+
+    verdict: "pass" (compliant, and home and every disk on a policy the namespace offers), "fail" (a
+    known no), "unknown" (something was never read or vCenter could not say -- held back like a fail),
+    "no_target" (nothing to judge against yet: no namespace). A known compliance failure is a fail even
+    without a namespace. `parts` has the VM home, then each disk: its policy, whether the namespace
+    offers it, vCenter's own compliance status and cause for that part, and the datastore.
+    `provisioned` is always None: vCenter's REST API reports no thin/thick flag; compliance carries it."""
+    from .vcenter import storage_compliance_ok, storage_compliance_reason, storage_policy_findings
+    facts = facts if isinstance(facts, dict) else {}
+    snapshot = snapshot or {}
+    names = snapshot.get("names") or {}
+    namespace = (namespace or "").strip()
+    allowed = (snapshot.get("namespaces") or {}).get(namespace) if namespace else None
+    limits = (snapshot.get("limits") or {}).get(namespace) or {}
+    attached, comp = facts.get("storage_policies"), facts.get("storage_compliance")
+    disk_ids = [str(d) for d in facts.get("disk_ids") or []]
+    found = storage_policy_findings(attached, disk_ids, namespace, allowed, names)
+    policies_read = isinstance(attached, dict) and not attached.get("error")
+
+    def name_of(pid: str) -> str:
+        return names.get(pid) or pid
+
+    def part(key: str, label: str, policy: str, status: str, cause: str, disk: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not policies_read:
+            offered, check = None, "unknown"
+        elif not policy:
+            offered, check = False, "fail"
+        elif allowed is None:
+            offered, check = None, "unknown"
+        else:
+            offered = policy in set(allowed)
+            check = "pass" if offered else "fail"
+        if not isinstance(comp, dict):
+            compliance = "unknown"
+        elif status in ("COMPLIANT", "NOT_APPLICABLE"):
+            compliance = "pass"
+        elif status in _COMPLIANCE_UNKNOWN:
+            compliance = "unknown"
+        else:
+            compliance = "fail"
+        return {"key": key, "label": label, "policy": policy, "policy_name": name_of(policy) if policy else "",
+                "offered": offered, "policy_check": check, "status": status, "compliance": compliance, "cause": cause,
+                "datastore": (disk or {}).get("datastore", ""), "backing": (disk or {}).get("backing", ""),
+                "capacity_gb": (disk or {}).get("capacity_gb")}
+
+    comp_d = comp if isinstance(comp, dict) else {}
+    disks_comp = comp_d.get("disks") if isinstance(comp_d.get("disks"), dict) else {}
+    disks_pol = (attached or {}).get("disks") if policies_read and isinstance((attached or {}).get("disks"), dict) else {}
+    disk_info = facts.get("disks") if isinstance(facts.get("disks"), dict) else {}
+    parts = [part("home", "VM home", (attached or {}).get("vm_home", "") if policies_read else "",
+                  comp_d.get("vm_home_status", ""), comp_d.get("vm_home_cause", ""), None)]
+    for d in sorted(set(disk_ids) | set(str(k) for k in disks_pol)):
+        info = disk_info.get(d) or {}
+        dc = disks_comp.get(d) if isinstance(disks_comp.get(d), dict) else {}
+        parts.append(part(d, info.get("label") or "Disk " + d, disks_pol.get(d, "") if policies_read else "",
+                          dc.get("status", ""), dc.get("failure_cause", ""), info))
+
+    comp_ok = storage_compliance_ok(comp)
+    comp_overall = (comp_d.get("overall") if comp_d else "") or ""
+    comp_known_bad = comp is not None and not comp_ok and comp_overall not in _COMPLIANCE_UNKNOWN
+    issues: List[str] = []
+    if not comp_ok:
+        issues.append("vCenter compliance: " + storage_compliance_reason(comp))
+    issues.extend(f["text"] for f in found if f["code"] != "offers")
+    offers = [{"id": p, "name": name_of(p), "limit": limits.get(p)} for p in sorted(allowed or [])]
+    if comp_known_bad or any(f["code"] in ("home_none", "home_wrong", "disk_none", "disk_wrong") for f in found):
+        verdict = "fail"
+    elif not namespace and policies_read and comp_ok:
+        verdict = "no_target"
+    elif not comp_ok or found:
+        verdict = "unknown"
+    else:
+        verdict = "pass"
+    return {"verdict": verdict, "namespace": namespace, "ns_source": ns_source if namespace else "",
+            "offers": offers, "offers_known": allowed is not None, "parts": parts, "issues": issues,
+            "disks_read": "disks" in facts, "provisioned": None}
+
+
 def storage_policy_report(store: st.Store) -> List[str]:
     """Discover-log lines: queued VMs whose storage policy does not fit their
     target namespace -- the same verdict engine.eligible() applies at precheck

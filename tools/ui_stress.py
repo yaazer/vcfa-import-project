@@ -280,6 +280,47 @@ const SCENARIOS = {
     check('select page never broke', !brokeView());
   },
 
+  async storage() {
+    // Select shows every VM's storage policy against its namespace: a column, a summary, a filter, and the
+    // disk-by-disk reason one click away -- not only a line in the discover log.
+    await open('select');
+    const d = (await GET('/api/discovered')).vms;
+    const by = (n) => d.find((v) => v.name === n);
+    check('every VM carries a storage breakdown', d.every((v) => v.storage && v.storage.parts && v.storage.parts.length));
+    check('some VMs pass', d.some((v) => v.storage_verdict === 'pass'));
+    const nc = by('app-004'), wrong = by('db-002');
+    check('a VM vCenter calls non compliant fails, whatever the namespace', nc && nc.storage_verdict === 'fail', nc && nc.storage_verdict);
+    check('a VM on a policy its namespace does not offer fails', wrong && wrong.storage_verdict === 'fail', wrong && wrong.storage_verdict);
+    check('the column and the summary bar are on the page', document.querySelector('#view th') && /Storage/.test(document.querySelector('#view thead').textContent) && document.querySelector('#view .storagebar'));
+    check('the summary counts failures', /fail/.test(document.querySelector('#view .storagebar').textContent));
+    const filt = document.querySelector('select[data-k="storage"]');
+    check('there is a storage filter', filt);
+    filt.value = 'fail'; filt.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => [...document.querySelectorAll('#view tbody .stag')].every((b) => /fail/.test(b.textContent)));
+    const tags = [...document.querySelectorAll('#view tbody .stag')];
+    check('the filter lists only failing VMs', tags.length >= 3 && tags.every((b) => /fail/.test(b.textContent)), tags.length);
+    type('#sel-q', 'app-004');
+    const rowTag = (name) => { const tr = [...document.querySelectorAll('#view tbody tr:not(.subrow)')].find((r) => r.querySelector('.vm-name') && r.querySelector('.vm-name').childNodes[0].textContent.trim() === name); return tr && tr.querySelector('.stag'); };
+    const tag = await waitFor(() => rowTag('app-004'), 4000);
+    check('a failing VM shows its first reason under the tag', tag && tag.closest('td').querySelector('.stag-why') && tag.closest('td').querySelector('.stag-why').textContent.length > 5);
+    tag.click();
+    const sub = await waitFor(() => document.querySelector('#view tr.subrow'), 3000);
+    check('clicking the tag opens the disk-by-disk detail', sub && /Hard disk 1/.test(sub.textContent) && /VM home/.test(sub.textContent));
+    check('the detail shows the vCenter cause for the failing disk', sub && /Space Efficiency/.test(sub.textContent), sub && sub.textContent.slice(0, 300));
+    check('the detail names the datastore', sub && /vsanDatastore|DS2-Thick/.test(sub.textContent));
+    check('the detail says where the target namespace came from, or that there is none yet', sub && /Target namespace:\s*(\S+ from (maps|queue|set in Select)|none yet)/.test(sub.textContent), sub && sub.textContent.slice(0, 200));
+    type('#sel-q', 'db-002');
+    const t2 = await waitFor(() => rowTag('db-002'), 4000);
+    t2 && t2.click();
+    const sub2 = await waitFor(() => [...document.querySelectorAll('#view tr.subrow')].find((r) => /Bronze/.test(r.textContent)), 3000);
+    check('a queued VM names its target namespace and what it offers', sub2 && /Target namespace:/.test(sub2.textContent) && /offers:/.test(sub2.textContent) && /Gold/.test(sub2.textContent), sub2 && sub2.textContent.slice(0, 250));
+    check('a wrong-policy disk says the policy and that the namespace does not offer it', sub2 && /Bronze/.test(sub2.textContent) && /not offered/.test(sub2.textContent), sub2 && sub2.textContent.slice(0, 300));
+    check('the policies each namespace offers are listed, with limits', /Storage policies each namespace offers/.test(document.querySelector('#view').textContent) && /Gold/.test(document.querySelector('#view').textContent) && /GiB/.test(document.querySelector('#view').textContent));
+    check('nothing is injected by the storage column', noInjection());
+    type('#sel-q', '');
+    filt.value = ''; filt.dispatchEvent(new Event('change', { bubbles: true }));
+  },
+
   async stage() {
     await open('stage');
     const recs = () => S.view.preview.records;
@@ -1465,6 +1506,8 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
     # Two real VMs on a storage policy their namespace does not offer: held back from precheck with a reason
     # (the fake reads the same wrong policy on every discover, so another scenario's discover keeps them held).
     os.environ["FAKE_VC_WRONG_POLICY_VMS"] = HELD_VMS
+    # One DMZ VM (never queued by the seed) that vCenter calls non compliant on its disk, with a cause.
+    os.environ["FAKE_VC_NONCOMPLIANT_VMS"] = "app-004"
     vc_server, vc_port = fake_vcenter.serve(count=vms)
     env = demo.setup(tmp, vc_port, scenario, batch_size=8 if vms < 1000 else 25)
     os.environ.update(env)
@@ -1573,7 +1616,7 @@ def run_chrome(chrome, url, profile, size, budget):
     return json.loads(html.unescape(m.group(1)))
 
 
-SCENARIOS = ["pages", "hostile", "select", "stage", "waves", "drawers", "execute",
+SCENARIOS = ["pages", "hostile", "select", "storage", "stage", "waves", "drawers", "execute",
              "resilience", "token", "signin", "theme", "palette", "stream", "govern", "help", "flow", "reset", "terms"]
 
 

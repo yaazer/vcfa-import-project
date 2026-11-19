@@ -1525,6 +1525,23 @@ uses:
   record per VM and cause (`vcfaimport/eligibility.py`), so the pages cannot
   disagree. `readiness` flags a home or disk with no policy
   (`storage_policy_missing`).
+- **Select VMs shows the check for every VM, before anything is queued.** A
+  **Storage** column tags each VM *pass*, *fail*, *unknown* or *no target yet*
+  (with the first reason under a failing tag); a summary bar counts the selected
+  VMs by verdict and **Show them** filters to the ones that will be held back;
+  a **Storage** filter does the same by verdict. Click a tag for the VM
+  disk by disk: its policy, whether the target namespace offers it, vCenter's
+  own compliance status and cause for that part (this is where a thin disk under
+  a thick-provisioning rule, or a wrong datastore, shows up), and the datastore
+  and size from the VMDK. A section below lists each namespace with the policies
+  it offers and their limits, and how many selected VMs aimed at it pass or fail;
+  **Read from vCenter** refreshes it. The target namespace is the queued one, else
+  the one set in Select, else what the saved maps would assign (it says which);
+  with none it reads *no target yet*, never a guess. Pass means exactly what the
+  gate lets through (`service.storage_breakdown`, tested against the engine).
+  vCenter's REST API reports no per-disk thin/thick flag, so the tool shows
+  vCenter's verdict and cause rather than the provisioning setting itself.
+  A VM discovered before this release has no datastore detail: Discover again.
 - **"Namespace's storage policies unknown"** means the tool has not read what
   that namespace offers: discover reads the namespaces vCenter lists plus the
   ones the queue targets, so a namespace staged after the last discover (or

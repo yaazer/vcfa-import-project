@@ -151,8 +151,11 @@ def build_inventory(count: int, seed: int = 7) -> Dict[str, Any]:
                 "host": "host-{}".format(10 + (i % 4)),
                 "nics": nics,
                 "hardware": {"version": "VMX_08" if i % 23 == 0 else "VMX_19"},
-                "disks": dict({"2000": {"backing": {"type": "VMDK_FILE"}}},
-                              **({"2001": {"backing": {"type": "RDM"}}} if i % 17 == 0 else {})),
+                "disks": dict({"2000": {"label": "Hard disk 1", "capacity": (20 + 10 * (i % 4)) * 1024 ** 3,
+                                         "backing": {"type": "VMDK_FILE", "vmdk_file": "[{}] vm-{}/disk1.vmdk".format(
+                                             ["vsanDatastore", "DS2-Thick"][i % 2], i)}}},
+                              **({"2001": {"label": "Hard disk 2", "backing": {"type": "RDM"}}}
+                                 if i % 17 == 0 else {})),
                 "cdroms": {"3000": {"state": "CONNECTED" if i % 13 == 0 else "NOT_CONNECTED",
                                     "backing": {"type": "ISO_FILE" if i % 13 == 0 else "CLIENT_DEVICE"}}},
             },
@@ -202,6 +205,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         overall = {"noncompliant": "NON_COMPLIANT", "outofdate": "OUT_OF_DATE",
                   "unknown": "UNKNOWN_COMPLIANCE"}.get(mode, "COMPLIANT")
+        # FAKE_VC_NONCOMPLIANT_VMS="web-005": those VMs (by name) fail their policy on disk 2000 only, with a
+        # cause and a healthy home -- the shape a thin disk under a thick-provisioning policy would have.
+        if vm.get("name") in [n.strip() for n in os.environ.get("FAKE_VC_NONCOMPLIANT_VMS", "").split(",") if n.strip()]:
+            self._send(200, {"overall_compliance": "NON_COMPLIANT", "vm_home": {"status": "COMPLIANT"},
+                             "disks": {"2000": {"status": "NON_COMPLIANT", "failure_cause": [
+                                 {"id": "com.vmware.spbm.fake", "args": [],
+                                  "default_message": STORAGE_COMPLIANCE_CAUSE["NON_COMPLIANT"]}]}}})
+            return
         disk_info = {"status": overall}
         cause = STORAGE_COMPLIANCE_CAUSE.get(overall)
         if cause:
