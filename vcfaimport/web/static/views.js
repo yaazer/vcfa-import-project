@@ -1744,52 +1744,185 @@ VIEWS.batches = view({
   },
 });
 
-// ================================================================= ACTIVITY
-// One pane for "what is it doing, and why is it stuck?": a verdict with the signals
-// behind it (service.activity_now), everything that led here as one timeline -- jobs,
-// events, and state changes grouped by batch (service.activity_timeline) -- and the
-// log of the job you pick. Exports sit at the foot.
+// ===================================================================== PANE
+// The Activity pane: a column of the page, right of the stage you are working on, never a
+// floating window. It merges what used to be the log dock and the Activity page:
+//   Log       the followed job's live log (job picker, filter, problems only, Stop)
+//   Timeline  a verdict with the signals behind it (service.activity_now), everything that led
+//             here as one stream -- jobs, events, state changes by batch -- and the exports
+// It collapses to a thin rail (state kept per browser); a new job never opens a collapsed pane.
+// `#/activity` is kept for old links: it opens the pane and stays on the page you were on.
 const TL_KINDS = [['all', 'All'], ['problems', 'Problems'], ['job', 'Jobs'], ['change', 'State changes'], ['event', 'Events']];
-VIEWS.activity = view({
-  title: 'Activity & logs', sub: 'What is happening now, why it may be stuck, and everything that led here', live: true,
-  init(v, p) {
-    v.jobId = p.job || null; v.scope = p.scope || null;
-    v.kind = p.kind || 'all'; v.q = ''; v.filter = ''; v.errOnly = false; v.open = new Set(); v.follow = true;
-  },
-  async load(v) {
-    const d = await GET('/api/activity?' + qs({ job: v.jobId || '', scope: v.scope || '' }));
-    v.d = d;
-    const logId = v.jobId || d.active || (d.jobs[0] && d.jobs[0].id) || null;
-    if (logId) {
-      const same = v.job && v.job.id === logId && v.job.status !== 'running';
-      if (!same) v.job = await GET('/api/jobs/' + encodeURIComponent(logId));
-    } else v.job = null;
-  },
-  paint(v) {
-    const d = v.d;
-    return html`${nowPanel(v)}
-      <div class="act-split">${timelineCard(v)}${logCard(v)}</div>
-      <div class="act-exports"><span class="lbl">Exports</span>
-        ${[['tracker.csv', 'One row per VM: source facts, target, batches and timings'], ['transitions.csv', 'Every state change of every VM'],
-          ['ledger.jsonl', 'The append-only ledger, for a SIEM or a change record'], ['report.html', 'A standalone progress report']]
-          .map(([f, hint]) => html`<a class="btn xs ghost" href="${exportUrl(f)}" download="${f}" title="${hint}">${icon('download')} ${f}</a>`)}
-        <span class="tiny faint mono ellipsis" title="${d.ledger_path}">ledger: ${d.ledger_path}</span></div>`;
-  },
-  after(v) { const log = $('#act-log'); if (log && v.follow) log.scrollTop = log.scrollHeight; },
-  act: {
-    pickJob(t, e, v) { v.jobId = t.value || t.dataset.id || null; v.scope = null; v.job = null; v.follow = true; v.refresh(); },
-    scope(t, e, v) { v.scope = t.dataset.k; v.refresh(); },
-    kind(t, e, v) { v.kind = t.dataset.k; v.render(); },
-    tlq: debounce((t, e, v) => { v.q = t.value; v.render(); }, 150),
-    tlOpen(t, e, v) { const k = t.dataset.k; if (v.open.has(k)) v.open.delete(k); else v.open.add(k); v.render(); },
-    logFilter: debounce((t, e, v) => { v.filter = t.value; v.follow = false; v.render(); }, 150),
-    errOnly(t, e, v) { v.errOnly = t.checked; v.render(); },
-    follow(t) { followJob(t.dataset.id, true); },
-    watch: () => startJob('watch', {}),
-  },
-});
+const PA = { d: null, err: null, kind: 'all', q: '', open: new Set(), scope: null, jobId: null, loading: false, loadedAt: 0, sig: '' };
+
+VIEWS.activity = { title: 'Activity & logs', act: {}, enter: async () => {} };   // route() intercepts it (parseHash needs it to exist)
+
+async function paneLoad() {
+  if (PA.loading) { PA.again = true; return; }   // a request arrived mid-load (a scope click): load once more after
+  PA.loading = true;
+  try { PA.d = await GET('/api/activity?' + qs({ job: PA.jobId || '', scope: PA.scope || '' })); PA.err = null; PA.loadedAt = Date.now(); }
+  catch (e) { PA.err = e; PA.loadedAt = Date.now(); }
+  finally { PA.loading = false; }
+  if (!D.id && PA.d && PA.d.jobs.length) followJob(PA.d.jobs[0].id, false);   // a fresh page: show the latest job's log
+  renderPane(false);
+  if (PA.again) { PA.again = false; paneLoad(); }
+}
+function paneRefresh() { if (PN.open) paneLoad(); }
+function paneOnPulse(p) {
+  if (!PN.open) return;
+  const sig = JSON.stringify([p.counts, p.live_batches, p.job && p.job.id]);
+  const age = Date.now() - PA.loadedAt;
+  if (PN.tab === 'timeline' && (((sig !== PA.sig || p.job) && age > 2500) || age > 15000)) paneLoad();
+  PA.sig = sig;
+}
+function paneSet(open, tab) {
+  PN.open = open;
+  if (tab) PN.tab = tab;
+  savePane();
+  renderNav();
+  renderPane(true);
+  if (open) paneLoad();
+}
+function paneToggle() { paneSet(!PN.open); }
+function paneShowJob(id) { followJob(id, false); paneSet(true, 'log'); }
+function paneOpen(tab, params) {
+  params = params || {};
+  if (params.scope) PA.scope = params.scope;
+  if (params.job) { PA.jobId = params.job; followJob(params.job, false); }
+  paneSet(true, tab === 'log' ? 'log' : 'timeline');
+}
 
 const LVL_ICON = { ok: 'check', info: 'info', warn: 'triage', bad: 'x' };
+const paneVisible = (lines) => D.errOnly ? lines.filter(([, , t]) => ['bad', 'warn'].includes(lineClass(t))) : lines;
+
+function paneHead() {
+  const running = D.job && D.job.status === 'running';
+  const probs = PA.d ? PA.d.timeline.filter((e) => e.level === 'bad' || e.level === 'warn').length : 0;
+  return html`<div class="tabs pane-tabs" role="tablist">
+      <button type="button" role="tab" class="${PN.tab === 'log' ? 'on' : ''}" data-act="paneTab" data-k="log" aria-selected="${PN.tab === 'log' ? 'true' : 'false'}">Log${running ? html` <span class="spinner"></span>` : ''}</button>
+      <button type="button" role="tab" class="${PN.tab === 'timeline' ? 'on' : ''}" data-act="paneTab" data-k="timeline" aria-selected="${PN.tab === 'timeline' ? 'true' : 'false'}">Timeline${probs ? html` <span class="n bad-text">${n(probs)}</span>` : ''}</button></div>
+    <span class="grow"></span>
+    <button type="button" class="btn ghost sm" data-act="paneWide" title="${PN.wide ? 'Back to the narrow pane' : 'Make the pane wider'}">${PN.wide ? 'Narrower' : 'Wider'}</button>
+    <button type="button" class="btn ghost icon sm" data-act="togglePane" aria-label="Collapse the Activity pane" title="Collapse (it stays on the rail)">${icon('chevron')}</button>`;
+}
+function paneRail() {
+  const j = D.job;
+  return html`<button type="button" class="rail" data-act="togglePane" aria-label="Open the Activity pane" title="Open the Activity pane${j ? ' · ' + j.title + ' ' + jobWord(j) : ''}">
+      <span class="rail-ic">${icon('left')}</span>
+      ${j ? statusIcon(j.status) : html`<span class="status-ic">${icon('activity')}</span>`}
+      <span class="rail-t">Activity &amp; logs</span></button>`;
+}
+function paneJobStrip() {
+  const j = D.job;
+  const prog = j && j.progress;
+  return html`<div class="pj-top">${statusIcon(j ? j.status : 'running')}
+      <span class="t" title="${j ? j.title : ''}">${j ? j.title : 'Starting…'}</span>
+      ${j && j.stoppable ? html`<button class="btn xs danger-ghost" data-act="stopJob" data-id="${j.id}" ${attr(j.stop_requested, 'disabled')}>${icon('stop')} ${j.stop_requested ? 'Stopping…' : 'Stop'}</button>` : ''}</div>
+    <div class="pj-meta">${j ? html`<span>${jobWord(j)} · ${fmtDur(elapsed(j))}</span><span>${n(j.lines)} lines · started ${fmtTime(j.started_at)}</span>` : ''}</div>
+    ${j && j.status === 'running'
+      ? (prog ? html`<div class="pj-prog"><div class="progress"><span style="width:${pct(prog.done, prog.total)}"></span></div><span class="small muted">${n(prog.done)}/${n(prog.total)} ${prog.label}</span></div>`
+        : html`<div class="progress indet"><span></span></div>`) : ''}
+    ${j && j.error ? html`<div class="pj-err bad-text small">${j.error}</div>` : ''}`;
+}
+function paneJobSelect() {
+  const jobs = PA.d ? PA.d.jobs.slice() : [];
+  if (D.job && !jobs.some((x) => x.id === D.job.id)) jobs.unshift(D.job);
+  if (!jobs.length) return '';
+  return html`<select class="select sm" id="pane-jobsel" data-change="paneJob" aria-label="Job log to show">${jobs.map((x) => html`<option value="${x.id}" ${attr(x.id === D.id, 'selected')}>${fmtTime(x.started_at)} · ${x.title} · ${jobWord(x)}</option>`)}</select>`;
+}
+function paneLogTab() {
+  if (!D.id) {
+    return html`<div class="pane-empty">${emptyState('terminal', 'No job yet', 'Every discovery, preflight, precheck, import and rollback started from the console is logged here, and kept under <workdir>/jobs.')}
+      <div class="pane-sel" id="pane-sel">${paneJobSelect()}</div></div>`;
+  }
+  const lines = paneVisible(D.lines);
+  return html`<div class="pj" id="pane-job">${paneJobStrip()}</div>
+    <div class="pj-tools"><div class="pane-sel" id="pane-sel">${paneJobSelect()}</div>
+      <div class="search grow">${icon('search')}<input class="input sm" id="pane-filter" placeholder="Filter lines" value="${D.filter}" data-input="paneFilter"></div>
+      <label class="check small"><input type="checkbox" data-change="paneErrOnly" ${attr(D.errOnly, 'checked')}> Problems only</label>
+      <span class="small muted" id="pane-count">${plural(lines.length, 'line')}</span></div>
+    <div class="log" id="pane-log">${logLines(lines, D.filter)}</div>`;
+}
+function paneTimelineTab() {
+  const v = PA;
+  if (!v.d) return v.err ? errorBox(v.err) : html`<div class="boot">Loading…</div>`;
+  const d = v.d;
+  return html`${nowPanel(v)}${timelineCard(v)}
+    <div class="act-exports"><span class="lbl">Exports</span>
+      ${[['tracker.csv', 'One row per VM: source facts, target, batches and timings'], ['transitions.csv', 'Every state change of every VM'],
+        ['ledger.jsonl', 'The append-only ledger, for a SIEM or a change record'], ['report.html', 'A standalone progress report']]
+        .map(([f, hint]) => html`<a class="btn xs ghost" href="${exportUrl(f)}" download="${f}" title="${hint}">${icon('download')} ${f}</a>`)}
+      <span class="tiny faint mono ellipsis" title="${d.ledger_path}">ledger: ${d.ledger_path}</span></div>`;
+}
+
+// full: rebuild the structure; otherwise a poll or a data refresh: touch only what changed.
+function renderPane(full, fresh) {
+  const root = $('#pane');
+  if (!root || S.gated) return;
+  const running = !!(D.job && D.job.status === 'running');
+  root.classList.toggle('collapsed', !PN.open);
+  root.classList.toggle('wide', PN.open && PN.wide);
+  root.classList.toggle('live', running);
+  // Only when the layout state changes (this runs on every log poll, and reading a width forces a layout):
+  // the topbar compacts while the pane takes room, and toasts sit left of it rather than over its tabs.
+  const lay = (PN.open ? (PN.wide ? 'wide' : 'open') : 'rail') + '|' + window.innerWidth;
+  if (renderPane.lay !== lay) {
+    renderPane.lay = lay;
+    document.body.dataset.pane = lay.split('|')[0];
+    document.documentElement.style.setProperty('--pane-w', getComputedStyle(root).position === 'sticky' ? root.offsetWidth + 'px' : '0px');
+  }
+  if (!PN.open) {
+    if (root.dataset.mode !== 'rail' || full) { root.dataset.mode = 'rail'; root.innerHTML = fmt(paneRail()); root.__markup = null; }
+    else mount(root, paneRail());
+    return;
+  }
+  if (root.dataset.mode !== 'open') {
+    root.dataset.mode = 'open';
+    root.innerHTML = '<div class="pane-h" id="pane-head"></div><div class="pane-b" id="pane-body"></div>';
+    full = true;
+  }
+  mount($('#pane-head'), paneHead());
+  const body = $('#pane-body');
+  if (PN.tab === 'log') {
+    const log = $('#pane-log');
+    if (full || !log || body.dataset.tab !== 'log') {
+      body.dataset.tab = 'log';
+      body.innerHTML = fmt(paneLogTab());
+      body.__markup = null;
+      const l = $('#pane-log');
+      if (l) l.scrollTop = l.scrollHeight;
+      return;
+    }
+    mount($('#pane-job'), paneJobStrip());
+    mount($('#pane-sel'), paneJobSelect());
+    if (fresh && fresh.length) {
+      const vis = paneVisible(fresh);
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      if (vis.length) log.insertAdjacentHTML('beforeend', fmt(logLines(vis, D.filter)));
+      if (atBottom) log.scrollTop = log.scrollHeight;
+      const c = $('#pane-count');
+      if (c) c.textContent = plural(paneVisible(D.lines).length, 'line');
+    }
+    return;
+  }
+  if (body.dataset.tab !== 'timeline') { body.dataset.tab = 'timeline'; body.innerHTML = ''; body.__markup = null; }
+  mount(body, paneTimelineTab());
+}
+
+Object.assign(GLOBAL_ACT, {
+  paneTab(t) { PN.tab = t.dataset.k === 'timeline' ? 'timeline' : 'log'; savePane(); renderPane(true); if (PN.tab === 'timeline') paneLoad(); },
+  paneWide() { PN.wide = !PN.wide; savePane(); renderPane(true); },
+  paneJob(t) { if (t.value) followJob(t.value, true); },
+  paneFilter: debounce((t) => { D.filter = t.value; const log = $('#pane-log'); if (log) { mount(log, logLines(paneVisible(D.lines), D.filter)); log.scrollTop = log.scrollHeight; } }, 150),
+  paneErrOnly(t) { D.errOnly = t.checked; renderPane(true); },
+  panePick(t) { PA.jobId = t.dataset.id || null; PA.scope = null; followJob(PA.jobId, true); paneLoad(); },
+  paneScope(t) { PA.scope = t.dataset.k; paneLoad(); },
+  paneKind(t) { PA.kind = t.dataset.k; renderPane(false); },
+  paneQ: debounce((t) => { PA.q = t.value; renderPane(false); }, 150),
+  paneRow(t) { const k = t.dataset.k; if (PA.open.has(k)) PA.open.delete(k); else PA.open.add(k); renderPane(false); },
+  paneWatch: () => startJob('watch', {}),
+});
+
 function nowPanel(v) {
   const now = v.d.now, vd = now.verdict;
   const job = v.d.active ? v.d.jobs.find((j) => j.id === v.d.active) : null;
@@ -1816,8 +1949,8 @@ function sigAction(a) {
   if (!a) return '';
   if (a.go) return html`<button class="btn xs" data-act="go" data-to="${a.go}">${a.label}</button>`;
   if (a.batch) return html`<button class="btn xs" data-act="batch" data-ns="${a.ns}" data-name="${a.batch}">${a.label}</button>`;
-  if (a.job) return html`<button class="btn xs" data-act="pickJob" data-id="${a.job}">${a.label}</button>`;
-  if (a.act) return html`<button class="btn xs primary" data-act="${a.act}">${a.label}</button>`;
+  if (a.job) return html`<button class="btn xs" data-act="panePick" data-id="${a.job}">${a.label}</button>`;
+  if (a.act) return html`<button class="btn xs primary" data-act="${a.act === 'watch' ? 'paneWatch' : a.act}">${a.label}</button>`;
   return '';
 }
 
@@ -1831,9 +1964,9 @@ function timelineCard(v) {
   const scopes = [['job', 'This job', !picked], ['day', 'Last 24 h'], ['all', 'Everything']];
   return html`<div class="card tl-card"><div class="card-h"><h3>Timeline</h3>
       <span class="sub">${d.scope === 'job' && picked ? picked.title : d.scope === 'day' ? 'last 24 hours' : 'everything'} · newest first</span>
-      <div class="tools"><div class="seg">${scopes.map(([k, l, off]) => html`<button class="${d.scope === k ? 'on' : ''}" data-act="scope" data-k="${k}" ${attr(!!off, 'disabled')}>${l}</button>`)}</div></div></div>
-    <div class="toolbar"><div class="chips">${TL_KINDS.map(([k, l]) => html`<span class="chip ${v.kind === k ? 'on' : ''}" data-act="kind" data-k="${k}">${l} <span class="n">${n(count(k))}</span></span>`)}</div>
-      <div class="search grow">${icon('search')}<input class="input sm" id="tl-q" placeholder="Search VMs, batches, messages" value="${v.q}" data-input="tlq"></div></div>
+      <div class="tools"><div class="seg">${scopes.map(([k, l, off]) => html`<button class="${d.scope === k ? 'on' : ''}" data-act="paneScope" data-k="${k}" ${attr(!!off, 'disabled')}>${l}</button>`)}</div></div></div>
+    <div class="toolbar"><div class="chips">${TL_KINDS.map(([k, l]) => html`<span class="chip ${v.kind === k ? 'on' : ''}" data-act="paneKind" data-k="${k}">${l} <span class="n">${n(count(k))}</span></span>`)}</div>
+      <div class="search grow">${icon('search')}<input class="input sm" id="tl-q" placeholder="Search VMs, batches, messages" value="${v.q}" data-input="paneQ"></div></div>
     <div class="act-tl" id="act-tl" data-scroll="acttl">${rows.length ? rows.map((e) => tlRow(v, e))
       : html`<div class="card-b small muted">Nothing ${v.kind === 'all' ? '' : 'of this kind '}in this window.${d.scope !== 'all' ? ' Widen it with Everything.' : ''}</div>`}</div>
     ${d.timeline.length >= 300 ? html`<div class="card-f tiny faint">The newest 300 entries. Pick a job to narrow the window.</div>` : ''}</div>`;
@@ -1847,7 +1980,7 @@ function tlRow(v, e) {
     const open = v.open.has(k);
     return html`<div class="tl-row lvl-${e.level}">${when}<span class="tl-ic">${icon('arrow')}</span>
       <div class="grow"><div class="tl-t">${e.count === 1 ? html`<a data-act="vm" data-moref="${first.moref}">${first.name || first.moref}</a>`
-        : html`<a data-act="tlOpen" data-k="${k}">${plural(e.count, 'VM')} ${open ? '▴' : '▾'}</a>`}
+        : html`<a data-act="paneRow" data-k="${k}">${plural(e.count, 'VM')} ${open ? '▴' : '▾'}</a>`}
         <span class="faint">${e.from ? label(e.from) : 'queued'} →</span> <b>${label(e.to)}</b></div>
         <div class="tl-m">${tlLinks([e.stage, e.batch ? html`<a class="mono" data-act="batch" data-ns="${e.ns || ''}" data-name="${e.batch}">${e.batch}</a>` : '',
           e.actor && e.actor !== 'owner' ? e.actor : ''])}</div>
@@ -1860,22 +1993,7 @@ function tlRow(v, e) {
         <div class="tl-m">${tlLinks([e.moref ? html`<a data-act="vm" data-moref="${e.moref}">${e.moref}</a>` : '',
           e.batch ? html`<a class="mono" data-act="batch" data-ns="${e.ns || ''}" data-name="${e.batch}">${e.batch}</a>` : '', e.actor && e.actor !== 'owner' ? e.actor : ''])}</div></div></div>`;
   }
-  return html`<div class="tl-row tl-job lvl-${e.level} ${v.d.job === e.job ? 'on' : ''}" data-act="pickJob" data-id="${e.job}" title="Show this job's log, and only what happened during it">
+  return html`<div class="tl-row tl-job lvl-${e.level} ${v.d.job === e.job ? 'on' : ''}" data-act="panePick" data-id="${e.job}" title="Show this job's log, and only what happened during it">
     ${when}<span class="tl-ic">${icon('terminal')}</span>
     <div class="grow"><div class="tl-t"><b>${e.title}</b></div>${e.detail ? html`<div class="tl-msg bad-text">${e.detail}</div>` : ''}</div><span class="tiny faint">log</span></div>`;
-}
-
-function logCard(v) {
-  const j = v.job, d = v.d;
-  if (!d.jobs.length) return html`<div class="card log-card">${emptyState('terminal', 'No jobs yet', 'Every discovery, preflight, precheck, import and rollback started from the console is logged here, and kept under <workdir>/jobs.')}</div>`;
-  let lines = j ? j.log : [];
-  if (v.errOnly) lines = lines.filter(([, , t]) => ['bad', 'warn'].includes(lineClass(t)));
-  return html`<div class="card log-card"><div class="card-h">${j ? statusIcon(j.status) : ''}
-      <select class="select sm grow" data-change="pickJob" aria-label="Job log to show">${d.jobs.map((x) => html`<option value="${x.id}" ${attr(!!j && x.id === j.id, 'selected')}>${fmtTime(x.started_at)} · ${x.title} · ${jobWord(x)}</option>`)}</select>
-      ${j && j.status === 'running' ? html`<button class="btn xs" data-act="follow" data-id="${j.id}" title="Follow it in the dock on every page">Dock</button>` : ''}</div>
-    ${j ? html`<div class="toolbar small"><span class="muted">${jobWord(j)} · ${fmtDur(elapsed(j))} · by ${j.user || 'owner'}</span>${j.error ? html`<span class="bad-text ellipsis" title="${j.error}">${j.error}</span>` : ''}</div>
-    <div class="toolbar"><div class="search grow">${icon('search')}<input class="input sm" id="act-filter" placeholder="Filter lines" value="${v.filter}" data-input="logFilter"></div>
-      <label class="check small"><input type="checkbox" data-change="errOnly" ${attr(v.errOnly, 'checked')}> Problems only</label>
-      <span class="small muted">${plural(lines.length, 'line')}</span></div>
-    <div class="log" id="act-log" data-scroll="actlog">${logLines(lines, v.filter)}</div>` : ''}</div>`;
 }

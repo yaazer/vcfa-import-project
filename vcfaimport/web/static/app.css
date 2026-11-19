@@ -68,7 +68,7 @@ body::after { content: ""; position: fixed; inset: 0; z-index: 90; pointer-event
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
 
 /* ---------------------------------------------------------------- shell */
-.app { position: relative; z-index: 1; display: grid; grid-template-columns: 252px minmax(0, 1fr); min-height: 100vh; }
+.app { position: relative; z-index: 1; display: grid; grid-template-columns: 252px minmax(0, 1fr) auto; min-height: 100vh; }
 .sidebar { position: sticky; top: 12px; margin: 12px 0 12px 12px; height: calc(100vh - 24px); display: flex; flex-direction: column;
   background: var(--glass); border: 1px solid var(--line); border-radius: 24px;
   backdrop-filter: blur(26px) saturate(170%); -webkit-backdrop-filter: blur(26px) saturate(170%); box-shadow: var(--shadow); }
@@ -142,7 +142,12 @@ html[data-theme="dark"] .appicon { --ai-edge: rgba(255, 255, 255, .22); }
   background: linear-gradient(90deg, transparent, var(--mood), var(--accent-2), transparent); opacity: calc(.35 + var(--aura) * .6);
   background-size: 200% 100%; }
 body[data-busy] .topbar::after { animation: scan 2.4s linear infinite; opacity: .95; }
-.topbar h1 { font-size: 23px; font-weight: 700; letter-spacing: -.025em; }
+.topbar h1 { font-size: 23px; font-weight: 700; letter-spacing: -.025em; white-space: nowrap; }
+.topbar > div:first-child { flex: 1 1 160px; min-width: 0; }
+.topbar .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* the Activity pane takes width from the page: the topbar keeps what matters (it has no container to ask) */
+@media (max-width: 1750px) { body[data-pane="open"] .topbar { padding-left: 18px; padding-right: 18px; gap: 8px; } body[data-pane="open"] .ctxchip[data-tip="context"] { display: none; } }
+@media (max-width: 2000px) { body[data-pane="wide"] .topbar { padding-left: 18px; padding-right: 18px; gap: 8px; } body[data-pane="wide"] .ctxchip[data-tip="context"] { display: none; } }
 .topbar .sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
 .topbar .spacer { flex: 1; }
 .offline { position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 10px; margin: 12px 30px 0; padding: 10px 16px;
@@ -150,7 +155,7 @@ body[data-busy] .topbar::after { animation: scan 2.4s linear infinite; opacity: 
   border: 1px solid color-mix(in oklab, var(--warn) 35%, transparent); font-size: 13px; font-weight: 600;
   box-shadow: 0 0 30px -8px color-mix(in oklab, var(--warn) 50%, transparent); }
 .offline .spinner { color: var(--warn); }
-.view { padding: 8px 30px 130px; outline: none; max-width: 1520px; width: 100%; }
+.view { padding: 8px 30px 40px; outline: none; max-width: 1520px; width: 100%; }
 
 /* page entrance: only on navigation (fx.js sets data-enter), never on live refresh */
 .view[data-enter] > *, .view[data-enter] .kpis > *, .view[data-enter] .grid > *, .view[data-enter] .steps > * {
@@ -384,7 +389,8 @@ table.t input.input { width: 100%; }
   background: linear-gradient(90deg, color-mix(in oklab, var(--accent) 13%, transparent), transparent);
   border-bottom: 1px solid color-mix(in oklab, var(--accent) 22%, transparent); }
 .bulkbar b { color: var(--accent); }
-.stickybar { position: sticky; bottom: 76px; z-index: 5; margin-top: 18px; }
+.stickybar { position: sticky; bottom: 12px; z-index: 5; margin-top: 18px; }   /* the unsaved-changes bar */
+.stickybar.flow-next { position: static; }   /* the way to the next stage: in the page flow, never floating over it */
 .callout.stickybar { background: var(--glass-strong) !important; }
 
 /* ---------------------------------------------------------- held back (why a VM is not eligible) */
@@ -509,18 +515,60 @@ table.t input.input { width: 100%; }
 .log .dim { color: oklch(0.6 0.02 var(--hb)); }
 .log mark { background: color-mix(in oklab, var(--warn) 45%, transparent); color: oklch(0.98 0 0); border-radius: 3px; }
 
-/* ---------------------------------------------------------------- dock */
-.dock { position: fixed; left: 276px; right: 14px; bottom: 12px; z-index: 40; display: flex; flex-direction: column; overflow: hidden;
-  background: var(--glass-strong); border: 1px solid var(--line-2); border-radius: 18px; box-shadow: var(--shadow-lg);
-  backdrop-filter: blur(26px) saturate(170%); -webkit-backdrop-filter: blur(26px) saturate(170%); animation: toastin .4s var(--ease); }
-.dock::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; opacity: 0;
+/* ---------------------------------------------------------------- pane */
+/* The Activity pane is the third column of .app: it takes its width from the page instead of
+   floating over it, and collapses to a rail. */
+.pane { position: sticky; top: 12px; margin: 12px 12px 12px 0; width: 420px; height: calc(100vh - 24px); display: flex; flex-direction: column; overflow: hidden;
+  background: var(--glass-strong); border: 1px solid var(--line-2); border-radius: 24px; box-shadow: var(--shadow);
+  backdrop-filter: blur(26px) saturate(170%); -webkit-backdrop-filter: blur(26px) saturate(170%); }
+.pane.wide { width: min(680px, 36vw); }
+.pane.collapsed { width: 52px; border-radius: 18px; }
+.pane::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; opacity: 0; z-index: 1;
   background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), transparent); background-size: 200% 100%; }
-.dock.live::before { opacity: 1; animation: scan 1.8s linear infinite; }
-.dock-bar { display: flex; align-items: center; gap: 12px; padding: 10px 18px; min-height: 52px; cursor: pointer; }
-.dock-bar .t { font-weight: 700; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 38vw; }
-.dock-bar .meta { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
-.dock-bar .progress { flex: 1; max-width: 360px; min-width: 80px; }
-.dock-bar .grow { flex: 1; }
+.pane.live::before { opacity: 1; animation: scan 1.8s linear infinite; }
+.pane-h { display: flex; align-items: center; gap: 6px; padding: 10px 12px 10px 14px; border-bottom: 1px solid var(--line); flex: none; }
+.pane-h .grow { flex: 1; }
+.pane-tabs.tabs { margin: 0; }
+.pane-tabs.tabs button { padding: 6px 12px; font-size: 13px; }
+.pane-tabs .spinner { width: 10px; height: 10px; vertical-align: -1px; }
+.pane-b { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; overflow-x: hidden; }
+.pane-b[data-tab="timeline"] { padding: 12px; display: block; }
+.pane-b[data-tab="timeline"] > * + * { margin-top: 12px; }
+.pj { padding: 12px 14px 8px; flex: none; }
+.pj-top { display: flex; align-items: center; gap: 10px; }
+.pj-top .t { font-weight: 700; font-size: 13.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pj-meta { display: flex; flex-wrap: wrap; gap: 2px 14px; color: var(--muted); font-size: 12px; margin: 6px 0 0 34px; }
+.pj-prog { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.pj-prog .progress { flex: 1; }
+.pj > .progress { margin-top: 8px; }
+.pj-err { margin-top: 6px; }
+.pj-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 14px 10px; flex: none; }
+.pj-tools .search { min-width: 120px; flex: 1 1 120px; }
+.pj-tools .pane-sel { flex: 1 1 100%; min-width: 0; }
+.pj-tools .pane-sel .select { width: 100%; min-width: 0; }
+.pane-empty { padding: 8px 14px; }
+.pane-empty .pane-sel .select { width: 100%; margin-top: 10px; }
+.pane .log { flex: 1; min-height: 120px; border-radius: 0 0 24px 24px; overflow: auto; }
+.pane .log .ln { gap: 8px; padding: 0 12px; }
+.pane .now-h { padding: 12px 14px; gap: 10px; }
+.pane .now-h h2 { font-size: 16px; }
+.pane .now-job { max-width: 100%; text-align: left; }
+.pane .signal { padding: 9px 14px; flex-wrap: wrap; }
+.pane .now-batches { padding: 4px 14px 12px; }
+.pane .act-tl { max-height: none; min-height: 0; overflow: visible; }
+.pane .tl-card .chips { flex-wrap: wrap; }
+.pane .toolbar .search { width: 100%; flex: 1 1 100%; }
+.pane .card-h { flex-wrap: wrap; }
+.pane .act-exports { margin: 4px 2px 8px; }
+/* the rail: what is left when the pane is collapsed */
+.rail { all: unset; box-sizing: border-box; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 14px 0; cursor: pointer; color: var(--muted); }
+.rail:hover, .rail:focus-visible { color: var(--fg); background: var(--panel-2); }
+.rail:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.nav-item.pane-on { color: var(--fg); }
+.nav-item.pane-on svg { color: var(--accent); }
+.rail-ic svg { width: 16px; height: 16px; }
+.rail-t { writing-mode: vertical-rl; font-size: 12.5px; font-weight: 650; letter-spacing: .06em; white-space: nowrap; }
+
 .spark { width: 120px; height: 26px; flex: none; }
 .spark path { fill: none; stroke: var(--accent); stroke-width: 1.6; filter: drop-shadow(0 0 4px var(--accent)); vector-effect: non-scaling-stroke; }
 .spark .area { fill: color-mix(in oklab, var(--accent) 20%, transparent); stroke: none; filter: none; }
@@ -531,10 +579,6 @@ table.t input.input { width: 100%; }
 .status-ic.warning { background: var(--warn-soft); color: var(--warn); }
 .status-ic.failed { background: var(--bad-soft); color: var(--bad); box-shadow: 0 0 14px -4px var(--bad); }
 .status-ic.stopped { background: var(--panel-3); color: var(--muted); }
-.dock-body { height: 38vh; border-top: 1px solid var(--line); display: flex; flex-direction: column; }
-.dock-body .log { flex: 1; border-radius: 0; }
-.dock-tools { display: flex; gap: 8px; align-items: center; padding: 7px 18px; border-bottom: 1px solid var(--line); }
-
 /* ------------------------------------------------------ drawer & modal */
 .overlay { position: fixed; inset: 0; z-index: 60; background: oklch(0.08 0.02 var(--hb) / .5);
   backdrop-filter: blur(6px) saturate(120%); -webkit-backdrop-filter: blur(6px) saturate(120%); animation: fade .25s ease; }
@@ -563,7 +607,7 @@ table.t input.input { width: 100%; }
 .typeconfirm { margin-top: 14px; display: grid; gap: 6px; }
 .typeconfirm code { background: var(--bad-soft); color: var(--bad); padding: 1px 7px; border-radius: 6px; font-weight: 800; letter-spacing: .08em; }
 
-.toasts { position: fixed; top: 16px; right: 16px; z-index: 95; display: grid; gap: 10px; width: min(400px, 92vw); }
+.toasts { position: fixed; top: 16px; right: calc(var(--pane-w, 0px) + 28px); z-index: 95; display: grid; gap: 10px; width: min(400px, 92vw); }
 .toast { display: flex; gap: 10px; align-items: flex-start; padding: 12px 15px; font-size: 13px; border-radius: 16px; overflow: hidden; position: relative;
   background: var(--glass-strong); border: 1px solid var(--line-2); box-shadow: var(--shadow-lg), 0 0 40px -18px var(--tc, var(--accent));
   backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); animation: toastin .45s var(--spring); }
@@ -734,7 +778,11 @@ body[data-motion="off"] .kpi { transform: none; }
   #nav-glider, .nav-group, .side-foot { display: none; }
   .nav-item { flex: none; }
   .nav-item.active { background: color-mix(in oklab, var(--accent) 18%, transparent); }
-  .dock { left: 10px; right: 10px; }
+  .pane, .pane.wide, .pane.collapsed { position: static; width: auto; margin: 0 10px 10px; height: 70vh; }
+  .pane.collapsed { height: 52px; }
+  .rail { flex-direction: row; padding: 0 16px; }
+  .rail-t { writing-mode: horizontal-tb; }
+  .rail-ic svg { transform: rotate(-90deg); }
   .view { padding: 8px 14px 130px; }
   .topbar { padding: 12px 14px; flex-wrap: wrap; }
   .topbar::after { left: 14px; right: 14px; }
@@ -957,7 +1005,7 @@ body[data-fx="lite"] #fx-aurora, body[data-fx="lite"] #fx-grid, body[data-fx="li
 body[data-fx="lite"] { background: var(--bg0); }
 body[data-fx="lite"] .topbar { background: var(--bg0); }
 body[data-fx="lite"] .card, body[data-fx="lite"] .kpi, body[data-fx="lite"] .sidebar, body[data-fx="lite"] .callout,
-body[data-fx="lite"] .dock, body[data-fx="lite"] .drawer, body[data-fx="lite"] .modal, body[data-fx="lite"] .studio,
+body[data-fx="lite"] .pane, body[data-fx="lite"] .drawer, body[data-fx="lite"] .modal, body[data-fx="lite"] .studio,
 body[data-fx="lite"] .cmdk, body[data-fx="lite"] .toast, body[data-fx="lite"] .tip, body[data-fx="lite"] .tour-card {
   box-shadow: 0 1px 0 var(--hi) inset, 0 6px 16px -10px oklch(0 0 0 / .55); }
 body[data-fx="lite"] .card::before, body[data-fx="lite"] .kpi::before { display: none; }
@@ -970,7 +1018,7 @@ body[data-fx="lite"] .logo::before { filter: none; opacity: .5; }
    Spinners and progress bars stay -- they say something is happening. */
 body[data-fx="lite"] .logo::before, body[data-fx="lite"] .nav-badge.busy, body[data-fx="lite"] .topbar::after,
 body[data-fx="lite"] .pill.busy::before, body[data-fx="lite"] .segbar > span, body[data-fx="lite"] .step.now .n,
-body[data-fx="lite"] .dock.live::before, body[data-fx="lite"] .jobchip, body[data-fx="lite"] .tline .win.busy {
+body[data-fx="lite"] .pane.live::before, body[data-fx="lite"] .jobchip, body[data-fx="lite"] .tline .win.busy {
   animation: none !important; }
 
 /* ------------------------------------------------ namespaces while mapping */
@@ -1012,7 +1060,7 @@ html[data-skin] .input, html[data-skin] .select, html[data-skin] .fgroup, html[d
 html[data-skin] .vmrow, html[data-skin] .step .n, html[data-skin] .modal-h .ic, html[data-skin] .callout .ic, html[data-skin] .empty .ic,
 html[data-skin] .opt-row, html[data-skin] .note, html[data-skin] .approval, html[data-skin] .fit, html[data-skin] .tline,
 html[data-skin] .gs-step, html[data-skin] .tip, html[data-skin] .tour-card, html[data-skin] .toast, html[data-skin] .cmdk,
-html[data-skin] .studio, html[data-skin] .drawer, html[data-skin] .modal, html[data-skin] .dock, html[data-skin] .jobchip,
+html[data-skin] .studio, html[data-skin] .drawer, html[data-skin] .modal, html[data-skin] .pane, html[data-skin] .jobchip,
 html[data-skin] .ctxchip, html[data-skin] .userchip, html[data-skin] .seg, html[data-skin] .tabs, html[data-skin] .log { border-radius: var(--radius); }
 
 /* ------------------------------------------------ VMware Modern (Clarity, dark) */
@@ -1068,7 +1116,7 @@ html[data-skin="clarity"] .chip { border-radius: 12px; }
 html[data-skin="clarity"] .chip.on { background: rgba(73, 175, 217, .18); box-shadow: none; }
 html[data-skin="clarity"] .modal, html[data-skin="clarity"] .drawer, html[data-skin="clarity"] .studio, html[data-skin="clarity"] .cmdk { background: #21333b; border: 1px solid var(--line-2); }
 html[data-skin="clarity"] .overlay { background: rgba(0, 0, 0, .55); }
-html[data-skin="clarity"] .dock { background: #1b2a32; border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
+html[data-skin="clarity"] .pane { background: #1b2a32; border: 1px solid var(--line-2); box-shadow: var(--shadow-lg); }
 html[data-skin="clarity"] .log { background: #0f1c22; }
 html[data-skin="clarity"] .ctxchip, html[data-skin="clarity"] .userchip { background: transparent; border-color: var(--line-2); }
 html[data-skin="clarity"] .jobchip { animation: none; background: rgba(73, 175, 217, .14); }
@@ -1154,8 +1202,8 @@ html[data-skin="classic"] .modal-h .ic { background: #fff; color: #2a6db0; }
 html[data-skin="classic"] .modal-h .ic.danger { background: #fff; color: #b72a2a; }
 html[data-skin="classic"] .drawer-h, html[data-skin="classic"] .studio-h { background: linear-gradient(180deg, #f5f8fb, #dbe6f1); border-bottom: 1px solid #b7c7d8; }
 html[data-skin="classic"] .overlay { background: rgba(20, 40, 60, .35); }
-html[data-skin="classic"] .dock { background: #fff; border: 1px solid #7f9ab5; box-shadow: var(--shadow-lg); }
-html[data-skin="classic"] .dock-bar { background: linear-gradient(180deg, #f5f8fb, #dbe6f1); }
+html[data-skin="classic"] .pane { background: #fff; border: 1px solid #7f9ab5; box-shadow: var(--shadow-lg); }
+html[data-skin="classic"] .pane-h { background: linear-gradient(180deg, #f5f8fb, #dbe6f1); }
 html[data-skin="classic"] .log { background: #fbfcfd; color: #1f2d3a; border-top: 1px solid #c3d1de; }
 html[data-skin="classic"] .log .ts, html[data-skin="classic"] .log .dim { color: #8494a6; }
 html[data-skin="classic"] .log .bad { color: #b72a2a; } html[data-skin="classic"] .log .ok { color: #2f7d2f; }
@@ -1166,9 +1214,9 @@ html[data-skin="classic"] .tipq { background: #fff; }
 
 /* Desktop only: the sidebar runs the full height, flush like the originals (the phone layout keeps its own). */
 @media (min-width: 861px) {
-  html[data-skin] .app { grid-template-columns: 244px minmax(0, 1fr); }
+  html[data-skin] .app { grid-template-columns: 244px minmax(0, 1fr) auto; }
+  html[data-skin] .pane { top: 0; margin: 0; height: 100vh; border-radius: 0; border-width: 0 0 0 1px; }
   html[data-skin] .sidebar { position: sticky; top: 0; margin: 0; height: 100vh; border-radius: 0; }
-  html[data-skin] .dock { left: 256px; }
 }
 
 /* Studio: a skin's swatch previews its chrome */
@@ -1266,7 +1314,7 @@ html[data-skin="clarity"] .flow-step.active .fs-t small { color: #d2dbe1; }
 }
 
 /* ------------------------------------------------ terms of use gate (front and centre) */
-body.terms-gated .app, body.terms-gated .dock, body.terms-gated #drawer-root { visibility: hidden; }
+body.terms-gated .app, body.terms-gated #drawer-root { visibility: hidden; }
 #terms-gate { position: fixed; inset: 0; z-index: 200; overflow-y: auto; overflow-x: hidden; display: block; padding: 4vh 16px;
   background: oklch(0.1 0.02 var(--hb) / .86); backdrop-filter: blur(8px); }
 .tg-card { width: min(900px, 100%); box-sizing: border-box; min-width: 0; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; padding: 26px 28px; border-radius: 20px;

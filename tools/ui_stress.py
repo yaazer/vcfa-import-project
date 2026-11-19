@@ -167,23 +167,40 @@ const counts = async () => (await GET('/api/overview')).counts;
 
 const SCENARIOS = {
   async pages() {
-    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'activity', 'schedule', 'settings', 'help']) {
+    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'schedule', 'settings', 'help']) {
       const ok = await open(id);
       check('renders ' + id, ok);
       check('no error box on ' + id, !brokeView(), brokeView());
       check('no markup injected on ' + id, noInjection());
       if (HP.get('narrow')) check('no page-level horizontal scroll on ' + id, document.documentElement.scrollWidth <= innerWidth + 2, document.documentElement.scrollWidth + ' > ' + innerWidth + ': ' + overflowers());
     }
-    await open('activity');
-    check('activity leads with a verdict', await waitFor(() => document.querySelector('#act-now h2'), 5000));
-    check('activity shows one timeline and a job log', document.querySelector('#act-tl') && document.querySelector('.log-card'));
+    // The Activity pane: a column of the page, not a floating window.
+    await open('overview');
+    if (!document.querySelector('#pane.collapsed')) click('#pane [data-act="togglePane"]');
+    check('the pane collapses to a rail', await waitFor(() => document.querySelector('#pane.collapsed .rail'), 3000));
+    check('a collapsed pane takes little room', HP.get('narrow') ? document.querySelector('#pane').getBoundingClientRect().height < 80 : document.querySelector('#pane').getBoundingClientRect().width < 80);
+    click('#pane .rail');
+    check('the rail opens the pane', await waitFor(() => document.querySelector('#pane:not(.collapsed) .pane-h'), 3000));
+    const pr = document.querySelector('#pane').getBoundingClientRect(), vr = document.querySelector('#view').getBoundingClientRect();
+    check('the pane is in the layout, beside the page', getComputedStyle(document.querySelector('#pane')).position !== 'fixed'
+      && (HP.get('narrow') || vr.right <= pr.left + 1), JSON.stringify([pr.left, vr.right]));
+    click('#pane [data-act="paneTab"][data-k="timeline"]');
+    check('the timeline leads with a verdict', await waitFor(() => document.querySelector('#pane #act-now h2'), 5000));
+    check('the timeline and the exports are in the pane', document.querySelector('#pane #act-tl') && document.querySelectorAll('#pane .act-exports a[download]').length === 4);
     for (const k of ['problems', 'job', 'change', 'event', 'all']) {
-      click('[data-act="kind"][data-k="' + k + '"]');
-      check('timeline filter ' + k + ' renders', await waitFor(() => document.querySelector('[data-act="kind"].on[data-k="' + k + '"]'), 3000) && !brokeView());
+      click('#pane [data-act="paneKind"][data-k="' + k + '"]');
+      check('timeline filter ' + k + ' renders', await waitFor(() => document.querySelector('#pane [data-act="paneKind"].on[data-k="' + k + '"]'), 3000) && !brokeView());
     }
-    await open('activity', 'scope=all');
-    check('the whole history renders', !brokeView() && document.querySelector('[data-act="scope"].on[data-k="all"]'));
-    check('exports sit at the foot', document.querySelectorAll('.act-exports a[download]').length === 4);
+    click('#pane [data-act="paneScope"][data-k="all"]');
+    check('the whole history renders', await waitFor(() => document.querySelector('#pane [data-act="paneScope"].on[data-k="all"]'), 5000) && !brokeView());
+    click('#pane [data-act="paneTab"][data-k="log"]');
+    check('the log tab shows', await waitFor(() => document.querySelector('#pane-body[data-tab="log"]'), 3000));
+    check('no floating dock is left', !document.querySelector('#dock'));
+    for (const f of document.querySelectorAll('.flow-next')) check('the next-stage bar is not floating', getComputedStyle(f).position === 'static');
+    check('the old Activity link still opens the pane and keeps the page', await (async () => {
+      await open('overview'); location.hash = '#/activity';
+      return waitFor(() => S.route === 'overview' && document.querySelector('#pane[data-mode="open"] #pane-body[data-tab="timeline"]'), 5000);
+    })());
     await open('queue');
     const first = document.querySelector('#view').firstChild;
     S.view.render();
@@ -537,17 +554,21 @@ const SCENARIOS = {
     const catJob = await waitJob('catalog', catKnown);
     check('"Re-read namespaces & policies" runs as a job and succeeds', catJob && catJob.status === 'succeeded', catJob && (catJob.error || catJob.status));
     check('and the VMs on the wrong policy are still explained afterwards', await waitFor(() => document.querySelector('#ex-held .held-g[data-code="sp_not_offered"]'), 8000));
+    if (!document.querySelector('#pane.collapsed')) click('#pane [data-act="togglePane"]');
     click('[data-act="start"]');
     const yes = await waitFor(() => document.querySelector('.modal [data-m="yes"]'));
     check('precheck asks for confirmation', yes);
     since = await jobIds();
     yes.click();
-    check('the log dock opens', await waitFor(() => !document.querySelector('#dock').hidden, 5000));
+    check('a new job leaves a collapsed pane collapsed, with the rail showing it', await waitFor(() => document.querySelector('#pane.collapsed.live .rail .spinner'), 5000));
+    check('the sidebar toggle is not a second active page', document.querySelectorAll('#nav .nav-item.active').length <= 1 && !document.querySelector('#nav [data-act="togglePane"].active'));
+    click('#pane .rail');
+    check('opening the pane shows the running job, with Stop', await waitFor(() => document.querySelector('#pane #pane-log .ln') && document.querySelector('#pane [data-act="stopJob"]'), 8000));
     const job = await waitJob('execute', since);
     check('precheck job finished', job && ['succeeded', 'warning'].includes(job.status), job && job.status);
     const after = await counts();
     check('VMs moved out of pending', (after.pending || 0) < (before.pending || 0), JSON.stringify(after));
-    check('the dock shows the finished job', await waitFor(() => /finished|warnings/.test(document.querySelector('#dock').textContent), 8000));
+    check('the pane shows the finished job', await waitFor(() => { const pn = document.querySelector('#pane'); if (pn.classList.contains('collapsed')) click('#pane .rail'); return /finished|warnings/.test(pn.textContent); }, 8000));
     // A precheck every VM passed flips the page to Import for the same waves; anything less stays put.
     const r = (job && job.result) || {};
     const allPassed = job && job.status === 'succeeded' && r.applied > 0 && !r.failed && r.succeeded === r.applied;
@@ -590,15 +611,17 @@ const SCENARIOS = {
     }
     check('execute view never broke', !brokeView());
 
-    // Activity: a batch's VMs read as one timeline entry; a job's row scopes the timeline to it.
-    await open('activity');
-    check('activity groups a batch\'s state changes', await waitFor(() => [...document.querySelectorAll('#act-tl .tl-row')].some((r) => /\d+ VMs/.test(r.textContent)), 8000));
-    const jobRow = document.querySelector('#act-tl .tl-job');
+    // Activity pane: a batch's VMs read as one timeline entry; a job's row follows that job in the Log tab.
+    await open('execute');
+    if (document.querySelector('#pane.collapsed')) click('#pane .rail');
+    click('#pane [data-act="paneTab"][data-k="timeline"]');
+    check('the timeline groups a batch\'s state changes', await waitFor(() => [...document.querySelectorAll('#pane #act-tl .tl-row')].some((r) => /\d+ VMs/.test(r.textContent)), 8000));
+    const jobRow = document.querySelector('#pane #act-tl .tl-job');
     check('jobs appear in the timeline', jobRow);
     if (jobRow) {
       jobRow.click();
-      check('picking a job scopes the timeline to it', await waitFor(() => document.querySelector('[data-act="scope"].on[data-k="job"]'), 5000));
-      check('and shows its log', await waitFor(() => document.querySelectorAll('#act-log .ln').length > 0, 5000));
+      check('picking a job switches to its log', await waitFor(() => document.querySelector('#pane-body[data-tab="log"]'), 5000));
+      check('and shows its log', await waitFor(() => document.querySelectorAll('#pane-log .ln').length > 0, 5000));
     }
   },
 

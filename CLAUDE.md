@@ -76,6 +76,11 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   code and a CAUSES entry, never only a string. Unknown still means held (fail closed).
 - **`service.read_catalog` / `catalog`** re-reads namespaces, subnets and per-namespace policies with no VMs, and refuses a
   vCenter other than the cache's. Discover uses the same `vcenter.read_namespace_catalog`.
+- **No floating panels over the work.** The Activity pane (`#pane`, views.js "PANE") is the third column of
+  `.app`: job log + timeline + exports, collapsible to a rail, state in localStorage `vcfa-pane`. A new job never
+  opens it. The "next stage" bar (`.flow-next`) is in the page flow; only an unsaved-changes bar may stick.
+  `#/activity` stays as a redirect that opens the pane. Pane actions are prefixed `pane*` (`GLOBAL_ACT`) so a view's own
+  `act` names can never shadow them.
 - **The five stages flow top to bottom.** Their pages are one column: numbered `flowSec`
   sections ending in a `flowNext` bar to the next stage (views.js); no side-by-side grids
   there. The sidebar is the `FLOW` stepper plus collapsible groups (`NAV` group markers,
@@ -149,7 +154,7 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/settings.py` | workspace settings overlay: `FIELDS` with ranges, `apply`, `update`, `describe` |
 | `vcfaimport/notify.py` | Teams / Slack / webhook / email channels, `EVENTS`, retrying delivery |
 | `vcfaimport/verify.py` | post-import checks: power, Tools, IP kept, ping, TCP ports |
-| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, dock, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `skins.js` (icon sets of the design-language skins), `views.js` (pages), `gov.js` (Change control, Settings, badges, saved views), `help.js` (glossary + `?` tooltips, welcome tour, offline Markdown viewer for the guides), `app.css` (token design system) |
+| `vcfaimport/web/static/` | the UI: `core.js` (templating, shell, job-log polling, shared actions), `fx.js` (theme engine, aurora, Migration Stream, palette, studio), `skins.js` (icon sets of the design-language skins), `views.js` (pages, and the Activity pane: Log + Timeline tabs), `gov.js` (Change control, Settings, badges, saved views), `help.js` (glossary + `?` tooltips, welcome tour, offline Markdown viewer for the guides), `app.css` (token design system) |
 | `tools/web_demo.py` | the console against the fakes: `--keep ./webdemo` |
 | `tools/ui_perf.py` | rendering cost in software compositing (a GPU-less jump box): traces Full vs Lite |
 | `tools/ui_stress.py` | browser stress: injects a harness into the real UI, headless Chrome/Edge (`govern` runs in its own workspace) |
