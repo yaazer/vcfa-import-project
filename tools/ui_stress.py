@@ -1402,6 +1402,23 @@ def wait_job(app, job, timeout=600):
     return job
 
 
+def run_execute(app, params):
+    """Start an execute job and wait for it. A job reads as finished a moment before it lets go of the
+    workspace lock, so a job started straight after another can meet WorkspaceBusy: retry briefly."""
+    from vcfaimport.service import WorkspaceBusy
+    for attempt in range(25):
+        try:
+            return wait_job(app, app._job_execute(params))
+        except WorkspaceBusy:
+            time.sleep(0.2)
+    return wait_job(app, app._job_execute(params))
+
+
+# What a real discover records for a VM on a compliant policy the target namespaces offer (the hand-built VMs below).
+POLICY_OK = {"storage_compliance": {"overall": "COMPLIANT"},
+             "storage_policies": {"vm_home": "pol-gold-0001", "disks": {}}, "disk_ids": []}
+
+
 def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_action=None, accept=True):
     import demo
     vc_server, vc_port = fake_vcenter.serve(count=vms)
@@ -1433,9 +1450,12 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
                   (r["folder"] or "").startswith(("Production", "Databases"))]
         app.store.set_selected(chosen, True)
         app.stage_commit({}, {"default_namespace": "prod-web-ns1"} if vms >= 1000 else {})
+        # The storage-policy gate fails closed on a namespace whose policies the last discover did not
+        # read, and discover reads the ones the queue targets: so discover once more now that it targets some.
+        wait_job(app, app._job_discover({}))
         if vms < 1000:
-            wait_job(app, app._job_execute({"stage": "precheck", "waves": [1], "confirm": True}))
-            wait_job(app, app._job_execute({"stage": "import", "waves": [1], "confirm": True}))
+            run_execute(app, {"stage": "precheck", "waves": [1], "confirm": True})
+            run_execute(app, {"stage": "import", "waves": [1], "confirm": True})
         if hostile:
             # A real discover would have recorded a compliance verdict (the
             # gate is on by default, including at precheck since 2026-11-16);
@@ -1447,7 +1467,7 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
                                           "datacenter": "LabDC", "cluster": "PROD-CL01",
                                           "networks": "VLAN197-Prod", "power_state": "POWERED_ON",
                                           "nics": [{"device_key": 4000, "network_name": "VLAN197-Prod"}],
-                                          "facts": {"storage_compliance": {"overall": "COMPLIANT"}}}
+                                          "facts": POLICY_OK}
                                          for m, n in HOSTILE])
             app.store.set_selected([m for m, _ in HOSTILE], True, namespace="prod-web-ns1", wave=2)
             app.stage_commit({}, {})
@@ -1461,10 +1481,10 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
             app.store.upsert_discovered([
                 {"moref": "vm-9010", "name": "rolling-back-vm", "folder": "Evil/rolling-back-vm",
                  "datacenter": "LabDC", "cluster": "PROD-CL01", "power_state": "POWERED_ON", "nics": [],
-                 "facts": {"storage_compliance": {"overall": "COMPLIANT"}}},
+                 "facts": POLICY_OK},
                 {"moref": "vm-9011", "name": "rollback-failed-vm", "folder": "Evil/rollback-failed-vm",
                  "datacenter": "LabDC", "cluster": "PROD-CL01", "power_state": "POWERED_ON", "nics": [],
-                 "facts": {"storage_compliance": {"overall": "COMPLIANT"}}},
+                 "facts": POLICY_OK},
             ])
             app.store.set_selected(["vm-9010", "vm-9011"], True, namespace="prod-web-ns1", wave=2)
             app.stage_commit({}, {})

@@ -68,6 +68,11 @@ STORAGE_POLICIES = {"pol-gold-0001": "Gold", "pol-ds2-0003": "DS2-Thick", "pol-b
 NAMESPACE_STORAGE = {
     "migration-testing-ns-kcvm5": ["pol-gold-0001", "pol-ds2-0003"],
     "testing-vpc-k826r": ["pol-gold-0001"],
+    # The namespaces tools/ui_stress.py stages into. They are not in NAMESPACE_INSTANCES (the
+    # autodiscovery suggestions stay as they were); the policy endpoint answers for them, because
+    # the compliance gate fails closed on a namespace whose policies it could not read.
+    "prod-web-ns1": ["pol-gold-0001"], "prod-db-ns2": ["pol-gold-0001"], "dmz-ns3": ["pol-gold-0001"],
+    "zz-stress-ns": ["pol-gold-0001"], "zz-tag-ns": ["pol-gold-0001"],
 }
 
 CLUSTERS = ["PROD-CL01", "PROD-CL02", "DMZ-CL01"]
@@ -344,6 +349,8 @@ class Handler(BaseHTTPRequestHandler):
                                  "messages": [{"default_message": "System.Read is required"}]})
                 return
             known = {n["namespace"]: n for n in NAMESPACE_INSTANCES}
+            if namespace not in known and namespace in NAMESPACE_STORAGE:
+                known[namespace] = {"namespace": namespace, "cluster": "PROD-CL01", "description": ""}
             if namespace not in known:
                 self._send(404, {"error": "no such namespace"})
                 return
