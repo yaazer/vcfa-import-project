@@ -167,23 +167,40 @@ const counts = async () => (await GET('/api/overview')).counts;
 
 const SCENARIOS = {
   async pages() {
-    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'activity', 'schedule', 'settings', 'help']) {
+    for (const id of ['overview', 'discover', 'select', 'stage', 'waves', 'execute', 'queue', 'batches', 'triage', 'schedule', 'settings', 'help']) {
       const ok = await open(id);
       check('renders ' + id, ok);
       check('no error box on ' + id, !brokeView(), brokeView());
       check('no markup injected on ' + id, noInjection());
       if (HP.get('narrow')) check('no page-level horizontal scroll on ' + id, document.documentElement.scrollWidth <= innerWidth + 2, document.documentElement.scrollWidth + ' > ' + innerWidth + ': ' + overflowers());
     }
-    await open('activity');
-    check('activity leads with a verdict', await waitFor(() => document.querySelector('#act-now h2'), 5000));
-    check('activity shows one timeline and a job log', document.querySelector('#act-tl') && document.querySelector('.log-card'));
+    // The Activity pane: a column of the page, not a floating window.
+    await open('overview');
+    if (!document.querySelector('#pane.collapsed')) click('#pane [data-act="togglePane"]');
+    check('the pane collapses to a rail', await waitFor(() => document.querySelector('#pane.collapsed .rail'), 3000));
+    check('a collapsed pane takes little room', HP.get('narrow') ? document.querySelector('#pane').getBoundingClientRect().height < 80 : document.querySelector('#pane').getBoundingClientRect().width < 80);
+    click('#pane .rail');
+    check('the rail opens the pane', await waitFor(() => document.querySelector('#pane:not(.collapsed) .pane-h'), 3000));
+    const pr = document.querySelector('#pane').getBoundingClientRect(), vr = document.querySelector('#view').getBoundingClientRect();
+    check('the pane is in the layout, beside the page', getComputedStyle(document.querySelector('#pane')).position !== 'fixed'
+      && (HP.get('narrow') || vr.right <= pr.left + 1), JSON.stringify([pr.left, vr.right]));
+    click('#pane [data-act="paneTab"][data-k="timeline"]');
+    check('the timeline leads with a verdict', await waitFor(() => document.querySelector('#pane #act-now h2'), 5000));
+    check('the timeline and the exports are in the pane', document.querySelector('#pane #act-tl') && document.querySelectorAll('#pane .act-exports a[download]').length === 4);
     for (const k of ['problems', 'job', 'change', 'event', 'all']) {
-      click('[data-act="kind"][data-k="' + k + '"]');
-      check('timeline filter ' + k + ' renders', await waitFor(() => document.querySelector('[data-act="kind"].on[data-k="' + k + '"]'), 3000) && !brokeView());
+      click('#pane [data-act="paneKind"][data-k="' + k + '"]');
+      check('timeline filter ' + k + ' renders', await waitFor(() => document.querySelector('#pane [data-act="paneKind"].on[data-k="' + k + '"]'), 3000) && !brokeView());
     }
-    await open('activity', 'scope=all');
-    check('the whole history renders', !brokeView() && document.querySelector('[data-act="scope"].on[data-k="all"]'));
-    check('exports sit at the foot', document.querySelectorAll('.act-exports a[download]').length === 4);
+    click('#pane [data-act="paneScope"][data-k="all"]');
+    check('the whole history renders', await waitFor(() => document.querySelector('#pane [data-act="paneScope"].on[data-k="all"]'), 5000) && !brokeView());
+    click('#pane [data-act="paneTab"][data-k="log"]');
+    check('the log tab shows', await waitFor(() => document.querySelector('#pane-body[data-tab="log"]'), 3000));
+    check('no floating dock is left', !document.querySelector('#dock'));
+    for (const f of document.querySelectorAll('.flow-next')) check('the next-stage bar is not floating', getComputedStyle(f).position === 'static');
+    check('the old Activity link still opens the pane and keeps the page', await (async () => {
+      await open('overview'); location.hash = '#/activity';
+      return waitFor(() => S.route === 'overview' && document.querySelector('#pane[data-mode="open"] #pane-body[data-tab="timeline"]'), 5000);
+    })());
     await open('queue');
     const first = document.querySelector('#view').firstChild;
     S.view.render();
@@ -527,17 +544,21 @@ const SCENARIOS = {
     const before = await counts();
     check('the plan shows batches for wave 2', await waitFor(() => document.querySelector('#ex-plan table'), 8000));
     check('the plan names the VMs in the run', /VMs in this run:/.test(document.querySelector('#ex-plan').textContent));
+    if (!document.querySelector('#pane.collapsed')) click('#pane [data-act="togglePane"]');
     click('[data-act="start"]');
     const yes = await waitFor(() => document.querySelector('.modal [data-m="yes"]'));
     check('precheck asks for confirmation', yes);
     since = await jobIds();
     yes.click();
-    check('the log dock opens', await waitFor(() => !document.querySelector('#dock').hidden, 5000));
+    check('a new job leaves a collapsed pane collapsed, with the rail showing it', await waitFor(() => document.querySelector('#pane.collapsed.live .rail .spinner'), 5000));
+    check('the sidebar toggle is not a second active page', document.querySelectorAll('#nav .nav-item.active').length <= 1 && !document.querySelector('#nav [data-act="togglePane"].active'));
+    click('#pane .rail');
+    check('opening the pane shows the running job, with Stop', await waitFor(() => document.querySelector('#pane #pane-log .ln') && document.querySelector('#pane [data-act="stopJob"]'), 8000));
     const job = await waitJob('execute', since);
     check('precheck job finished', job && ['succeeded', 'warning'].includes(job.status), job && job.status);
     const after = await counts();
     check('VMs moved out of pending', (after.pending || 0) < (before.pending || 0), JSON.stringify(after));
-    check('the dock shows the finished job', await waitFor(() => /finished|warnings/.test(document.querySelector('#dock').textContent), 8000));
+    check('the pane shows the finished job', await waitFor(() => { const pn = document.querySelector('#pane'); if (pn.classList.contains('collapsed')) click('#pane .rail'); return /finished|warnings/.test(pn.textContent); }, 8000));
     // A precheck every VM passed flips the page to Import for the same waves; anything less stays put.
     const r = (job && job.result) || {};
     const allPassed = job && job.status === 'succeeded' && r.applied > 0 && !r.failed && r.succeeded === r.applied;
@@ -580,15 +601,17 @@ const SCENARIOS = {
     }
     check('execute view never broke', !brokeView());
 
-    // Activity: a batch's VMs read as one timeline entry; a job's row scopes the timeline to it.
-    await open('activity');
-    check('activity groups a batch\'s state changes', await waitFor(() => [...document.querySelectorAll('#act-tl .tl-row')].some((r) => /\d+ VMs/.test(r.textContent)), 8000));
-    const jobRow = document.querySelector('#act-tl .tl-job');
+    // Activity pane: a batch's VMs read as one timeline entry; a job's row follows that job in the Log tab.
+    await open('execute');
+    if (document.querySelector('#pane.collapsed')) click('#pane .rail');
+    click('#pane [data-act="paneTab"][data-k="timeline"]');
+    check('the timeline groups a batch\'s state changes', await waitFor(() => [...document.querySelectorAll('#pane #act-tl .tl-row')].some((r) => /\d+ VMs/.test(r.textContent)), 8000));
+    const jobRow = document.querySelector('#pane #act-tl .tl-job');
     check('jobs appear in the timeline', jobRow);
     if (jobRow) {
       jobRow.click();
-      check('picking a job scopes the timeline to it', await waitFor(() => document.querySelector('[data-act="scope"].on[data-k="job"]'), 5000));
-      check('and shows its log', await waitFor(() => document.querySelectorAll('#act-log .ln').length > 0, 5000));
+      check('picking a job switches to its log', await waitFor(() => document.querySelector('#pane-body[data-tab="log"]'), 5000));
+      check('and shows its log', await waitFor(() => document.querySelectorAll('#pane-log .ln').length > 0, 5000));
     }
   },
 
@@ -1402,6 +1425,23 @@ def wait_job(app, job, timeout=600):
     return job
 
 
+def run_execute(app, params):
+    """Start an execute job and wait for it. A job reads as finished a moment before it lets go of the
+    workspace lock, so a job started straight after another can meet WorkspaceBusy: retry briefly."""
+    from vcfaimport.service import WorkspaceBusy
+    for attempt in range(25):
+        try:
+            return wait_job(app, app._job_execute(params))
+        except WorkspaceBusy:
+            time.sleep(0.2)
+    return wait_job(app, app._job_execute(params))
+
+
+# What a real discover records for a VM on a compliant policy the target namespaces offer (the hand-built VMs below).
+POLICY_OK = {"storage_compliance": {"overall": "COMPLIANT"},
+             "storage_policies": {"vm_home": "pol-gold-0001", "disks": {}}, "disk_ids": []}
+
+
 def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_action=None, accept=True):
     import demo
     vc_server, vc_port = fake_vcenter.serve(count=vms)
@@ -1433,9 +1473,12 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
                   (r["folder"] or "").startswith(("Production", "Databases"))]
         app.store.set_selected(chosen, True)
         app.stage_commit({}, {"default_namespace": "prod-web-ns1"} if vms >= 1000 else {})
+        # The storage-policy gate fails closed on a namespace whose policies the last discover did not
+        # read, and discover reads the ones the queue targets: so discover once more now that it targets some.
+        wait_job(app, app._job_discover({}))
         if vms < 1000:
-            wait_job(app, app._job_execute({"stage": "precheck", "waves": [1], "confirm": True}))
-            wait_job(app, app._job_execute({"stage": "import", "waves": [1], "confirm": True}))
+            run_execute(app, {"stage": "precheck", "waves": [1], "confirm": True})
+            run_execute(app, {"stage": "import", "waves": [1], "confirm": True})
         if hostile:
             # A real discover would have recorded a compliance verdict (the
             # gate is on by default, including at precheck since 2026-11-16);
@@ -1447,7 +1490,7 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
                                           "datacenter": "LabDC", "cluster": "PROD-CL01",
                                           "networks": "VLAN197-Prod", "power_state": "POWERED_ON",
                                           "nics": [{"device_key": 4000, "network_name": "VLAN197-Prod"}],
-                                          "facts": {"storage_compliance": {"overall": "COMPLIANT"}}}
+                                          "facts": POLICY_OK}
                                          for m, n in HOSTILE])
             app.store.set_selected([m for m, _ in HOSTILE], True, namespace="prod-web-ns1", wave=2)
             app.stage_commit({}, {})
@@ -1461,10 +1504,10 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
             app.store.upsert_discovered([
                 {"moref": "vm-9010", "name": "rolling-back-vm", "folder": "Evil/rolling-back-vm",
                  "datacenter": "LabDC", "cluster": "PROD-CL01", "power_state": "POWERED_ON", "nics": [],
-                 "facts": {"storage_compliance": {"overall": "COMPLIANT"}}},
+                 "facts": POLICY_OK},
                 {"moref": "vm-9011", "name": "rollback-failed-vm", "folder": "Evil/rollback-failed-vm",
                  "datacenter": "LabDC", "cluster": "PROD-CL01", "power_state": "POWERED_ON", "nics": [],
-                 "facts": {"storage_compliance": {"overall": "COMPLIANT"}}},
+                 "facts": POLICY_OK},
             ])
             app.store.set_selected(["vm-9010", "vm-9011"], True, namespace="prod-web-ns1", wave=2)
             app.stage_commit({}, {})

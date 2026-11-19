@@ -1,5 +1,5 @@
 'use strict';
-/* VCFA Import Console — core: templating, API client, shell, dock, drawers,
+/* VCFA Import Console — core: templating, API client, shell, job-log state, drawers,
  * modals, toasts and the actions shared by several views. views.js holds the
  * pages. Plain scripts, no build step, no network dependencies. */
 
@@ -520,8 +520,17 @@ async function reloadDrawer() {
 }
 function closeDrawer() { DR.loader = null; DR.act = {}; $('#drawer-root').innerHTML = ''; }
 
-// ------------------------------------------------------------------- dock
-const D = { id: null, next: 0, lines: [], job: null, open: false, timer: null, filter: '' };
+// -------------------------------------------------------- job log + pane state
+// The log of the followed job is polled here; the right-hand pane (views.js, "PANE")
+// draws it. The pane is part of the page layout, never floats over it, and collapses
+// to a thin rail. Its open/closed state and tab are remembered per browser.
+const D = { id: null, next: 0, lines: [], job: null, timer: null, filter: '', errOnly: false };
+const PN = (() => {
+  let o = {};
+  try { o = JSON.parse(localStorage.getItem('vcfa-pane') || '{}') || {}; } catch (e) { o = {}; }
+  return { open: typeof o.open === 'boolean' ? o.open : window.innerWidth >= 1600, tab: o.tab === 'timeline' ? 'timeline' : 'log', wide: !!o.wide };
+})();
+function savePane() { try { localStorage.setItem('vcfa-pane', JSON.stringify({ open: PN.open, tab: PN.tab, wide: PN.wide })); } catch (e) { /* per-browser nicety only */ } }
 function lineClass(t) {
   if (/^\s*(!|PROBLEM|error|RUN HALTED|!!)|\[!!\]|refus/i.test(t) || /FAILED/.test(t)) return 'bad';
   if (/warning|^\s*~|\|\|/i.test(t)) return 'warn';
@@ -550,11 +559,14 @@ function statusIcon(status) {
 const STATUS_WORD = { running: 'running', succeeded: 'finished', warning: 'finished with warnings', failed: 'failed', stopped: 'stopped' };
 // A job the console was restarted under: not stopped by anyone, cut short.
 const jobWord = j => j.interrupted ? 'interrupted' : (STATUS_WORD[j.status] || j.status);
-function followJob(id, open) {
-  if (D.id !== id) { D.id = id; D.next = 0; D.lines = []; D.job = null; D.filter = ''; }
-  if (open !== undefined) D.open = open;
-  renderDock(true);
+// Follow a job's log. A new job never opens a collapsed pane (it shows on the rail); an open
+// pane switches to its Log tab. `show` is true when the user, or a job the user started, asked.
+function followJob(id, show) {
+  if (D.id !== id) { D.id = id; D.next = 0; D.lines = []; D.job = null; D.filter = ''; D.errOnly = false; }
+  if (show && PN.open && PN.tab !== 'log') { PN.tab = 'log'; savePane(); }
+  renderPane(true);
   pollDock();
+  if (PN.open && typeof paneRefresh === 'function') paneRefresh();   // the job picker lists it
 }
 async function pollDock() {
   clearTimeout(D.timer);
@@ -569,53 +581,9 @@ async function pollDock() {
     D.lines = D.lines.concat(fresh);
     if (window.FX && fresh.length && snap.status === 'running') FX.logActivity(fresh.length);
     if (D.lines.length > 8000) D.lines = D.lines.slice(-8000);
-    renderDock(false, fresh);
+    renderPane(false, fresh);
     if (snap.status === 'running') D.timer = setTimeout(pollDock, 1000);
   } catch (e) { D.timer = setTimeout(pollDock, 3000); }
-}
-function renderDock(full, fresh) {
-  const el = $('#dock');
-  if (!D.id) { el.hidden = true; return; }
-  el.hidden = false;
-  const j = D.job;
-  el.classList.toggle('live', !!(j && j.status === 'running'));
-  const prog = j && j.progress;
-  const bar = html`<div class="dock-bar" data-act="toggleDock">
-      ${statusIcon(j ? j.status : 'running')}
-      <span class="t">${j ? j.title : 'Starting…'}</span>
-      <span class="meta">${j ? html`${jobWord(j)} · ${fmtDur(elapsed(j))}` : ''}</span>
-      ${j && j.status === 'running' && window.FX ? FX.spark() : ''}
-      ${prog && j.status === 'running' ? html`<div class="progress"><span style="width:${pct(prog.done, prog.total)}"></span></div><span class="meta">${n(prog.done)}/${n(prog.total)} ${prog.label}</span>`
-        : (j && j.status === 'running' ? html`<div class="progress indet"><span></span></div>` : html`<span class="grow"></span>`)}
-      ${j && j.stoppable ? html`<button class="btn sm danger-ghost" data-act="stopJob" data-id="${j.id}" ${attr(j.stop_requested, 'disabled')}>${icon('stop')} ${j.stop_requested ? 'Stopping…' : 'Stop'}</button>` : ''}
-      <button class="btn ghost sm" data-act="toggleDock">${icon(D.open ? 'down' : 'up')} ${D.open ? 'Hide' : 'Log'}</button>
-      ${j && j.status !== 'running' ? html`<button class="btn ghost icon sm" data-act="closeDock" aria-label="Close">${icon('x')}</button>` : ''}
-    </div>`;
-  const existingLog = el.querySelector('.log');
-  if (full || !existingLog || !D.open) {
-    el.innerHTML = fmt(html`${bar}${D.open ? html`<div class="dock-body">
-      <div class="dock-tools"><div class="search" style="width:260px">${icon('search')}<input class="input sm" id="dock-filter" placeholder="Filter log" value="${D.filter}" data-input="dockFilter"></div>
-      <span class="small muted grow">${j ? html`${n(j.lines)} lines · started ${fmtTime(j.started_at)}` : ''}</span>
-      <a class="btn sm ghost" href="#/activity?job=${D.id}">Open in Activity</a></div>
-      <div class="log" id="dock-log">${logLines(D.lines, D.filter)}</div></div>` : ''}`);
-    const log = $('#dock-log');
-    if (log) log.scrollTop = log.scrollHeight;
-    return;
-  }
-  // incremental: redraw the bar, append new lines, stick to the bottom if already there
-  const barEl = el.querySelector('.dock-bar');
-  const barHtml = fmt(bar);
-  if (barEl.__markup !== barHtml) {
-    const tmp = document.createElement('div');
-    tmp.innerHTML = barHtml;
-    tmp.firstElementChild.__markup = barHtml;
-    barEl.replaceWith(tmp.firstElementChild);
-  }
-  if (fresh && fresh.length) {
-    const atBottom = existingLog.scrollHeight - existingLog.scrollTop - existingLog.clientHeight < 40;
-    existingLog.insertAdjacentHTML('beforeend', fmt(logLines(fresh, D.filter)));
-    if (atBottom) existingLog.scrollTop = existingLog.scrollHeight;
-  }
 }
 
 // ----------------------------------------------------------- shared actions
@@ -631,7 +599,7 @@ async function startJob(kind, body, quiet) {
     }
     followJob(r.job.id, true);
     S.lastActive = r.job.id;
-    if (!quiet) toast('Started: ' + r.job.title, 'Follow it in the log panel below.', 'info', 3500);
+    if (!quiet) toast('Started: ' + r.job.title, PN.open ? 'Follow it in the Activity pane.' : 'Open the Activity pane on the right to follow it.', 'info', 3500);
     return r.job;
   } catch (e) {
     fail(e);
@@ -976,7 +944,11 @@ function renderNav() {
   const sections = [];
   for (const it of NAV) { if (it.group) sections.push({ g: it, items: [] }); else sections[sections.length - 1].items.push(it); }
   const nxt = nextStepId(p);
-  const item = (it) => html`<a class="nav-item ${S.route === it.id ? 'active' : ''}" href="#/${it.id}">
+  const item = (it) => it.id === 'activity'
+    // Not a page any more: the Activity pane sits beside whatever page is open.
+    ? html`<a class="nav-item ${PN.open ? 'pane-on' : ''}" data-act="togglePane" role="button" tabindex="0" aria-pressed="${PN.open ? 'true' : 'false'}"
+        title="${PN.open ? 'Collapse' : 'Open'} the Activity pane (jobs, logs, timeline)">${icon(it.icon, 'art')}<span>${it.label}</span>${navBadge(it.id, p)}</a>`
+    : html`<a class="nav-item ${S.route === it.id ? 'active' : ''}" href="#/${it.id}">
       ${icon(it.icon, 'art')}<span>${it.label}</span>${navBadge(it.id, p)}</a>`;
   const step = (it) => {
     const done = stepDone(it.id, p), on = S.route === it.id;
@@ -1042,6 +1014,14 @@ function go(id, qs) { location.hash = '#/' + id + (qs ? '?' + qs : ''); }
 async function route() {
   if (S.gated) return;
   const { id, params } = parseHash();
+  if (id === 'activity') {
+    // An old link: open the pane and leave the page you are on exactly as it is (no rebuild, no lost edits).
+    paneOpen(params.tab || 'timeline', params);
+    const q = new URLSearchParams(S.route ? S.params || {} : {}).toString();
+    history.replaceState(null, '', '#/' + (S.route || 'overview') + (q ? '?' + q : ''));
+    if (S.route) return;
+    return route();
+  }
   const v = VIEWS[id];
   if (S.view && S.view.leave) S.view.leave(S.view);
   S.view = v; S.route = id; S.params = params;
@@ -1094,9 +1074,8 @@ const GLOBAL_ACT = {
   vm: (t) => vmDrawer(t.dataset.moref),
   batch: (t) => batchDrawer(t.dataset.ns, t.dataset.name),
   closeDrawer: () => closeDrawer(),
-  toggleDock: (t, e) => { if (e.target.closest('button') && e.target.closest('button') !== t) return; D.open = !D.open; renderDock(true); },
-  closeDock: () => { D.id = null; D.open = false; clearTimeout(D.timer); renderDock(true); },
-  showJob: (t) => followJob(t.dataset.id, true),
+  togglePane: () => paneToggle(),
+  showJob: (t) => paneShowJob(t.dataset.id),
   stopJob: async (t) => {
     const ok = await modal({ title: 'Stop this job?', ic: 'stop', confirm: 'Stop',
       body: html`<p>No new batches are applied. Batches already on the cluster are polled to completion, so the job may take a little while to wind down. Nothing is rolled back.</p>` });
@@ -1157,7 +1136,6 @@ function wireEvents() {
       const t = e.target.closest('[data-' + type + ']');
       if (!t) return;
       const name = t.dataset[type];
-      if (name === 'dockFilter') { D.filter = t.value; const log = $('#dock-log'); if (log) mount(log, logLines(D.lines, D.filter)); return; }
       const fn = findAct(name);
       if (fn) Promise.resolve(fn(t, e, S.view)).catch(fail);
     });
@@ -1166,6 +1144,9 @@ function wireEvents() {
     if (e.key === 'Escape' && DR.loader && !$('#modal-root').innerHTML) closeDrawer();
     const t = e.target.closest && e.target.closest('[data-enter]');
     if (t && e.key === 'Enter') { const fn = findAct(t.dataset.enter); if (fn) { e.preventDefault(); Promise.resolve(fn(t, e, S.view)).catch(fail); } }
+    // A link-styled control with no href (the Activity pane toggle) answers Enter and Space like a button.
+    const rb = e.target.closest && e.target.closest('a[role="button"][data-act]');
+    if (rb && (e.key === 'Enter' || e.key === ' ')) { const fn = findAct(rb.dataset.act); if (fn) { e.preventDefault(); Promise.resolve(fn(rb, e, S.view)).catch(fail); } }
   });
   for (const type of ['dragstart', 'dragover', 'dragleave', 'drop', 'dragend']) {
     document.addEventListener(type, (e) => {
@@ -1196,6 +1177,7 @@ async function pulse() {
     }
     renderNav();
     renderTopbar();
+    if (typeof paneOnPulse === 'function') paneOnPulse(p);
     if (window.FX) FX.onPulse(p);
     const sig = JSON.stringify([p.counts, p.discovered, p.live_batches]);
     const v = S.view;
@@ -1225,6 +1207,7 @@ async function jobFinished(id) {
   const kind = { succeeded: 'ok', warning: 'warn', failed: 'bad', stopped: 'warn' }[j.status] || 'info';
   toast(j.title + ' ' + jobWord(j), j.error || jobSummary(j), kind, 8000);
   if (D.id === id) pollDock();
+  if (typeof paneRefresh === 'function') paneRefresh();
   if (j.kind === 'discover' && typeof CNS !== 'undefined') {
     // A fresh vc_namespaces/vc_networks snapshot just landed server-side (the
     // console's own 120s cache is already dropped): drop these page-session
@@ -1275,6 +1258,8 @@ async function boot() {
   S.gated = false;
   const recent = S.pulse.job;
   if (recent) { S.lastActive = recent.id; followJob(recent.id, false); }
+  renderPane(true);
+  if (PN.open) paneLoad();
   renderNav();
   await route();
   if (window.HELP) HELP.maybeWelcome();
