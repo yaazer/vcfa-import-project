@@ -641,7 +641,7 @@ function tgtRows(v) {
   const snList = sn ? sn.subnets.filter((x) => hit(x.name, x.namespace, x.display)) : [];
   const pgList = pg ? pg.portgroups.filter((x) => hit(x.name)).sort((a, b) => (b.selected - a.selected) || (b.vms - a.vms) || a.name.localeCompare(b.name)) : [];
   const nsRow = !c ? looking : html`${nsList.slice(0, TGT_SHOW).map((x) => html`<button type="button" class="chip nschip ${used.ns.has(x.name) ? 'on' : ''}" data-act="pickNs" data-ns="${x.name}"
-      title="${NS_SEEN[x.source] || ''} · click to put it in the namespace field you last clicked">${x.name}</button>`)}
+      title="${NS_SEEN[x.source] || ''} · ${(c.policies || {})[x.name] ? 'offers storage policies: ' + c.policies[x.name].join(', ') : 'storage policies not read yet'} · click to put it in the namespace field you last clicked">${x.name}</button>`)}
     ${more(nsList.length, TGT_SHOW)}${nsList.length ? '' : none('none found')}`;
   const snRow = !sn ? looking : html`${snList.slice(0, TGT_SHOW).map((x) => html`<button type="button" class="chip nschip sbchip ${used.subnets.has(x.name) ? 'on' : ''}" data-act="pickSubnet"
       data-name="${x.name}" data-kind="${x.kind}" title="${x.kind} in namespace ${x.namespace}${x.display ? ' · shown in VCF Automation as ' + x.display : ''} · click to put it in the subnet field you last clicked">${x.name}<small>${x.namespace}</small></button>`)}
@@ -662,13 +662,16 @@ function targetsPanel(v) {
   const badSubnets = [...used.subnets].filter((x) => subnetKnown(x) === false).sort();
   const badPg = [...used.pg].filter((x) => pgKnown(x) === false).sort();
   const cnt = (d, len, what) => (d ? plural(len, what) : '… ' + what + 's');
-  const warn = missingNs.length || badSubnets.length || badPg.length;
+  // Namespaces the maps use whose storage policies were never read: their VMs are held back until they are.
+  const noPolicies = c && c.policies ? [...used.ns].filter((x) => !(x in c.policies)).sort() : [];
+  const warn = missingNs.length || badSubnets.length || badPg.length || noPolicies.length;
   return html`<div class="card nsbar">
     <details class="tgt" ${attr(v.tgtOpen, 'open')} data-toggle="tgtOpen">
       <summary class="card-h"><h3>${icon('chevron', 'tgt-caret')} What you can map to</h3>
         <span class="sub">${cnt(c, c ? c.namespaces.length : 0, 'namespace')} · ${cnt(sn, sn ? sn.subnets.length : 0, 'subnet')} · ${cnt(pg, pg ? pg.portgroups.length : 0, 'portgroup')}
           ${sn && sn.checked_at ? ' · checked ' + fmtTime(sn.checked_at) : ''} · <span class="when-open">click a name to fill the field you are in</span><span class="when-closed">expand for the list</span></span>
-        <div class="tools"><button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again and re-read the discovery">${icon('refresh')} Refresh</button></div></summary>
+        <div class="tools"><button class="btn xs ghost" data-act="readCatalog" title="Ask vCenter again for its namespaces, their subnets and the storage policies each offers (no VMs are read)">${icon('discover')} Read from vCenter</button>
+          <button class="btn xs ghost" data-act="nsRefresh" title="Ask the Supervisor again and re-read the discovery">${icon('refresh')} Refresh</button></div></summary>
       <div class="card-b stack" style="gap:10px">
         <div class="search tgt-q">${icon('search')}<input class="input sm" id="tgt-q" data-input="tgtQ" value="${v.tgtQ || ''}" placeholder="Filter namespaces, subnets and portgroups…" autocomplete="off"></div>
         <div id="tgt-rows" class="stack" style="gap:10px">${tgtRows(v)}</div>
@@ -679,6 +682,9 @@ function targetsPanel(v) {
         <span class="mono">${missingNs.join(', ')}</span>. Check the spelling; VMs mapped there would fail preflight.</div>` : ''}
       ${badSubnets.length ? html`<div class="note warn"><b>${plural(badSubnets.length, 'subnet')} in the portgroup map not found on the Supervisor:</b>
         <span class="mono">${badSubnets.join(', ')}</span>. Check the spelling; in a VPC namespace use the name from the VPC’s own namespace.</div>` : ''}
+      ${noPolicies.length ? html`<div class="note warn"><b>${plural(noPolicies.length, 'namespace')} in these maps with no storage policies on record:</b>
+        <span class="mono">${noPolicies.join(', ')}</span>. VMs mapped there are held back from precheck until vCenter has been asked which policies they offer.
+        <button class="btn xs" data-act="readCatalog">${icon('discover')} Read from vCenter</button></div>` : ''}
       ${badPg.length ? html`<div class="note warn"><b>${plural(badPg.length, 'portgroup entry', 'portgroup entries')} match no portgroup in vCenter:</b>
         <span class="mono">${badPg.join(', ')}</span>. Check the spelling (as of the last discovery).</div>` : ''}
     </div>` : ''}</div>`;
@@ -1460,13 +1466,26 @@ async function replan(v, full) {
   mount($('#ex-go'), goButton(v));
 }
 const replanSoon = debounce((v) => replan(v, false), 350);
+// Namespaces, their subnets and each one's storage policies, from vCenter, without reading VMs. Needs the
+// credentials Discover remembered (or the console's environment); without them it says so and opens Discover.
+async function readCatalog() {
+  const job = await startJob('catalog', {}, true);
+  if (!job) { go('discover'); return; }
+  toast('Reading namespaces from vCenter', 'Held-back VMs are re-judged when it finishes.', 'info', 3500);
+}
+Object.assign(GLOBAL_ACT, { readCatalog });
+
+function heldTag(reasons) {
+  if (!reasons || !reasons.length) return '';
+  return html`<div class="held-tag" title="${reasons.map((r) => r.title + (r.detail ? ': ' + r.detail : '')).join(' · ')}\"><span class=\"tag bad\">held back</span> <span class="tiny">${reasons[0].title}${reasons.length > 1 ? ' +' + (reasons.length - 1) : ''}</span></div>`;
+}
 function planTable(v) {
   if (v.planErr) return html`<div class="note bad">${v.planErr}</div>`;
   const pl = v.plan;
   if (!pl.plan.length) {
     const why = v.opt.stage === 'import' && S.info.settings.require_precheck && !v.opt.no_precheck
       ? 'Import only takes VMs that passed precheck. Precheck first, or choose other waves.' : 'No VM in the chosen waves and scope is eligible.';
-    return html`<div class="note">${why}</div>`;
+    return html`<div class="note">${why}${pl.held_vms ? html` <b>${plural(pl.held_vms, 'VM')} ${pl.held_vms === 1 ? 'is' : 'are'} held back, and why is below.</b>` : ''}</div>${heldCard(pl)}`;
   }
   const basis = pl.plan[0] && pl.plan[0].basis === 'measured' ? 'measured batch times from this campaign' : 'a default batch time, until batches have run here';
   return html`<table class="t compact" style="border:1px solid var(--line);border-radius:8px"><thead><tr><th>Wave</th><th class="right">VMs</th><th class="right">Batches</th><th>Namespaces</th><th class="right">Time ${tip('eta')}</th></tr></thead><tbody>
@@ -1474,12 +1493,36 @@ function planTable(v) {
       <td class="small mono">${p.namespaces.join(', ')}</td><td class="right small nowrap">${eta(p.seconds)}</td></tr>`)}
     <tr><td><b>Total</b></td><td class="right num"><b>${n(pl.total)}</b></td><td class="right num"><b>${n(pl.plan.reduce((a, p) => a + p.batches, 0))}</b></td><td></td><td class="right nowrap"><b>${eta(pl.seconds)}</b></td></tr></tbody></table>
     <div class="tiny faint mt-s">Times use ${basis}; waves run one after another.</div>
-    ${(pl.holdbacks || []).length ? html`<div class="note warn mt-s"><b>Held back:</b><ul class="plain">${pl.holdbacks.map((h) => html`<li>${h}</li>`)}</ul></div>` : ''}
+    ${(pl.held || []).length ? heldCard(pl) : (pl.holdbacks || []).length ? html`<div class="note warn mt-s"><b>Held back:</b><ul class="plain">${pl.holdbacks.map((h) => html`<li>${h}</li>`)}</ul></div>` : ''}
     ${(pl.left_over || []).length ? html`<div class="note warn mt-s"><b>${plural(pl.left_over.length, 'VM')} not in your current selection ${tip('leftover')}</b>
       <ul class="plain small">${pl.left_over.slice(0, 10).map((m) => html`<li><b>${m.vm_name}</b> <span class="mono tiny">${m.moref}</span> · wave ${m.wave} · queued ${fmtTime(m.queued_at, true)}</li>`)}</ul>
       ${pl.left_over.length > 10 ? html`<div class="tiny">and ${n(pl.left_over.length - 10)} more</div>` : ''}
       <div class="tiny">Staged in an earlier session. Deselecting does not take a VM out of the queue; skip it in the Import queue to keep it out.</div></div>` : ''}
     ${(pl.members || []).length ? html`<div class="small mt-s"><b>VMs in this run:</b> ${pl.members.slice(0, 40).map((m) => m.vm_name).join(', ')}${pl.members.length > 40 ? html` <span class="faint">and ${n(pl.members.length - 40)} more</span>` : ''}</div>` : ''}`;
+}
+// Why VMs in scope are not in this run: one block per cause (eligibility.py), each with what it means,
+// what to do, where to do it, and the VMs it holds back. Shown whether or not anything else is eligible.
+const HELD_SHOWN = 8;
+function heldCard(pl) {
+  const groups = pl.held || [];
+  if (!groups.length) return '';
+  const LABEL = { discover: 'Open Discover', stage: 'Open Map & Stage', select: 'Open Select VMs', queue: 'Open the Import queue' };
+  const go = (g) => (g.where === 'catalog'
+    ? html`<button class="btn xs primary" data-act="readCatalog">${icon('discover')} Re-read namespaces &amp; policies from vCenter</button>`
+    : LABEL[g.where] ? html`<button class="btn xs" data-act="go" data-to="${g.where}">${LABEL[g.where]}</button>` : '');
+  return html`<div class="held" id="ex-held">
+    <div class="held-h"><span class="held-ic">${icon('triage')}</span>
+      <div><b>${plural(pl.held_vms, 'VM')} held back</b> ${tip('held_back')}<div class="small muted">They are left out of this run until the cause is fixed; nothing is guessed.</div></div></div>
+    ${groups.map((g) => html`<div class="held-g" data-code="${g.code}">
+      <div class="held-t"><b>${g.title}</b> <span class="tag bad">${plural(g.count, 'VM')}</span></div>
+      <div class="held-why">${g.why}</div>
+      <div class="held-fix"><b>To fix:</b> ${g.fix} ${go(g)}</div>
+      <table class="t compact held-vms"><tbody>${g.vms.slice(0, HELD_SHOWN).map((x) => html`<tr class="click" data-act="vm" data-moref="${x.moref}">
+        <td class="nowrap"><b>${x.vm_name}</b><div class="tiny faint mono">${x.moref}</div></td>
+        <td class="small mono nowrap">${x.namespace || html`<span class="faint">no namespace</span>`}</td>
+        <td class="small">${x.detail}</td></tr>`)}</tbody></table>
+      ${g.count > HELD_SHOWN ? html`<div class="tiny faint">and ${n(g.count - HELD_SHOWN)} more: filter the Import queue by <b>held back</b>.</div>` : ''}
+    </div>`)}</div>`;
 }
 function goButton(v) {
   const pl = v.plan, imp = v.opt.stage === 'import', busy = !!(S.pulse && S.pulse.job);
@@ -1502,17 +1545,21 @@ function preflightResult(pf) {
 VIEWS.queue = view({
   title: 'Import queue', sub: 'Every staged VM and where it stands', live: true,
   init(v, p) {
-    v.f = { states: new Set(p.state ? p.state.split(',') : []), q: p.q || '', wave: p.wave || '', ns: p.ns || '', folder: '', app: p.app || '', verify: '' };
+    v.f = { states: new Set(p.state ? p.state.split(',') : []), q: p.q || '', wave: p.wave || '', ns: p.ns || '', folder: '', app: p.app || '', verify: '', held: !!p.held };
     v.sort = { key: 'wave', dir: 1 };
     v.page = 0;
     v.checked = new Set();
   },
-  async load(v) { const d = await GET('/api/vms'); v.vms = d.vms; v.byMoref = new Map(v.vms.map((x) => [x.moref, x])); S.waves = uniq(v.vms.map((x) => x.wave)).sort((a, b) => a - b); },
+  async load(v) {
+    const d = await GET('/api/vms'); v.vms = d.vms; v.byMoref = new Map(v.vms.map((x) => [x.moref, x])); S.waves = uniq(v.vms.map((x) => x.wave)).sort((a, b) => a - b);
+    // Why queued VMs are not moving: a failed read never blocks the page.
+    try { v.elig = await GET('/api/eligibility'); } catch (e) { v.elig = null; }
+  },
   paint(v) {
     if (!v.vms.length) return emptyState('queue', 'The import queue is empty', 'Stage VMs from the Map & Stage step.', html`<button class="btn primary" data-act="go" data-to="stage">Map & Stage</button>`);
     const f = v.f, q = f.q.trim().toLowerCase();
     const base = v.vms.filter((x) => (!f.wave || String(x.wave) === f.wave) && (!f.ns || x.namespace === f.ns) && (!f.folder || inFolder(x.folder || '', f.folder)) &&
-      (!f.app || x.app === f.app) && (!f.verify || (f.verify === 'none' ? x.state === 'committed' && !x.verify_state : x.verify_state === f.verify)) &&
+      (!f.app || x.app === f.app) && (!f.held || !!(v.elig && v.elig.by_moref[x.moref])) && (!f.verify || (f.verify === 'none' ? x.state === 'committed' && !x.verify_state : x.verify_state === f.verify)) &&
       (!q || [x.vm_name, x.moref, x.message, x.batch_name, x.precheck_batch, x.folder, x.app].join(' ').toLowerCase().includes(q)));
     const apps = uniq(v.vms.map((x) => x.app)).sort();
     const counts = countBy(base, 'state');
@@ -1533,7 +1580,8 @@ VIEWS.queue = view({
       <div class="toolbar thin">${savedViews('queue')}</div>
       <div class="toolbar"><div class="chips">
         <span class="chip ${f.states.size ? '' : 'on'}" data-act="st" data-s="">All <span class="n">${n(base.length)}</span></span>
-        ${STATE_ORDER.filter((s) => counts[s]).map((s) => html`<span class="chip ${f.states.has(s) ? 'on' : ''}" data-act="st" data-s="${s}">${dot(s)} ${label(s)} <span class="n">${n(counts[s])}</span></span>`)}</div></div>
+        ${STATE_ORDER.filter((s) => counts[s]).map((s) => html`<span class="chip ${f.states.has(s) ? 'on' : ''}" data-act="st" data-s="${s}">${dot(s)} ${label(s)} <span class="n">${n(counts[s])}</span></span>`)}
+        ${v.elig && v.elig.vms ? html`<span class="chip ${f.held ? 'on' : ''}" data-act="heldOnly" title="${v.elig.headline || ''}">${icon('triage')} Held back <span class="n">${n(v.elig.vms)}</span></span>` : ''}</div></div>
       ${checked.length ? html`<div class="bulkbar"><span><b>${n(checked.length)}</b> checked</span>
         <button class="btn sm" data-act="bRetry">${icon('refresh')} Retry</button>
         <button class="btn sm" data-act="bSkip">${icon('skip')} Skip</button>
@@ -1548,7 +1596,7 @@ VIEWS.queue = view({
         ${th(v, 'vm_name', 'VM')}${th(v, 'state', 'State')}${th(v, 'verify_state', html`Verified ${tip('verification')}`)}${th(v, 'app', 'App')}${th(v, 'wave', 'Wave')}${th(v, 'namespace', 'Namespace')}${th(v, 'folder', 'Folder')}${th(v, 'batch_name', 'Batch')}${th(v, 'attempts', 'Att.')}${th(v, 'message', 'Message')}${th(v, 'updated_at', 'Updated')}</tr></thead>
         <tbody>${pageRows.map((x) => html`<tr class="click ${v.checked.has(x.moref) ? 'on' : ''}" data-act="vm" data-moref="${x.moref}">
           <td class="chk"><input type="checkbox" data-act="chk" data-moref="${x.moref}" ${attr(v.checked.has(x.moref), 'checked')}></td>
-          <td><span class="vm-name">${x.vm_name}<small>${x.moref}</small></span></td><td>${pill(x.state)}</td><td>${verifyTag(x.verify_state, x.verified_at)}</td><td>${appTag(x.app)}</td><td class="num">${x.wave}</td>
+          <td><span class="vm-name">${x.vm_name}<small>${x.moref}</small></span></td><td>${pill(x.state)}${heldTag(v.elig && v.elig.by_moref[x.moref])}</td><td>${verifyTag(x.verify_state, x.verified_at)}</td><td>${appTag(x.app)}</td><td class="num">${x.wave}</td>
           <td class="mono small nowrap">${x.namespace}</td><td class="small clip" title="${x.folder}">${x.folder || '/'}</td>
           <td class="mono tiny nowrap">${x.batch_name || x.precheck_batch || ''}</td><td class="num">${x.attempts}</td>
           <td class="msg"><div title="${x.message || ''}">${x.message || ''}</div></td><td class="small muted nowrap">${fmtTime(x.updated_at)}</td></tr>`)}</tbody></table></div>
@@ -1558,6 +1606,7 @@ VIEWS.queue = view({
     q: debounce((t, e, v) => { v.f.q = t.value; v.page = 0; v.render(); }, 180),
     folderF: debounce((t, e, v) => { v.f.folder = t.value.trim(); v.page = 0; v.render(); }, 250),
     filter(t, e, v) { v.f[t.dataset.k] = t.value; v.page = 0; v.render(); },
+    heldOnly(t, e, v) { v.f.held = !v.f.held; v.page = 0; v.render(); },
     st(t, e, v) { const s = t.dataset.s; if (!s) v.f.states.clear(); else if (v.f.states.has(s)) v.f.states.delete(s); else v.f.states.add(s); v.page = 0; v.render(); },
     sort(t, e, v) { const k = t.dataset.key; v.sort = { key: k, dir: v.sort.key === k ? -v.sort.dir : 1 }; v.render(); },
     page(t, e, v) { v.page = +t.dataset.page; v.render(); window.scrollTo(0, 0); },

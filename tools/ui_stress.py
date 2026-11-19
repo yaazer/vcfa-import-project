@@ -527,6 +527,16 @@ const SCENARIOS = {
     const before = await counts();
     check('the plan shows batches for wave 2', await waitFor(() => document.querySelector('#ex-plan table'), 8000));
     check('the plan names the VMs in the run', /VMs in this run:/.test(document.querySelector('#ex-plan').textContent));
+    // Held-back VMs are explained where they would have run: a cause, why, the fix and the VMs.
+    const held = await waitFor(() => document.querySelector('#ex-held .held-g[data-code="sp_not_offered"]'), 5000);
+    check('held-back VMs are explained on Execute, with a cause and a fix', held && /does not offer/.test(held.textContent) && held.querySelector('.held-fix') && /db-002/.test(held.textContent), held && held.textContent.slice(0, 200));
+    check('the explanation names the policy and what the namespace offers', held && /'?Bronze'?|pol-bronze/.test(held.textContent) && /offers/.test(held.textContent));
+    // The catalog read: namespaces, subnets and policies from vCenter without reading VMs; the wrong-policy VMs stay held.
+    const catKnown = await jobIds();
+    click('#ex-held [data-act="readCatalog"]');
+    const catJob = await waitJob('catalog', catKnown);
+    check('"Re-read namespaces & policies" runs as a job and succeeds', catJob && catJob.status === 'succeeded', catJob && (catJob.error || catJob.status));
+    check('and the VMs on the wrong policy are still explained afterwards', await waitFor(() => document.querySelector('#ex-held .held-g[data-code="sp_not_offered"]'), 8000));
     click('[data-act="start"]');
     const yes = await waitFor(() => document.querySelector('.modal [data-m="yes"]'));
     check('precheck asks for confirmation', yes);
@@ -594,6 +604,13 @@ const SCENARIOS = {
 
   async drawers() {
     await open('queue');
+    check('the queue offers a Held back filter', await waitFor(() => document.querySelector('#view [data-act="heldOnly"]'), 5000));
+    click('[data-act="heldOnly"]');
+    check('the held-back filter shows only those VMs', await waitFor(() => {
+      const rows = [...document.querySelectorAll('#view tbody tr[data-act="vm"]')];
+      return rows.length >= 2 && rows.every((r) => r.querySelector('.held-tag'));
+    }, 4000));
+    click('[data-act="heldOnly"]');
     click('#view tbody tr[data-act="vm"]');
     check('VM drawer shows history', await waitFor(() => document.querySelectorAll('.drawer .timeline .tl').length > 0));
     const b = document.querySelector('.drawer [data-act="batch"]');
@@ -1415,12 +1432,16 @@ def run_execute(app, params):
 
 
 # What a real discover records for a VM on a compliant policy the target namespaces offer (the hand-built VMs below).
+HELD_VMS = "db-002,db-010"
 POLICY_OK = {"storage_compliance": {"overall": "COMPLIANT"},
              "storage_policies": {"vm_home": "pol-gold-0001", "disks": {}}, "disk_ids": []}
 
 
 def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_action=None, accept=True):
     import demo
+    # Two real VMs on a storage policy their namespace does not offer: held back from precheck with a reason
+    # (the fake reads the same wrong policy on every discover, so another scenario's discover keeps them held).
+    os.environ["FAKE_VC_WRONG_POLICY_VMS"] = HELD_VMS
     vc_server, vc_port = fake_vcenter.serve(count=vms)
     env = demo.setup(tmp, vc_port, scenario, batch_size=8 if vms < 1000 else 25)
     os.environ.update(env)

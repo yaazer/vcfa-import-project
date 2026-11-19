@@ -5545,6 +5545,124 @@ def t_engine_storage_policy_gate():
         store.close()
 
 
+@test("eligibility: every hold-back is a per-VM record with a cause, grouped with the fix, "
+      "and the plan API says why even when nothing at all is eligible")
+def t_eligibility_causes_and_plan():
+    from vcfaimport import eligibility, service
+    from vcfaimport import state as vst
+    from vcfaimport.engine import Engine
+    with tempfile.TemporaryDirectory() as tmp:
+        c = _Console(tmp)
+        try:
+            store = c.app.store
+            _seed_store_with_vms(store, 5, waves=(1,))
+            facts = {
+                "vm-1001": _good_storage_facts(BRONZE_POLICY),        # compliant, wrong policy for ns-a
+                "vm-1002": dict(_good_storage_facts(), storage_policies={"vm_home": GOLD_POLICY, "disks": {}}),
+                "vm-1003": {"storage_compliance": {"overall": "COMPLIANT"}, "disk_ids": ["2000"]},   # never read
+                "vm-1004": {"storage_compliance": {"overall": "NON_COMPLIANT"}, "disk_ids": []},
+            }
+            for moref, f in facts.items():
+                store.conn.execute("UPDATE discovered SET facts_json=? WHERE moref=?", (json.dumps(f), moref))
+            store.conn.commit()
+
+            ov = c.ok("GET", "/api/eligibility")
+            by = {g["code"]: g for g in ov["groups"]}
+            eq(sorted(by), ["sp_missing", "sp_noncompliant", "sp_not_offered", "sp_unread"])
+            eq([g["code"] for g in ov["groups"]], [x for x in eligibility.ORDER if x in by], "most actionable first")
+            assert "disk 2000 uses 'Bronze'" in by["sp_not_offered"]["vms"][0]["detail"]
+            assert "namespace ns-a offers: 'Gold'" in by["sp_not_offered"]["vms"][0]["detail"]
+            assert by["sp_not_offered"]["fix"] and by["sp_not_offered"]["why"], "each cause says what to do"
+            eq(by["sp_unread"]["where"], "discover")
+            eq(sorted(ov["by_moref"]), ["vm-1001", "vm-1002", "vm-1003", "vm-1004"])
+            eq(ov["vms"], 4)
+            assert "held back" in ov["headline"], ov["headline"]
+
+            # The namespace was never read: every VM is held for that one reason (not for its own policies).
+            store.set_meta("vc_storage_policies", {"namespaces": {}, "names": {}})
+            ov = c.ok("GET", "/api/eligibility")
+            assert "ns_unread" in {g["code"] for g in ov["groups"]}
+            ns = next(g for g in ov["groups"] if g["code"] == "ns_unread")
+            assert "namespace ns-a" in ns["vms"][0]["detail"], ns["vms"][0]
+
+            # Nothing eligible at all: the plan still carries the explanation (it used to say only
+            # "No VM is eligible", the reason shown only when something else was).
+            plan = c.ok("POST", "/api/execute/preview", {"stage": "precheck"})
+            eq(plan["plan"], [])
+            assert plan["held"] and plan["held_vms"] == 5, plan.get("held_vms")
+            assert all(g["fix"] for g in plan["held"])
+            # CLI/log text comes from the same records.
+            eng = Engine(c.app.cfg, store, None, lambda m: None)
+            lines = service.held_lines(service.holds(eng, "precheck")[1])
+            assert any("fix:" in l for l in lines) and any("why:" in l for l in lines), lines
+            # Settled: the named override clears the lot.
+            c.app.cfg.storage_compliance_enforce = False
+            eq(c.ok("GET", "/api/eligibility")["groups"], [])
+        finally:
+            c.close()
+
+
+@test("catalog: reading namespaces, subnets and policies on their own (no VMs) clears the namespace-unknown "
+      "hold, names what vCenter lists and what it does not, and refuses another vCenter's cache")
+def t_read_catalog():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_vcenter
+    from vcfaimport import eligibility, service
+    from vcfaimport.discovery import SelectionError
+    from vcfaimport.engine import Engine
+    from vcfaimport.vcenter import VCenterClient
+
+    listed = "migration-testing-ns-kcvm5"
+    server, port = fake_vcenter.serve(count=3)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            _seed_store_with_vms(store, 4, waves=(1,))
+            for moref, ns in (("vm-1000", listed), ("vm-1001", listed), ("vm-1002", listed), ("vm-1003", "ghost-ns")):
+                store.conn.execute("UPDATE vms SET namespace=? WHERE moref=?", (ns, moref))
+            store.set_meta("vc_storage_policies", {"namespaces": {}, "names": {}})
+            store.conn.commit()
+            cfg = Config()
+            cfg.kubectl, cfg.workdir = "vcfa-test-no-such-kubectl", tmp
+            engine = Engine(cfg, store, None, lambda m: None)
+            by = lambda: {g["code"]: g for g in service.eligibility_overview(engine)["groups"]}
+            eq(sorted(by()), ["ns_unread"], "before: nothing about any namespace is known")
+            eq(by()["ns_unread"]["count"], 4)
+
+            lines = []
+            client = VCenterClient("http://127.0.0.1:{}".format(port), fake_vcenter.USER, fake_vcenter.PASSWORD)
+            client.connect()
+            try:
+                out = service.read_catalog(client, store, "http://127.0.0.1:{}".format(port), log=lines.append)
+            finally:
+                client.close()
+            text = "\n".join(lines)
+            assert "namespaces: vCenter lists 2: migration-testing-ns-kcvm5, testing-vpc-k826r" in text, text
+            assert "the queue targets 1 that vCenter does not list: ghost-ns" in text, text
+            assert "subnets: 2 NSX Subnet/SubnetSet(s) read from 2 of 2 namespace(s)" in text, text
+            assert "migration-testing-ns-kcvm5: subnet-local" in text, text
+            assert "migration-testing-ns-kcvm5 offers 'DS2-Thick', 'Gold'" in text, text
+            assert "storage policies: not read for 1: ghost-ns" in text, text
+            eq((out["namespaces"], out["subnets"]), (2, 2))
+
+            g = by()
+            eq(sorted(g), ["ns_unread"], "the three real namespaces are settled; only ghost-ns is still unknown")
+            eq([v["namespace"] for v in g["ns_unread"]["vms"]], ["ghost-ns"])
+            assert store.get_meta("vc_namespaces")["namespaces"], "the pick lists get the namespaces too"
+            assert store.get_meta("vc_subnets")["subnets"]
+
+            # The cache came from another vCenter: its namespaces must not be applied to these VMs.
+            store.set_meta("vcenter", "other-vcenter.example")
+            try:
+                service.read_catalog(None, store, "http://127.0.0.1:{}".format(port))
+                raise AssertionError("another vCenter's catalog was accepted")
+            except SelectionError as exc:
+                assert "other-vcenter.example" in str(exc), exc
+            store.close()
+    finally:
+        server.shutdown()
+
+
 @test("storage policy vs namespace: the live recheck holds back a batch whose VM moved to a "
       "policy the namespace does not offer, and refreshes the cached facts and snapshot")
 def t_engine_storage_policy_live_filter():
@@ -6469,7 +6587,7 @@ def t_e2e_vcenter_namespaces():
                          ["migration-testing-ns-kcvm5/subnet-local", "testing-vpc-k826r/migration-testing"])
             cfg_path = _write_config(tmp)
             out = _run_cli(["-c", cfg_path, "discover"], env, tmp).stdout
-            assert "2 Supervisor namespace(s) known to vCenter" in out, out
+            assert "namespaces: vCenter lists 2: migration-testing-ns-kcvm5, testing-vpc-k826r" in out, out
 
             cfg = Config.load(cfg_path)
             with Store(store_path(cfg)) as store:
@@ -7449,7 +7567,7 @@ UNIT = [
     t_engine_storage_compliance_gate, t_engine_storage_compliance_live_filter,
     t_engine_storage_compliance_live_filter_real_client,
     t_stage_moves_queued_vms, t_web_stage_moves_queued,
-    t_vcenter_storage_policy_problems, t_engine_storage_policy_gate,
+    t_vcenter_storage_policy_problems, t_engine_storage_policy_gate, t_eligibility_causes_and_plan, t_read_catalog,
     t_engine_storage_policy_live_filter, t_discover_storage_policy_real_client,
     t_web_roles_settings,
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,

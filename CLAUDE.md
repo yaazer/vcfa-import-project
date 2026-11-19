@@ -69,6 +69,13 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   colours in `vars`, their structure in the `app.css` skin block and icons in `skins.js`.
   Colour-art icon sets (not `everywhere`) only render where `icon(name, 'art')` marks
   the slot (nav, palette, empty states, folder rows). Skins are flat: no aurora or glass.
+- **Every hold-back is a record, not just a sentence.** `Engine.eligible()` appends to `engine.held`
+  (`eligibility.hold`: code, VM, detail) beside the text in `engine.holdbacks`; `eligibility.CAUSES` says what each code
+  means and how to fix it. The Execute plan (`held`, shown even when nothing is eligible), the Import queue badges
+  (`/api/eligibility`), the CLI and the discover log all render those records. A new reason for holding a VM back needs a
+  code and a CAUSES entry, never only a string. Unknown still means held (fail closed).
+- **`service.read_catalog` / `catalog`** re-reads namespaces, subnets and per-namespace policies with no VMs, and refuses a
+  vCenter other than the cache's. Discover uses the same `vcenter.read_namespace_catalog`.
 - **The five stages flow top to bottom.** Their pages are one column: numbered `flowSec`
   sections ending in a `flowNext` bar to the next stage (views.js); no side-by-side grids
   there. The sidebar is the `FLOW` stepper plus collapsible groups (`NAV` group markers,
@@ -134,6 +141,7 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
 | `vcfaimport/web/server.py` | `serve`: stdlib HTTP server, token + Host checks, static assets via `pkgutil` (works in .pyz/.exe) |
 | `vcfaimport/web/api.py` | JSON API; `ROUTES` table; cluster-touching actions start jobs, DB-only ones run inline |
 | `vcfaimport/web/jobs.py` | background jobs: one at a time, own `Store`, log streamed + kept in `<workdir>/jobs/` |
+| `vcfaimport/eligibility.py` | why a VM is held back: one record per VM and cause (`hold`), what each cause means and how to fix it, grouping for the console / CLI / discover log |
 | `vcfaimport/readiness.py` | advisory pre-precheck rules over discovery facts: ready / warn / block |
 | `vcfaimport/estimate.py` | batch-time median (measured or default) + parallel-limit simulation -> ETA |
 | `vcfaimport/schedule.py` | change windows: states, due / missed, deadline |

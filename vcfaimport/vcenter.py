@@ -705,49 +705,60 @@ def storage_compliance_checker(
     return check
 
 
-def storage_policy_problems(attached: Optional[Dict[str, Any]], disk_ids: Sequence[str],
+def storage_policy_findings(attached: Optional[Dict[str, Any]], disk_ids: Sequence[str],
                             namespace: str, allowed: Optional[Sequence[str]],
-                            names: Optional[Dict[str, str]] = None) -> List[str]:
-    """Why a VM's storage policies do not fit its target namespace; [] when they do.
+                            names: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+    """Why a VM's storage policies do not fit its target namespace, as records; [] when they do.
 
     `attached` is a vm_storage_policies() result, `disk_ids` the VM's own disk
     keys (a disk with no policy is missing from `attached`), `allowed` the policy
     ids `namespace` offers (namespace_storage_policies). Fails closed: never
     read, a failed read, an unknown namespace, a home or disk with no policy, and
-    a policy the namespace does not offer all come back as a problem."""
+    a policy the namespace does not offer all come back as a finding.
+
+    Each finding is {"code", "text"}; the codes are eligibility.FINDING_CAUSE's keys.
+    A VM that fails on its policies ends with an "offers" finding naming what the
+    namespace does offer (it is context, not a cause of its own)."""
     names = names or {}
 
     def label(pid: str) -> str:
         return "'{}'".format(names[pid]) if names.get(pid) else pid
     if attached is None:
-        return ["its storage policies were never read (an older discover, or one run "
-                "with --no-storage-compliance)"]
+        return [{"code": "never_read", "text": "its storage policies were never read (an older discover, "
+                 "or one run with --no-storage-compliance)"}]
     if attached.get("error"):
-        return ["vCenter's VM storage-policy call failed (HTTP {}): {}".format(
-            attached.get("status"), attached.get("error"))]
+        return [{"code": "read_failed", "text": "vCenter's VM storage-policy call failed (HTTP {}): {}".format(
+            attached.get("status"), attached.get("error"))}]
     if not namespace:
-        return ["it has no target namespace"]
+        return [{"code": "no_namespace", "text": "it has no target namespace"}]
     if allowed is None:
-        return ["the storage policies namespace {} offers are unknown (vCenter did not list "
-                "them at the last discover)".format(namespace)]
+        return [{"code": "ns_unread", "text": "the storage policies namespace {} offers are unknown (vCenter "
+                 "did not list them at the last discover)".format(namespace)}]
     allowed_set = set(allowed)
-    problems: List[str] = []
+    found: List[Dict[str, str]] = []
     home = attached.get("vm_home") or ""
     if not home:
-        problems.append("VM home has no storage policy")
+        found.append({"code": "home_none", "text": "VM home has no storage policy"})
     elif home not in allowed_set:
-        problems.append("VM home uses {}".format(label(home)))
+        found.append({"code": "home_wrong", "text": "VM home uses {}".format(label(home))})
     disks = attached.get("disks") or {}
     for disk in sorted(set(str(d) for d in (disk_ids or [])) | set(disks)):
         pid = disks.get(disk) or ""
         if not pid:
-            problems.append("disk {} has no storage policy".format(disk))
+            found.append({"code": "disk_none", "text": "disk {} has no storage policy".format(disk)})
         elif pid not in allowed_set:
-            problems.append("disk {} uses {}".format(disk, label(pid)))
-    if problems:
+            found.append({"code": "disk_wrong", "text": "disk {} uses {}".format(disk, label(pid))})
+    if found:
         offers = ", ".join(sorted(label(p) for p in allowed_set)) or "none"
-        problems.append("namespace {} offers: {}".format(namespace, offers))
-    return problems
+        found.append({"code": "offers", "text": "namespace {} offers: {}".format(namespace, offers)})
+    return found
+
+
+def storage_policy_problems(attached: Optional[Dict[str, Any]], disk_ids: Sequence[str],
+                            namespace: str, allowed: Optional[Sequence[str]],
+                            names: Optional[Dict[str, str]] = None) -> List[str]:
+    """storage_policy_findings() as plain sentences; [] when the policies fit."""
+    return [f["text"] for f in storage_policy_findings(attached, disk_ids, namespace, allowed, names)]
 
 
 def storage_policy_checker(
@@ -836,6 +847,102 @@ def _facts(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _names(names: Sequence[str], limit: int = 8) -> str:
+    """": a, b, c ..." for a log line; nothing for an empty list."""
+    if not names:
+        return ""
+    return ": " + ", ".join(names[:limit]) + (" ... and {} more".format(len(names) - limit) if len(names) > limit else "")
+
+
+def read_namespace_catalog(client: VCenterClient, extras: Dict[str, Any], *, with_namespaces: bool = True,
+                           with_subnets: bool = True, with_storage_compliance: bool = True,
+                           policy_namespaces: Sequence[str] = (), concurrency: int = 12,
+                           say: Callable[[str], None] = lambda msg: None) -> None:
+    """What vCenter knows about the places VMs can go: the Supervisor namespaces it lists, the NSX
+    subnets of each, and which storage policies each offers. Fills `extras` ("namespaces", "subnets",
+    "storage_policies"; a key left out, or None, means vCenter could not be asked -- never "there are none").
+
+    Discover calls this beside the VM listing; the console's "Read namespaces & policies" job calls it
+    alone, so a fixed namespace or a new subnet is picked up without reading every VM again.
+    `policy_namespaces` are the namespaces the queue targets: their policies are read even when vCenter
+    does not list them, so a login that cannot list namespaces still learns the ones in use."""
+    if with_namespaces:
+        ns_list = client.namespace_list()
+        extras["namespaces"] = ns_list    # None = could not ask; [] = none configured
+        if ns_list is not None:
+            listed_names = sorted({n["namespace"] for n in ns_list if n.get("namespace")})
+            say("  namespaces: vCenter lists {}{}".format(len(listed_names), _names(listed_names)))
+            missing = sorted(set(n for n in policy_namespaces if n) - set(listed_names))
+            if missing:
+                say("  namespaces: the queue targets {} that vCenter does not list{} -- a typo in the folder map, "
+                    "a namespace on another vCenter, or one this login may not see. Their VMs cannot be "
+                    "checked against a storage policy until that is settled".format(len(missing), _names(missing)))
+            if with_subnets and ns_list:
+                # Per namespace, not a single call: a namespace this failed for
+                # contributes nothing (unknown), never a guessed "it has none".
+                # A namespace that did answer, even with an empty list, is a real
+                # observation and is kept as such.
+                names = sorted({n["namespace"] for n in ns_list if n.get("namespace")})[:50]
+                workers = max(1, min(int(concurrency), 32))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    per_ns = list(pool.map(client.namespace_subnets, names))
+                subnets: List[Dict[str, str]] = []
+                asked, answered = len(names), 0
+                for found in per_ns:
+                    if found is not None:
+                        answered += 1
+                        subnets.extend(found)
+                # None when not one namespace could be asked (e.g. every call got a 403):
+                # that is "could not ask", not "there are none", and must not overwrite a
+                # previously good vc_subnets snapshot with an empty one (record_discovery
+                # only replaces it when this is not None).
+                extras["subnets"] = subnets if answered else None
+                if answered:
+                    by_ns: Dict[str, List[str]] = {}
+                    for sub in subnets:
+                        by_ns.setdefault(sub["namespace"], []).append(sub["name"])
+                    say("  subnets: {} NSX Subnet/SubnetSet(s) read from {} of {} namespace(s)".format(
+                        len(subnets), answered, asked))
+                    for ns_name in sorted(by_ns)[:12]:
+                        say("    {}: {}".format(ns_name, ", ".join(sorted(by_ns[ns_name]))))
+                    if len(by_ns) > 12:
+                        say("    ... and {} more namespace(s)".format(len(by_ns) - 12))
+                    if answered < asked:
+                        say("  subnets: {} namespace(s) could not be asked (no privilege, or vCenter does not "
+                            "know them)".format(asked - answered))
+                else:
+                    say("  vCenter could not be asked for any namespace's subnet list")
+
+    if with_storage_compliance:
+        # Which storage policies each namespace offers: the namespaces vCenter
+        # listed plus any the queue already targets (`policy_namespaces`), so a
+        # login that cannot list namespaces still learns about the ones in use.
+        # Uncapped, unlike subnets: a namespace left out here would block its VMs.
+        listed = [n["namespace"] for n in (extras.get("namespaces") or []) if n.get("namespace")]
+        names = sorted(set(listed) | set(n for n in policy_namespaces if n))
+        if names:
+            workers = max(1, min(int(concurrency), 32))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                per_ns = list(pool.map(client.namespace_storage_policies, names))
+            answered = {ns: found for ns, found in zip(names, per_ns) if found is not None}
+            # None = not one namespace could be asked: keep the last snapshot.
+            extras["storage_policies"] = ({"namespaces": answered,
+                                           "names": client.storage_policy_names()}
+                                          if answered else None)
+            if answered:
+                say("  storage policies: read for {} of {} namespace(s)".format(len(answered), len(names)))
+                for ns_name in sorted(answered)[:12]:
+                    say("    {} offers {}".format(ns_name, ", ".join(
+                        "'{}'".format(client.storage_policy_names().get(pid) or pid)
+                        for pid in sorted(answered[ns_name])) or "no policy"))
+                unread = sorted(set(names) - set(answered))
+                if unread:
+                    say("  storage policies: not read for {}{} -- their VMs are held back".format(
+                        len(unread), _names(unread)))
+            else:
+                say("  vCenter could not be asked which storage policies any namespace offers")
+
+
 def discover(
     client: VCenterClient,
     *,
@@ -868,57 +975,9 @@ def discover(
         # Kept by the caller, so portgroup fields can suggest every portgroup --
         # including ones no discovered VM uses yet.
         extras["networks"] = [{"name": n["name"], "type": n["type"]} for n in network_list if n["name"]]
-        if with_namespaces:
-            ns_list = client.namespace_list()
-            extras["namespaces"] = ns_list    # None = could not ask; [] = none configured
-            if ns_list is not None:
-                say("  {} Supervisor namespace(s) known to vCenter".format(len(ns_list)))
-                if with_subnets and ns_list:
-                    # Per namespace, not a single call: a namespace this failed for
-                    # contributes nothing (unknown), never a guessed "it has none".
-                    # A namespace that did answer, even with an empty list, is a real
-                    # observation and is kept as such.
-                    names = sorted({n["namespace"] for n in ns_list if n.get("namespace")})[:50]
-                    workers = max(1, min(int(concurrency), 32))
-                    with ThreadPoolExecutor(max_workers=workers) as pool:
-                        per_ns = list(pool.map(client.namespace_subnets, names))
-                    subnets: List[Dict[str, str]] = []
-                    asked, answered = len(names), 0
-                    for found in per_ns:
-                        if found is not None:
-                            answered += 1
-                            subnets.extend(found)
-                    # None when not one namespace could be asked (e.g. every call got a 403):
-                    # that is "could not ask", not "there are none", and must not overwrite a
-                    # previously good vc_subnets snapshot with an empty one (record_discovery
-                    # only replaces it when this is not None).
-                    extras["subnets"] = subnets if answered else None
-                    if answered:
-                        say("  {} NSX Subnet(s)/SubnetSet(s) known to vCenter across {} of {} namespace(s)".format(
-                            len(subnets), answered, asked))
-                    else:
-                        say("  vCenter could not be asked for any namespace's subnet list")
-
-    if extras is not None and with_storage_compliance:
-        # Which storage policies each namespace offers: the namespaces vCenter
-        # listed plus any the queue already targets (`policy_namespaces`), so a
-        # login that cannot list namespaces still learns about the ones in use.
-        # Uncapped, unlike subnets: a namespace left out here would block its VMs.
-        listed = [n["namespace"] for n in (extras.get("namespaces") or []) if n.get("namespace")]
-        names = sorted(set(listed) | set(n for n in policy_namespaces if n))
-        if names:
-            workers = max(1, min(int(concurrency), 32))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                per_ns = list(pool.map(client.namespace_storage_policies, names))
-            answered = {ns: found for ns, found in zip(names, per_ns) if found is not None}
-            # None = not one namespace could be asked: keep the last snapshot.
-            extras["storage_policies"] = ({"namespaces": answered,
-                                           "names": client.storage_policy_names()}
-                                          if answered else None)
-            if answered:
-                say("  storage policies read for {} of {} namespace(s)".format(len(answered), len(names)))
-            else:
-                say("  vCenter could not be asked which storage policies any namespace offers")
+        read_namespace_catalog(client, extras, with_namespaces=with_namespaces, with_subnets=with_subnets,
+                               with_storage_compliance=with_storage_compliance,
+                               policy_namespaces=policy_namespaces, concurrency=concurrency, say=say)
 
     folder_of: Dict[str, str] = {}
     dc_of: Dict[str, str] = {}

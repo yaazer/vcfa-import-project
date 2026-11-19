@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .. import __version__
 from .. import access
+from .. import eligibility
 from .. import estimate as est
 from .. import legal
 from .. import notify as notify_mod
@@ -263,6 +264,11 @@ class WebApp:
             "next_window": window,
             "me": current_user(),
         }
+
+    def eligibility(self, q, body) -> Dict[str, Any]:
+        """Which queued VMs are held back from their next step, grouped by cause, with the fix."""
+        with self.lock:
+            return service.eligibility_overview(self._engine())
 
     def overview(self, q, body) -> Dict[str, Any]:
         with self.lock:
@@ -570,7 +576,7 @@ class WebApp:
             try:
                 return self.store.set_wave_info(wave, name=name, notes=notes)
             except ValueError as exc:
-                raise ApiError(400, str(exc))
+                raise ApiError(400, str(exc)) from None
 
     def waves_swap(self, q, body) -> Dict[str, Any]:
         a, b = _int(body.get("a"), minimum=1), _int(body.get("b"), minimum=1)
@@ -651,9 +657,9 @@ class WebApp:
                                             folder_exact=bool(body.get("folder_exact")))
             plan = []
             planned: List[str] = []
-            holdbacks = service.holdbacks(engine, stage_name, waves, morefs=morefs,
-                                          include_failed=include_failed, folders=folders,
-                                          folder_exact=bool(body.get("folder_exact")))
+            holdbacks, held = service.holds(engine, stage_name, waves, morefs=morefs,
+                                            include_failed=include_failed, folders=folders,
+                                            folder_exact=bool(body.get("folder_exact")))
             for wave, count in rows:
                 batches = engine.plan(stage_name, wave=wave, morefs=morefs, limit=limit,
                                       include_failed=include_failed, write_manifests=False,
@@ -676,6 +682,7 @@ class WebApp:
             "total": sum(p["vms"] for p in plan),
             "seconds": sum(p["seconds"] for p in plan),
             "holdbacks": holdbacks,
+            "held": eligibility.group(held), "held_vms": len({h["moref"] for h in held}),
             "members": who["members"], "left_over": who["left_over"],
             "needs_approval": access.needs_approval(cfg, stage_name, body),
             "eligible_by_wave": per_wave_all,
@@ -829,6 +836,38 @@ class WebApp:
         job = starter(body)
         return {"job": job.summary()}
 
+    def _job_catalog(self, body: Dict[str, Any]) -> Job:
+        """Read namespaces, subnets and per-namespace storage policies from vCenter, no VMs. Uses the
+        credentials typed here, else the ones remembered from Discover or in the environment."""
+        from ..vcenter import VCenterClient, VCenterError
+        creds = self._vc_creds or {}
+        server = (body.get("server") or creds.get("server") or os.environ.get(ENV_SERVER) or "").strip()
+        user = (body.get("user") or creds.get("user") or os.environ.get(ENV_USER) or "").strip()
+        password = body.get("password") or creds.get("password") or os.environ.get(ENV_PASSWORD) or ""
+        if not (server and user and password):
+            raise ApiError(400, "vCenter credentials are needed: run Discover once with 'remember' ticked, or "
+                                "start the console with {}/{}/{} set".format(ENV_SERVER, ENV_USER, ENV_PASSWORD))
+        insecure = bool(body.get("insecure", creds.get("insecure")))
+        concurrency = _int(body.get("concurrency"), default=12, minimum=1)
+
+        def run(job: Job) -> Dict[str, Any]:
+            client = VCenterClient(server, user, password, insecure=insecure, timeout=60, log=job.log)
+            try:
+                client.connect()
+                with self._job_workspace(job) as ws:
+                    out = service.read_catalog(client, ws.store, server, concurrency=concurrency,
+                                               with_subnets=not body.get("no_subnets"),
+                                               with_storage_compliance=not body.get("no_storage_compliance"),
+                                               log=job.log)
+            except (VCenterError, service.SelectionError) as exc:
+                raise ApiError(400, str(exc)) from None
+            finally:
+                client.close()
+            self._ns_cache = None
+            self._subnet_cache = None
+            return out
+        return self._start("catalog", "Read namespaces & storage policies from vCenter", {"server": server}, run)
+
     def _job_discover(self, body: Dict[str, Any]) -> Job:
         server = (body.get("server") or os.environ.get(ENV_SERVER) or "").strip()
         user = (body.get("user") or os.environ.get(ENV_USER) or "").strip()
@@ -913,8 +952,7 @@ class WebApp:
             if opts["with_namespaces"]:
                 ns = extras.get("namespaces")
                 if ns is not None:
-                    job.log("  {} Supervisor namespace(s) known to vCenter -- used where this login "
-                            "cannot list namespaces itself".format(len(ns)))
+                    pass     # said above, by name, as it was read (vcenter.read_namespace_catalog)
                 elif kept_namespaces and kept_namespaces.get("namespaces"):
                     job.log("  vCenter could not be asked for its namespace list this time (older vCenter, "
                             "or no System.Read privilege); keeping the {} namespace(s) from the last time "
@@ -926,8 +964,7 @@ class WebApp:
                 if opts["with_subnets"]:
                     sn = extras.get("subnets")
                     if sn is not None:
-                        job.log("  {} NSX Subnet(s)/SubnetSet(s) known to vCenter -- used where the "
-                                "Supervisor cannot list them itself".format(len(sn)))
+                        pass     # said above, per namespace
                     elif extras.get("namespaces"):
                         job.log("  vCenter could not be asked for any namespace's subnet list; subnet "
                                 "suggestions fall back to the Supervisor")
@@ -1284,7 +1321,11 @@ class WebApp:
             return cached[1]
         with self.lock:
             vc_namespaces = self.store.get_meta("vc_namespaces")
+            sp = self.store.get_meta("vc_storage_policies") or {}
         data = service.cluster_namespaces(Kubectl(self.cfg), vc_namespaces)
+        names = sp.get("names") or {}
+        # namespace -> the storage policies it offers, by name; a namespace missing here was never read
+        data["policies"] = {ns: [names.get(p) or p for p in ids] for ns, ids in (sp.get("namespaces") or {}).items()}
         data["checked_at"] = _local_now()
         data["context"] = self.cfg.context or ""
         self._ns_cache = (time.time(), data)
@@ -1537,7 +1578,7 @@ class WebApp:
             try:
                 s_ = sch.create(self.store, stage_name, body, start, end, self._actor(), needs_approval=needs)
             except sch.ScheduleError as exc:
-                raise ApiError(400, str(exc))
+                raise ApiError(400, str(exc)) from None
             if needs:
                 a = access.request(self.store, stage_name, dict(body, stage=stage_name), self._actor(),
                                    schedule_id=s_["id"])
@@ -1625,7 +1666,7 @@ class WebApp:
             try:
                 settings_mod.update(self.store, changes, self._actor())
             except (ConfigError, ValueError) as exc:
-                raise ApiError(400, str(exc))
+                raise ApiError(400, str(exc)) from None
         self.cfg = self._effective_cfg()
         return self.settings_get(q, {})
 
@@ -1661,7 +1702,7 @@ class WebApp:
                 token = access.create_user(self.store, str(body.get("name") or ""), str(body.get("role") or ""),
                                            self._actor(), pw_hash=pw_hash)
             except access.AccessError as exc:
-                raise ApiError(400, str(exc))
+                raise ApiError(400, str(exc)) from None
             if password:
                 self.sessions.end_user(str(body.get("name")).strip())
         return {"name": body.get("name"), "token": token}
@@ -1729,7 +1770,7 @@ class WebApp:
             try:
                 access.set_password(self.store, user["name"], new, user["name"], pw_hash=pw_hash)
             except access.AccessError as exc:
-                raise ApiError(400, str(exc))
+                raise ApiError(400, str(exc)) from None
         self.sessions.end_user(user["name"], keep=getattr(CTX, "token", None))
         return {"ok": True}
 
@@ -1754,6 +1795,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/info", "info"),
         ("GET", r"/api/pulse", "pulse"),
         ("GET", r"/api/overview", "overview"),
+        ("GET", r"/api/eligibility", "eligibility"),
         ("GET", r"/api/discovered", "discovered"),
         ("GET", r"/api/folders", "folders"),
         ("POST", r"/api/select", "select"),
@@ -1783,7 +1825,7 @@ ROUTES: List[Tuple[str, "re.Pattern[str]", str]] = [
         ("GET", r"/api/jobs", "jobs_list"),
         ("GET", r"/api/jobs/(?P<job_id>[\w.-]+)", "job"),
         ("POST", r"/api/jobs/(?P<job_id>[\w.-]+)/stop", "job_stop"),
-        ("POST", r"/api/run/(?P<kind>discover|preflight|execute|refresh|watch|commit|rollback|"
+        ("POST", r"/api/run/(?P<kind>discover|catalog|preflight|execute|refresh|watch|commit|rollback|"
                  r"release_rollback|abandon|cleanup|verify)", "run_job"),
         ("GET", r"/api/reset", "reset_preview"),
         ("POST", r"/api/reset", "reset_run"),

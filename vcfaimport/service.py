@@ -19,9 +19,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .config import Config
 from .discovery import SelectionError, match_folder_map, match_tag_map, _match_mapping  # noqa: F401  (re-exported for web)
-from .engine import STAGE_IMPORT, SETTLED_STATES, AbortRun, Engine, cleanup_candidates, cleanup_plan, wave_finished
+from .engine import STAGE_IMPORT, STAGE_PRECHECK, SETTLED_STATES, AbortRun, Engine, cleanup_candidates, cleanup_plan, wave_finished
 from .kube import Kubectl, KubectlError
 from .folders import folder_matches, norm_folder
+from . import eligibility
 from . import state as st
 
 Log = Callable[[str], None]
@@ -181,19 +182,61 @@ def eligible_by_wave(engine: Engine, stage: str, waves: Optional[Sequence[int]] 
     return rows
 
 
-def holdbacks(engine: Engine, stage: str, waves: Optional[Sequence[int]] = None,
-              morefs: Optional[Sequence[str]] = None, include_failed: bool = False,
-              folders: Optional[Sequence[str]] = None, folder_exact: bool = False) -> List[str]:
-    """Why VMs in scope are being kept out of this run (readiness, apps kept together).
+def holds(engine: Engine, stage: str, waves: Optional[Sequence[int]] = None,
+          morefs: Optional[Sequence[str]] = None, include_failed: bool = False,
+          folders: Optional[Sequence[str]] = None,
+          folder_exact: bool = False) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """(notes, held): why VMs in scope are kept out of this run.
 
-    Every wave in scope is asked, including one held back entirely -- that wave
-    has nothing eligible, so it would otherwise be silently missing from the plan."""
+    `notes` is the prose (readiness, storage policy, apps kept together); `held` is the
+    same thing as one record per VM and cause (eligibility.hold), which is what the
+    console groups and explains. Every wave in scope is asked, including one held back
+    entirely -- that wave has nothing eligible, so it would otherwise be silently
+    missing from the plan."""
     notes: List[str] = []
+    held: List[Dict[str, Any]] = []
     for wave in (waves or engine.store.waves()):
         engine.eligible(stage, wave, morefs=morefs, include_failed=include_failed,
                         folders=folders, folder_exact=folder_exact)
         notes.extend("wave {}: {}".format(wave, h) for h in engine.holdbacks)
-    return notes
+        held.extend(engine.held)
+    return notes, held
+
+
+def holdbacks(engine: Engine, stage: str, waves: Optional[Sequence[int]] = None,
+              morefs: Optional[Sequence[str]] = None, include_failed: bool = False,
+              folders: Optional[Sequence[str]] = None, folder_exact: bool = False) -> List[str]:
+    """The prose half of holds()."""
+    return holds(engine, stage, waves, morefs=morefs, include_failed=include_failed,
+                 folders=folders, folder_exact=folder_exact)[0]
+
+
+def held_lines(held: Sequence[Dict[str, Any]], examples: int = 3) -> List[str]:
+    """Held records as lines for a log or the CLI: per cause, how many, why, an example, and the fix."""
+    lines: List[str] = []
+    for g in eligibility.group(held):
+        lines.append("  held back: {} -- {} VM(s)".format(g["title"], g["count"]))
+        lines.append("    why: {}".format(g["why"]))
+        for v in g["vms"][:examples]:
+            lines.append("      {} ({}){}{}".format(v["vm_name"], v["moref"], " -> " + v["namespace"] if v["namespace"] else "",
+                                                     ": " + v["detail"] if v["detail"] else ""))
+        if g["count"] > examples:
+            lines.append("      ... and {} more".format(g["count"] - examples))
+        lines.append("    fix: {}".format(g["fix"]))
+    return lines
+
+
+def eligibility_overview(engine: Engine, include_failed: bool = False) -> Dict[str, Any]:
+    """Every queued VM that is held back from its next step, and why.
+
+    Pending VMs are asked about precheck, prechecked ones about import. Reads only the
+    local store (cached discovery facts), so it is cheap enough to ask on every visit."""
+    held: List[Dict[str, Any]] = []
+    for stage in (STAGE_PRECHECK, STAGE_IMPORT):
+        held.extend(holds(engine, stage, include_failed=include_failed)[1])
+    groups = eligibility.group(held)
+    return {"groups": groups, "by_moref": eligibility.by_moref(held),
+            "vms": len({h["moref"] for h in held}), "headline": eligibility.headline(groups)}
 
 
 def run_members(store: st.Store, morefs: Sequence[str]) -> Dict[str, Any]:
@@ -1478,36 +1521,71 @@ def record_discovery(store: st.Store, server: str, extras: Optional[Dict[str, An
         store.set_meta("vc_storage_policies", dict(extras["storage_policies"], server=server))
 
 
+def read_catalog(client: Any, store: st.Store, server: str, *, concurrency: int = 12, with_subnets: bool = True,
+                 with_storage_compliance: bool = True, log: Optional[Log] = None) -> Dict[str, Any]:
+    """Read the namespaces vCenter lists, their NSX subnets and the storage policies each offers -- and
+    nothing else. Discover does this beside reading every VM; this is the same read on its own, for when
+    a namespace was fixed, a subnet added or a policy offered and the VMs themselves have not changed.
+
+    The result lands where Map & Stage's pick lists and the storage-policy gate already look
+    (vc_namespaces / vc_subnets / vc_storage_policies), so held-back VMs are re-judged at once.
+    Refused when the VM cache came from another vCenter: namespaces and policies of one vCenter must never
+    be applied to VMs discovered from another."""
+    from .vcenter import read_namespace_catalog
+    say = log or (lambda m: None)
+    known = store.get_meta("vcenter")
+    if known and _server_key(known) != _server_key(server):
+        raise SelectionError("the VM cache was discovered from {} but this is {}: namespaces and policies of one "
+                             "vCenter are never applied to VMs from another. Discover from {} first, or use the "
+                             "same server.".format(known, server, server))
+    extras: Dict[str, Any] = {}
+    read_namespace_catalog(client, extras, with_namespaces=True, with_subnets=with_subnets,
+                           with_storage_compliance=with_storage_compliance,
+                           policy_namespaces=store.namespaces(), concurrency=concurrency, say=say)
+    if extras.get("namespaces") is None and extras.get("storage_policies") is None and extras.get("subnets") is None:
+        say("  vCenter answered none of the namespace, subnet or storage-policy calls; nothing was changed "
+            "(older vCenter, or the login lacks System.Read / StorageProfile.View)")
+    record_discovery(store, server, extras)
+    report = storage_policy_report(store) if with_storage_compliance else []
+    if report:
+        say("  after reading, these queued VMs are still held back:")
+    elif with_storage_compliance and store.counts().get("total"):
+        say("  every queued VM's storage policy now fits its target namespace")
+    for line in report:
+        say(line)
+    sp = extras.get("storage_policies") or {}
+    return {"namespaces": None if extras.get("namespaces") is None else len(extras["namespaces"]),
+            "subnets": None if extras.get("subnets") is None else len(extras["subnets"]),
+            "policy_namespaces": len(sp.get("namespaces") or {}),
+            "still_held": len([l for l in report if l.startswith("  held back:")])}
+
+
 def storage_policy_report(store: st.Store) -> List[str]:
     """Discover-log lines: queued VMs whose storage policy does not fit their
     target namespace -- the same verdict engine.eligible() applies at precheck
     and import, said up front instead of only when a run holds them back."""
-    from .vcenter import storage_policy_problems
+    from .vcenter import storage_policy_findings
     snapshot = store.get_meta("vc_storage_policies") or {}
     offered, names = snapshot.get("namespaces") or {}, snapshot.get("names") or {}
     rows = store.conn.execute(
-        "SELECT v.moref, v.vm_name, v.namespace, d.facts_json FROM vms v "
+        "SELECT v.moref, v.vm_name, v.namespace, v.wave, d.facts_json FROM vms v "
         "JOIN discovered d ON d.moref = v.moref WHERE v.state IN (?, ?)",
         (st.S_PENDING, st.S_PRECHECK_PASSED)).fetchall()
-    wrong = []
+    held: List[Dict[str, Any]] = []
     for r in rows:
         try:
             facts = json.loads(r["facts_json"] or "{}") or {}
         except ValueError:
             facts = {}
-        problems = storage_policy_problems(facts.get("storage_policies"), facts.get("disk_ids") or [],
-                                           r["namespace"], offered.get(r["namespace"]), names)
-        if problems:
-            wrong.append((r, problems))
-    if not wrong:
+        held.extend(eligibility.from_findings(r, storage_policy_findings(
+            facts.get("storage_policies"), facts.get("disk_ids") or [],
+            r["namespace"], offered.get(r["namespace"]), names)))
+    if not held:
         return []
-    lines = ["  {} queued VM(s) use a storage policy their target namespace does not offer -- held "
-             "back from precheck and import until fixed (storage_compliance_enforce):".format(len(wrong))]
-    for r, problems in wrong[:10]:
-        lines.append("    {} ({}) -> {}: {}".format(r["vm_name"], r["moref"], r["namespace"], "; ".join(problems)))
-    if len(wrong) > 10:
-        lines.append("    ... and {} more (the precheck plan lists them)".format(len(wrong) - 10))
-    return lines
+    vms = len({h["moref"] for h in held})
+    return (["  {} queued VM(s) cannot be checked against their target namespace's storage policies -- held "
+             "back from precheck and import until fixed (storage_compliance_enforce). Why, by cause:".format(vms)]
+            + held_lines(held))
 
 
 # ------------------------------------------------------------ rediscovery

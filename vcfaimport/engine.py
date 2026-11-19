@@ -26,7 +26,8 @@ from .planner import PlannedBatch, plan_batches, record_from_row
 from .render import LABEL_RUN
 from . import state as st
 from .status import BatchStatus, batch_status
-from .vcenter import storage_compliance_ok, storage_compliance_reason, storage_policy_problems
+from .vcenter import storage_compliance_ok, storage_compliance_reason, storage_policy_findings, storage_policy_problems
+from . import eligibility
 
 STAGE_PRECHECK = "precheck"
 STAGE_IMPORT = "import"
@@ -96,6 +97,8 @@ class Engine:
         self.hit_deadline = False
         # Why VMs were held back from the last eligibility check (apps, readiness).
         self.holdbacks: List[str] = []
+        # The same hold-backs as records, one per VM and cause (eligibility.hold): what the console shows.
+        self.held: List[Dict[str, Any]] = []
         # Set by the CLI/web layer when it holds a connected vCenter session,
         # to re-verify storage-policy compliance live, right before each
         # import wave is applied -- see _filter_storage_compliance. None
@@ -389,11 +392,14 @@ class Engine:
         rows = self.store.query_vms(states=states, wave=wave, morefs=morefs,
                                     folders=folders, folder_exact=folder_exact)
         self.holdbacks = []
+        self.held = []
         if stage == STAGE_PRECHECK and getattr(self.cfg, "readiness_exclude_blocked", False) and rows:
             from .readiness import blocked_morefs
             blocked = set(blocked_morefs(self.store, [r["moref"] for r in rows]))
             if blocked:
                 self.holdbacks.append("{} VM(s) held back: readiness marks them blocked".format(len(blocked)))
+                self.held.extend(eligibility.hold(r, "readiness_blocked", "readiness grades it blocked")
+                                 for r in rows if r["moref"] in blocked)
                 rows = [r for r in rows if r["moref"] not in blocked]
         # Both stages, not import only: the user's own words were "Missing
         # prechecks for storage policy enforcement" (2026-11-16) -- a VM that
@@ -425,6 +431,9 @@ class Engine:
             facts = json.loads(d["facts_json"] or "{}") if d else {}
             comp = facts.get("storage_compliance") if isinstance(facts, dict) else None
             (bad if not storage_compliance_ok(comp) else keep).append((r, comp))
+        for r, comp in bad:
+            self.held.append(eligibility.hold(
+                r, "sp_not_checked" if comp is None else "sp_noncompliant", storage_compliance_reason(comp)))
         if bad:
             self.holdbacks.append(
                 "{} VM(s) held back: storage-policy compliance is not COMPLIANT/NOT_APPLICABLE -- {} "
@@ -442,10 +451,12 @@ class Engine:
             d = discovered.get(r["moref"])
             facts = json.loads(d["facts_json"] or "{}") if d else {}
             facts = facts if isinstance(facts, dict) else {}
-            problems = storage_policy_problems(
+            findings = storage_policy_findings(
                 facts.get("storage_policies"), facts.get("disk_ids") or [], r["namespace"],
                 offered.get(r["namespace"]), names)
+            problems = [f["text"] for f in findings]
             (wrong if problems else matched).append((r, problems))
+            self.held.extend(eligibility.from_findings(r, findings))
         if wrong:
             examples = ["{} ({}): {}".format(r["vm_name"] or r["moref"], r["moref"], "; ".join(p))
                         for r, p in wrong[:3]]
@@ -534,6 +545,8 @@ class Engine:
         for r in rows:
             when = st._parse_ts(r["precheck_finished_at"] or "") if r["state"] == st.S_PRECHECK_PASSED else None
             (stale if when is not None and when.timestamp() < cutoff else keep).append(r)
+        for r in stale:
+            self.held.append(eligibility.hold(r, "precheck_stale", "precheck passed {}".format(r["precheck_finished_at"] or "long ago")))
         if stale:
             self.holdbacks.append("{} VM(s) held back: precheck older than {}h, precheck again ({})".format(
                 len(stale), max_age_hours, ", ".join(r["vm_name"] for r in stale[:3])
@@ -561,6 +574,9 @@ class Engine:
             else:
                 keep.extend(members)
         for app, blockers in sorted(held.items()):
+            waiting = ", ".join("{} ({})".format(b["vm_name"], b["state"]) for b in blockers[:3]) + (" ..." if len(blockers) > 3 else "")
+            self.held.extend(eligibility.hold(m, "app_waiting", "application {} is waiting on {}".format(app, waiting))
+                             for m in by_app[app])
             self.holdbacks.append("app {} held back: {} VM(s) not ready ({})".format(
                 app, len(blockers), ", ".join("{} {}".format(b["vm_name"], b["state"]) for b in blockers[:3])
                 + (" ..." if len(blockers) > 3 else "")))

@@ -236,6 +236,26 @@ def _filters_from(args) -> Filters:
     )
 
 
+def cmd_catalog(args) -> int:
+    """Re-read vCenter's namespaces, their subnets and the storage policies each offers; no VMs."""
+    cfg, store, _kube, _engine = _open(args)
+    server, user, password = resolve_credentials(args.vcenter, args.user, args.password)
+    if args.insecure:
+        log("warning: TLS verification disabled (--insecure)")
+    client = VCenterClient(server, user, password, insecure=args.insecure, timeout=args.timeout, log=log)
+    try:
+        client.connect()
+        service.read_catalog(client, store, server, concurrency=args.concurrency,
+                             with_subnets=not args.no_subnets,
+                             with_storage_compliance=not args.no_storage_compliance, log=log)
+    except SelectionError as exc:
+        log("error: {}".format(exc))
+        return 2
+    finally:
+        client.close()
+    return 0
+
+
 def cmd_discover(args) -> int:
     cfg, store, _kube, _engine = _open(args)
     server, user, password = resolve_credentials(args.vcenter, args.user, args.password)
@@ -305,8 +325,7 @@ def cmd_discover(args) -> int:
     if not args.no_namespaces:
         ns = extras.get("namespaces")
         if ns is not None:
-            log("  {} Supervisor namespace(s) known to vCenter -- used where this login cannot list "
-                "namespaces itself".format(len(ns)))
+            pass     # said above, by name, as it was read (vcenter.read_namespace_catalog)
         else:
             kept = store.get_meta("vc_namespaces")
             if kept and kept.get("namespaces"):
@@ -319,8 +338,7 @@ def cmd_discover(args) -> int:
         if not args.no_subnets:
             sn = extras.get("subnets")
             if sn is not None:
-                log("  {} NSX Subnet(s)/SubnetSet(s) known to vCenter -- used where the Supervisor cannot "
-                    "list them itself".format(len(sn)))
+                pass     # said above, per namespace
             elif extras.get("namespaces"):
                 log("  vCenter could not be asked for any namespace's subnet list; subnet suggestions "
                     "fall back to the Supervisor")
@@ -676,12 +694,12 @@ def _execute(args, stage: str) -> int:
     rows = [list(r) for r in service.eligible_by_wave(
         engine, stage, waves, morefs=only, include_failed=args.include_failed,
         folders=scope, folder_exact=exact)]
-    held = service.holdbacks(engine, stage, waves, morefs=only, include_failed=args.include_failed,
-                             folders=scope, folder_exact=exact)
+    held, held_vms = service.holds(engine, stage, waves, morefs=only, include_failed=args.include_failed,
+                                   folders=scope, folder_exact=exact)
     if not rows:
         log("nothing to do for stage '{}'".format(stage))
-        for note in held:
-            log("  held back: " + note)
+        for line in service.held_lines(held_vms) or ["  held back: " + note for note in held]:
+            log(line)
         if stage == STAGE_IMPORT and cfg.require_precheck:
             log("(VMs must reach precheck_passed first; run `precheck`, or pass --no-precheck)")
         return 0
@@ -713,8 +731,8 @@ def _execute(args, stage: str) -> int:
             if cfg.commit_action == "Auto" else "  (each batch will wait for `commit`)"))
     log("  estimate     : about {} ({} batch(es); {} batch time {})".format(
         human(eta["seconds"]), eta["batches"], eta["basis"], human(eta["batch_seconds"])))
-    for note in held:
-        log("  held back    : " + note)
+    for line in service.held_lines(held_vms) or ["  held back    : " + note for note in held]:
+        log(line)
     for line in service.left_over_lines(service.run_members(store, in_run)["left_over"]):
         log(line)
     if args.dry_run:
@@ -1703,6 +1721,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "(storage_compliance_enforce then fails closed on all of them)")
     sp.add_argument("--allow-mass-removal", action="store_true",
                     help="remove VMs gone from vCenter even when that is more than half the inventory")
+
+    sp = add("catalog", cmd_catalog,
+             "re-read vCenter's namespaces, subnets and per-namespace storage policies (no VMs)")
+    sp.add_argument("--vcenter", help="vCenter host (or set VCFA_VC_SERVER)")
+    sp.add_argument("--user", help="vCenter user (or set VCFA_VC_USER)")
+    sp.add_argument("--password", help="prefer VCFA_VC_PASSWORD or the interactive prompt")
+    sp.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    sp.add_argument("--concurrency", type=int, default=12)
+    sp.add_argument("--timeout", type=int, default=60)
+    sp.add_argument("--no-subnets", action="store_true", help="skip each namespace's NSX Subnet/SubnetSet list")
+    sp.add_argument("--no-storage-compliance", action="store_true", help="skip the per-namespace storage policies")
 
     sp = add("browse", cmd_browse, "list the discovered vCenter inventory")
     add_filters(sp)

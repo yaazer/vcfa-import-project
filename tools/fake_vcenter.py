@@ -226,6 +226,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"disks": {}})
             return
         disks = {key: "pol-gold-0001" for key in vm["_detail"].get("disks", {})}
+        # FAKE_VC_WRONG_POLICY_VMS="web-005,web-013": those VMs (by name) have disk 2000 on Bronze, whatever
+        # the mode -- a discover run again reads the same wrong policy, as it would in a real estate.
+        if vm.get("name") in [n.strip() for n in os.environ.get("FAKE_VC_WRONG_POLICY_VMS", "").split(",") if n.strip()]:
+            disks["2000"] = "pol-bronze-0002"
         if mode == "wrong":
             disks["2000"] = "pol-bronze-0002"
         if mode == "nodisk":

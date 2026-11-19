@@ -800,6 +800,7 @@ it never touches batches it did not create.
 | `accept` | accept the terms of use; `--name ... --i-accept` for unattended accounts, `--revoke` to withdraw |
 | `init` | write a starter config and inventory template |
 | `discover` | pull the full VM inventory from vCenter into the local cache |
+| `catalog` | re-read vCenter's namespaces, their NSX subnets and each namespace's storage policies (no VMs); the logs name what vCenter lists, which queue targets it does not, and what each namespace offers |
 | `browse` | the folder tree (`--folders`), facets, or a filtered list (`--json`, `--csv`) |
 | `pick` | write a clickable HTML picker of the discovered VMs |
 | `select` | choose VMs to import, by folder (`--folder`, subtree included) or other filters |
@@ -1511,10 +1512,27 @@ uses:
 - If the tool cannot tell which policies a VM or a namespace uses, the VM is
   held back too (fail closed). That covers a failed read, a namespace vCenter
   never described, and a VM discovered before this release.
-- The plan shows why, for example
-  `disk 2000 uses 'Bronze'; namespace ns-a offers: 'DS2-Thick', 'Gold'`.
-  `discover` lists queued VMs that do not fit, and `readiness` flags a home or
-  disk with no policy (`storage_policy_missing`).
+- **Held-back VMs are explained where they would have run.** Execute shows a
+  *held back* block whether or not anything else is eligible: one section per
+  cause (namespace's policies unknown, VM on a policy the namespace does not
+  offer, no policy, not compliant, readiness, stale precheck, application
+  waiting), each with what it means, what to do, a button to the page or
+  action that fixes it, and the VMs it holds with their own detail, for example
+  `disk 2000 uses 'Bronze'; namespace ns-a offers: 'DS2-Thick', 'Gold'`. The
+  Import queue badges each held VM with its cause and has a **Held back**
+  filter; `precheck` / `run` print the same causes with `why:` and `fix:`
+  lines, and `discover` lists them after reading. All of it comes from one
+  record per VM and cause (`vcfaimport/eligibility.py`), so the pages cannot
+  disagree. `readiness` flags a home or disk with no policy
+  (`storage_policy_missing`).
+- **"Namespace's storage policies unknown"** means the tool has not read what
+  that namespace offers: discover reads the namespaces vCenter lists plus the
+  ones the queue targets, so a namespace staged after the last discover (or
+  one vCenter does not list) is unread. `catalog` (console: **Read from
+  vCenter** on Execute's held-back block and on Map & Stage's *What you can map
+  to*) re-reads namespaces, their NSX subnets and each namespace's policies
+  without reading any VM, then re-judges the held VMs. It refuses a vCenter
+  other than the one the VM cache came from.
 - With vCenter credentials on `run`, the live recheck before each wave re-reads
   both sides as well.
 
