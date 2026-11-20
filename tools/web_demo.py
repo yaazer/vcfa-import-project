@@ -140,6 +140,7 @@ def main() -> int:
         cfg_path = workdir / "cfg.toml"
         cfg_path.write_text(cfg_path.read_text(encoding="utf-8") + 'commit_action = "Wait"\n',
                             encoding="utf-8")
+    env["FAKE_KUBECTL_STORAGE_FAILS"] = "1"   # ~5% of imports fail with a storage / virtual-disk cause
     os.environ.update(env)   # the console and every fake kubectl it spawns see these
     os.chdir(str(workdir))
 

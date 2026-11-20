@@ -15,6 +15,11 @@ and set these environment variables:
                            once rollbackAction is set, never reverts -- the operator's own
                            RollbackCustomResourceCompleted step fails and keeps retrying
                            (incident 2026-11-13: a vCenter CNS-unregister NotSupported)
+    FAKE_KUBECTL_STORAGE_FAILS  when set (the web demo does), about 5% of VMs -- on top of whatever the
+                           scenario fails -- fail at import with a storage / virtual-disk cause: a spread
+                           of the ways such imports go wrong (datastore space, policy and datastore
+                           mismatch, namespace quota, disk types the import cannot move). The wording is
+                           illustrative, not observed, except the quota one (2026-10-01).
     FAKE_KUBECTL_SETTLE    polls before a batch reaches a terminal phase (default 2)
     FAKE_KUBECTL_VM_DELETE     "forbidden" makes deleting a vm-operator VirtualMachine refused
                                (release_rollback)
@@ -70,9 +75,39 @@ def settle() -> int:
     return int(os.environ.get("FAKE_KUBECTL_SETTLE", "2"))
 
 
+# Storage / virtual-disk causes for FAKE_KUBECTL_STORAGE_FAILS: what an import that gets as far as moving the
+# disks can run into. Only the namespace-quota one has been seen on a real cluster (2026-10-01: the quota
+# webhook denied the reservation; the operator log said so, the condition only said "waiting for placement").
+STORAGE_FAILURES = [
+    "VirtualMachineRelocateFailure: datastore 'DS2-Thick' has insufficient free space for the thick-provisioned "
+    "disk 'Hard disk 1' (needs 60 GiB, 42 GiB free)",
+    "storage policy 'Gold' cannot be satisfied on datastore 'vsanDatastore': the rule requires thick "
+    "provisioning (object space reservation 100%) but the disk is thin",
+    "StoragePolicyReservation denied: the namespace storage quota for policy 'Gold' is exceeded "
+    "(requested 80 GiB, 12 GiB remaining)",
+    "disk 'Hard disk 2' is independent-persistent: it is not part of snapshots, so it cannot be relocated with the VM",
+    "disk 'Hard disk 1' is shared between virtual machines (multi-writer): it cannot be moved with this VM alone",
+    "the VM has a snapshot: the delta disk chain (disk1-000001.vmdk) cannot be imported; consolidate the snapshots first",
+    "vSAN object not compliant: the policy's failures-to-tolerate needs 3 hosts, 2 are available in the target cluster",
+    "disk 'Hard disk 3' is a raw device mapping (RDM): not a plain VMDK, so it cannot be imported",
+]
+
+
+def storage_failure(vm_id: str) -> str:
+    """The storage cause this VM fails with under FAKE_KUBECTL_STORAGE_FAILS ('' when it does not)."""
+    if not os.environ.get("FAKE_KUBECTL_STORAGE_FAILS"):
+        return ""
+    idx = (int("".join(ch for ch in vm_id if ch.isdigit()) or "0") - 1483400) // 2
+    if idx < 0 or idx % 20 != 3:                 # 1 VM in 20 = 5%
+        return ""
+    return STORAGE_FAILURES[(idx // 20) % len(STORAGE_FAILURES)]
+
+
 def op_outcome(vm_id: str, precheck: bool) -> str:
     """Decide the terminal phase for one operation."""
     scen = scenario()
+    if not precheck and storage_failure(vm_id):
+        return "Failed"
     tail = int("".join(ch for ch in vm_id if ch.isdigit()) or "0")
     if scen == "disaster":
         return "Failed"
@@ -232,7 +267,7 @@ def build_status(obj: dict, polls: int, key: str = "", data: Optional[dict] = No
             "name": entry.get("name"),
             "virtualMachineID": vm_id,
             "phase": phase,
-            "message": {"Succeeded": "", "Failed": "VM Tools not running",
+            "message": {"Succeeded": "", "Failed": storage_failure(vm_id) or "VM Tools not running",
                         "AwaitingCommit": "waiting for commit",
                         "RollingBack": "reverting ownership to vCenter",
                         "RolledBack": "ownership reverted to vCenter",
