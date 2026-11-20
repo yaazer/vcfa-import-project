@@ -733,6 +733,9 @@ def _execute(args, stage: str) -> int:
         human(eta["seconds"]), eta["batches"], eta["basis"], human(eta["batch_seconds"])))
     for line in service.held_lines(held_vms) or ["  held back    : " + note for note in held]:
         log(line)
+    if stage == STAGE_IMPORT:
+        for line in service.quota_lines(service.quota_check(store, in_run)):
+            log(line)
     for line in service.left_over_lines(service.run_members(store, in_run)["left_over"]):
         log(line)
     if args.dry_run:

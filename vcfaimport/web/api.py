@@ -312,9 +312,10 @@ class WebApp:
                 "SELECT moref, namespace FROM vms") if r["namespace"]}
             sp_snapshot = self.store.get_meta("vc_storage_policies") or {}
         out = []
+        rctx = readiness.context(rows)
         for r in rows:
             nics = json.loads(r["nics_json"] or "[]")
-            found = readiness.assess(r)
+            found = readiness.assess(r, rctx)
             if r["moref"] in queued_ns:
                 ns, src = queued_ns[r["moref"]], "queue"
             elif (r["namespace"] or "").strip():
@@ -712,8 +713,9 @@ class WebApp:
             per_wave_all = {w: len(engine.eligible(stage_name, w, include_failed=include_failed))
                             for w in all_waves}
             who = service.run_members(self.store, planned)
+            quota = service.quota_check(self.store, planned) if stage_name == "import" else []
         return {
-            "stage": stage_name, "plan": plan,
+            "stage": stage_name, "plan": plan, "quota": quota,
             "total": sum(p["vms"] for p in plan),
             "seconds": sum(p["seconds"] for p in plan),
             "holdbacks": holdbacks,

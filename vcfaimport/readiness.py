@@ -12,7 +12,8 @@ expected to fail), warn (worth a look), info (context).
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, List, Sequence
+import re
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .vcenter import storage_compliance_ok, storage_compliance_reason
 
@@ -48,6 +49,36 @@ def _hw_version(facts: Dict[str, Any]) -> int:
     return int(digits) if digits else 0
 
 
+def _disks(facts: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    d = facts.get("disks")
+    return {k: v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+
+
+def _total_gb(facts: Dict[str, Any]) -> float:
+    return sum(v.get("capacity_gb") or 0 for v in _disks(facts).values())
+
+
+# The 63-char label / 253-char subdomain a Kubernetes object name must fit (RFC 1123).
+_K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+LARGE_VM_GB = 2048        # a VM this big moves slowly; the batch timeout is one fixed number
+MANY_DISKS = 8
+
+
+def duplicate_names(rows: Sequence[Any]) -> set:
+    """Lower-cased VM names that more than one discovered VM carries (different folders, datacenters, vCenters)."""
+    seen: Dict[str, int] = {}
+    for r in rows:
+        name = (r["name"] or "").strip().lower()
+        if name:
+            seen[name] = seen.get(name, 0) + 1
+    return {n for n, c in seen.items() if c > 1}
+
+
+def context(rows: Sequence[Any]) -> Dict[str, Any]:
+    """Facts about the whole inventory that single-VM rules need (today: names shared by several VMs)."""
+    return {"dupes": duplicate_names(rows)}
+
+
 Rule = Dict[str, Any]
 RULES: List[Rule] = [
     {"code": "tools_not_running", "level": BLOCK, "title": "VMware Tools is not running",
@@ -77,6 +108,31 @@ RULES: List[Rule] = [
     {"code": "no_ip", "level": INFO, "title": "No guest IP reported",
      "advice": "Post-import verification cannot ping it or compare its IP.",
      "test": lambda r, f: _on(r) and _tools_running(r) and not (r["ip"] if "ip" in r.keys() else "")},
+    # ---- added 2026-11-20. Warn or info only: none of these was seen to fail a precheck, so none may block
+    # (a new block would silently change what readiness_exclude_blocked keeps out). They read the disk and
+    # device facts of the last discover; an older cache lacks them and these rules stay quiet rather than guess.
+    {"code": "snapshot_disk", "level": WARN, "title": "The VM has a snapshot",
+     "advice": "A disk is a snapshot delta (named like vm-000001.vmdk). Delta chains are a common reason a disk "
+               "move fails: delete or consolidate the snapshots in vCenter and re-discover. The tool reads this from the "
+               "disk file name; vCenter's REST API has no snapshot list, so a snapshot that left no delta disk is not seen.",
+     "test": lambda r, f: any(d.get("delta") for d in _disks(f).values())},
+    {"code": "legacy_devices", "level": WARN, "title": "Serial port, parallel port or floppy attached",
+     "advice": "Legacy devices may not carry over to a Supervisor VM. Remove the ones the guest does not use, "
+               "then re-discover.",
+     "test": lambda r, f: sum(v for v in (f.get("devices") or {}).values() if isinstance(v, int)) > 0},
+    {"code": "large_vm", "level": INFO, "title": "A large VM",
+     "advice": "Over {} GB of disk, or {} or more disks. It will take long and the batch timeout is one fixed "
+               "number: give it a batch of its own, or its own change window.".format(LARGE_VM_GB, MANY_DISKS),
+     "test": lambda r, f: bool(_disks(f)) and (_total_gb(f) >= LARGE_VM_GB or len(_disks(f)) >= MANY_DISKS)},
+    {"code": "k8s_name", "level": INFO, "title": "Name is not a valid Kubernetes name",
+     "advice": "Uppercase letters, spaces, underscores or more than 253 characters. The manifest refers to the VM by its "
+               "ID, so this may change nothing; whether the operator renames or rejects such a VM has not been observed.",
+     "test": lambda r, f: bool((r["name"] or "").strip()) and not (len(r["name"]) <= 253 and _K8S_NAME.match(r["name"]))},
+    {"code": "duplicate_name", "level": INFO, "title": "Another VM has the same name",
+     "advice": "Same name in another folder, datacenter or vCenter. Names are not what the tool keys on (the moref is), "
+               "but the imported VMs may collide in a namespace; check before importing both into one.",
+     "ctx": True,
+     "test": lambda r, f, ctx: (r["name"] or "").strip().lower() in (ctx or {}).get("dupes", ())},
     # Unlike every other rule here, this one is not advisory-only: `engine.py`'s
     # own eligible() refuses to import a VM this flags, unconditionally (the
     # user asked, 2026-11-16, that imports never happen "unless the VM's
@@ -117,13 +173,16 @@ def storage_compliance_detail(row: Any) -> str:
     return storage_compliance_reason(_facts(row).get("storage_compliance"))
 
 
-def assess(row: Any) -> List[Dict[str, str]]:
-    """Findings for one discovered VM row."""
+def assess(row: Any, ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    """Findings for one discovered VM row. `ctx` (see context()) lets the rules that compare VMs run;
+    without it they stay quiet."""
     facts = _facts(row)
     out = []
     for rule in RULES:
+        if rule.get("ctx") and ctx is None:
+            continue
         try:
-            hit = rule["test"](row, facts)
+            hit = rule["test"](row, facts, ctx) if rule.get("ctx") else rule["test"](row, facts)
         except (KeyError, IndexError, TypeError, ValueError):
             hit = False
         if hit:
@@ -140,8 +199,9 @@ def summary(rows: Sequence[Any]) -> Dict[str, Any]:
     """Grades and per-rule counts over many VMs."""
     grades = {g: 0 for g in GRADES}
     by_code: Dict[str, Dict[str, Any]] = {}
+    ctx = context(rows)
     for r in rows:
-        found = assess(r)
+        found = assess(r, ctx)
         grades[grade(found)] += 1
         for f in found:
             entry = by_code.setdefault(f["code"], dict(f, count=0, morefs=[]))

@@ -1542,6 +1542,25 @@ uses:
   vCenter's REST API reports no per-disk thin/thick flag, so the tool shows
   vCenter's verdict and cause rather than the provisioning setting itself.
   A VM discovered before this release has no datastore detail: Discover again.
+- **Other disk and device checks** (advisory; they warn, they never hold a VM back or change what
+  `readiness_exclude_blocked` skips): *The VM has a snapshot* (a disk named like `vm-000001.vmdk`; vCenter's
+  REST API has no snapshot list, so a snapshot that left no delta disk is not seen), *Serial port, parallel port
+  or floppy attached*, *A large VM* (over 2048 GB of disk or 8 or more disks), and, at info level, a name that is
+  not a valid Kubernetes name or that another VM shares (the manifest refers to a VM by its ID, so whether
+  either matters has not been observed). They read the disk detail of the last discover: an older cache says
+  nothing rather than guess. A snapshot, a new disk or a resized disk after a precheck passed sends the VM back
+  to pending like a rename does; the first discover after upgrading only records the layout.
+- **Storage quota advice on the import plan.** Every import reserves its disks' size against the namespace's
+  per-policy limit until it is committed, rolled back or its batch deleted. The Execute plan and `import` add up
+  the planned VMs' disks plus what the tool's own in-flight imports reserve, per namespace and policy, and warn
+  when that is over the limit vCenter reports. It is advice only: usage by anything else in the namespace is not
+  visible, and a limit that was never read is skipped, not treated as full.
+- **Triage knows the usual storage failures**: quota, a datastore too full, a policy the datastore cannot satisfy,
+  independent or shared disks, a snapshot, a vSAN policy that needs more hosts, an RDM. Only the quota stall has been seen
+  on a real cluster (2026-10-01); the rest of the wording is a best guess. Not checked at all (nothing in
+  vCenter's API to read it, or it cannot be known in advance): independent or multi-writer disk mode before
+  import, TPM or encryption, USB or PCI passthrough, snapshots without a delta disk, credentials expiring mid-run,
+  maintenance or DRS during an import, clock skew.
 - **"Namespace's storage policies unknown"** means the tool has not read what
   that namespace offers: discover reads the namespaces vCenter lists plus the
   ones the queue targets, so a namespace staged after the last discover (or

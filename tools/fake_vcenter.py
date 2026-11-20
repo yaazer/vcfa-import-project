@@ -156,6 +156,7 @@ def build_inventory(count: int, seed: int = 7) -> Dict[str, Any]:
                                              ["vsanDatastore", "DS2-Thick"][i % 2], i)}}},
                               **({"2001": {"label": "Hard disk 2", "backing": {"type": "RDM"}}}
                                  if i % 17 == 0 else {})),
+                "floppies": {}, "serial_ports": {}, "parallel_ports": {},
                 "cdroms": {"3000": {"state": "CONNECTED" if i % 13 == 0 else "NOT_CONNECTED",
                                     "backing": {"type": "ISO_FILE" if i % 13 == 0 else "CLIENT_DEVICE"}}},
             },
@@ -384,6 +385,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "no such vm"})
                 return
             detail = dict(vm["_detail"])
+            # FAKE_VC_ODD_VMS="app-008:snapshot,web-009:serial,db-010:floppy,svc-011:big": disk and device oddities,
+            # opt-in so the grades other tests count do not move.
+            for item in [x.strip() for x in os.environ.get("FAKE_VC_ODD_VMS", "").split(",") if x.strip()]:
+                who, _, kind = item.partition(":")
+                if who != vm["name"]:
+                    continue
+                if kind == "snapshot":
+                    detail["disks"] = {k: dict(v, backing=dict(v.get("backing") or {}, vmdk_file="[vsanDatastore] {}/disk1-000001.vmdk".format(vm["name"])))
+                                       for k, v in detail["disks"].items()}
+                elif kind in ("serial", "floppy", "parallel"):
+                    key = {"serial": "serial_ports", "floppy": "floppies", "parallel": "parallel_ports"}[kind]
+                    detail[key] = {"9000": {"label": kind, "state": "CONNECTED"}}
+                elif kind == "big":
+                    detail["disks"] = {k: dict(v, capacity=3 * 1024 ** 4) if k == "2000" else v for k, v in detail["disks"].items()}
             detail["name"] = vm["name"]
             detail["power_state"] = vm["power_state"]
             self._send(200, detail)

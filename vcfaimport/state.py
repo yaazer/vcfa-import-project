@@ -266,6 +266,7 @@ ADDED_COLUMNS = {
         ("src_datacenter", "TEXT NOT NULL DEFAULT ''"),
         ("app", "TEXT NOT NULL DEFAULT ''"),
         ("src_ip", "TEXT NOT NULL DEFAULT ''"),
+        ("src_layout", "TEXT NOT NULL DEFAULT ''"),       # disks + devices as last recorded (see disk_layout)
         ("verify_state", "TEXT NOT NULL DEFAULT ''"),     # '', ok, warn, fail
         ("verified_at", "TEXT"),
         ("verify_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -307,6 +308,24 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+def disk_layout(facts_json: Any) -> str:
+    """A short, stable description of a VM's disks and legacy devices from its discovery facts, e.g.
+    "2 disk(s) 70 GB; snapshot; 1 serial"; "" when the facts carry no disk detail (an older discover)."""
+    try:
+        facts = json.loads(facts_json or "{}") or {}
+    except (TypeError, ValueError):
+        return ""
+    disks = facts.get("disks") if isinstance(facts, dict) else None
+    if not isinstance(disks, dict):
+        return ""
+    gb = sum((d.get("capacity_gb") or 0) for d in disks.values() if isinstance(d, dict))
+    parts = ["{} disk(s) {:g} GB".format(len(disks), round(gb, 1))]
+    if any(isinstance(d, dict) and d.get("delta") for d in disks.values()):
+        parts.append("snapshot")
+    parts += ["{} {}".format(n, k) for k, n in sorted((facts.get("devices") or {}).items()) if n]
+    return "; ".join(parts)
 
 
 class Store:
@@ -501,6 +520,14 @@ class Store:
         if row is None or vm is None:
             return []
         changes: List[str] = []
+        # Disks and legacy devices vouch the same way folder and power do: a snapshot taken, a disk added or
+        # grown after a precheck passed means the pass describes a different VM. Compared only when both the
+        # recorded and the new discovery carry the layout: the first discover after an upgrade has nothing
+        # to compare, and must not send every prechecked VM back to pending.
+        layout = disk_layout(row["facts_json"])
+        recorded = vm["src_layout"] if "src_layout" in vm.keys() else ""
+        if recorded and layout and recorded != layout:
+            changes.append("disks or devices {} -> {}".format(recorded, layout))
         if vm["src_power"] or vm["src_folder"]:      # facts came from an earlier discovery
             for label, old, new in (("folder", vm["src_folder"], row["folder"]),
                                     ("power", vm["src_power"], row["power_state"]),
@@ -510,10 +537,10 @@ class Store:
         self.conn.execute(
             "UPDATE vms SET src_vcenter=?, src_cluster=?, src_folder=?, src_host=?,"
             " src_networks=?, src_power=?, src_cpu=?, src_memory_mb=?, src_tools=?,"
-            " src_datacenter=?, src_ip=? WHERE moref=?",
+            " src_datacenter=?, src_ip=?, src_layout=? WHERE moref=?",
             (str(self.get_meta("vcenter") or ""), row["cluster"], row["folder"], row["host"],
              row["networks"], row["power_state"], row["cpu_count"], row["memory_mb"],
-             row["tools_status"], row["datacenter"], row["ip"] or "", moref),
+             row["tools_status"], row["datacenter"], row["ip"] or "", layout or recorded, moref),
         )
         return changes
 

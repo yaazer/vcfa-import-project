@@ -839,6 +839,57 @@ KNOWN_ISSUES: List[Dict[str, Any]] = [
      "advice": "Needs a human: check the VM in vCenter and its ImportOperation in the "
                "namespace before doing anything else with it.",
      "actions": []},
+    # Storage and virtual-disk causes. Order matters (first match wins): the quota patterns sit ahead of "apply"
+    # because a Kubernetes quota denial reads "forbidden: exceeded quota"; "independent" sits ahead of "snapshot"
+    # because its message mentions snapshots. Only the quota/placement stall was seen on a real cluster
+    # (2026-10-01); the rest are the usual ways a disk move fails and the wording is a best guess.
+    {"id": "storage_quota",
+     "pattern": r"exceeded quota|storage quota|StoragePolicyReservation|waiting for placement results from importoperationbatch",
+     "title": "The namespace's storage quota is probably full",
+     "advice": "Every import and every finished precheck batch holds a storage reservation the size of its disks "
+               "until the batch is deleted (seen 2026-10-01: 426 GiB held against a 250 GiB limit). The quota webhook "
+               "then denies the next import, and the condition only says it is waiting for placement; the denial is "
+               "in the operator's log. Delete finished precheck batches (Execute > clean up), or raise the "
+               "namespace's storage limit in vCenter, then retry.",
+     "actions": ["retry", "skip"]},
+    {"id": "storage_space", "pattern": r"insufficient free space|not enough (free )?space|out of space",
+     "title": "A datastore does not have room for the disks",
+     "advice": "The destination datastore cannot hold the VM's disks (a thick-provisioned disk needs its full size "
+               "up front). Free space or add capacity, or give the namespace a policy that lands on a roomier "
+               "datastore, then retry.",
+     "actions": ["retry", "skip"]},
+    {"id": "storage_policy",
+     "pattern": r"cannot be satisfied on datastore|policy .{0,60}(not compatible|incompatible)|object space reservation",
+     "title": "The storage policy cannot be satisfied on the target datastore",
+     "advice": "The policy demands something the datastore cannot give (for example thick provisioning on a thin "
+               "disk). Make the disk match the policy in vCenter, or move the VM to a policy the namespace offers "
+               "that suits its disks, then Discover again.",
+     "actions": ["skip"]},
+    {"id": "disk_independent", "pattern": r"independent[- ](persistent|nonpersistent)|not part of snapshots",
+     "title": "A disk is independent (outside snapshots)",
+     "advice": "Independent disks cannot be relocated with the VM. In vCenter set the disk's mode to dependent, "
+               "then Discover again.",
+     "actions": ["skip"]},
+    {"id": "disk_shared", "pattern": r"multi-writer|shared between virtual machines|shared disk",
+     "title": "A disk is shared between VMs",
+     "advice": "A multi-writer disk belongs to more than one VM, so it cannot move with just this one. Plan the "
+               "VMs that share it together, or separate the disk first.",
+     "actions": ["skip"]},
+    {"id": "disk_snapshot", "pattern": r"has a snapshot|delta disk|consolidate the snapshots|-0000\d\d\.vmdk",
+     "title": "The VM has a snapshot",
+     "advice": "A snapshot leaves a chain of delta disks that cannot be imported. Delete or consolidate the "
+               "snapshots in vCenter, then Discover again and retry.",
+     "actions": ["skip"]},
+    {"id": "vsan_ftt", "pattern": r"failures-to-tolerate|failures to tolerate|vsan object",
+     "title": "The vSAN policy needs more hosts than are available",
+     "advice": "The policy's failures-to-tolerate needs more hosts in the target cluster than it has. Use a "
+               "policy that fits the cluster, or wait until the hosts are back, then retry.",
+     "actions": ["retry", "skip"]},
+    {"id": "disk_rdm", "pattern": r"raw device mapping|\(RDM\)",
+     "title": "A disk is a raw device mapping",
+     "advice": "Only plain VMDK disks import. Convert the RDM to a VMDK in vCenter (storage migration), then "
+               "Discover again.",
+     "actions": ["skip"]},
     {"id": "apply", "pattern": r"batch apply failed|forbidden|unauthori[sz]ed",
      "title": "The batch could not be applied",
      "advice": "Nothing reached the operator. Run Preflight to check the context, RBAC, "
@@ -1558,6 +1609,78 @@ def read_catalog(client: Any, store: st.Store, server: str, *, concurrency: int 
             "subnets": None if extras.get("subnets") is None else len(extras["subnets"]),
             "policy_namespaces": len(sp.get("namespaces") or {}),
             "still_held": len([l for l in report if l.startswith("  held back:")])}
+
+
+def _disk_gib_by_policy(facts: Any) -> Dict[str, float]:
+    """policy id -> GiB of this VM's disks on it (disks with no known policy or size are not counted)."""
+    facts = facts if isinstance(facts, dict) else {}
+    attached = facts.get("storage_policies") if isinstance(facts.get("storage_policies"), dict) else {}
+    on = attached.get("disks") if isinstance(attached.get("disks"), dict) else {}
+    disks = facts.get("disks") if isinstance(facts.get("disks"), dict) else {}
+    out: Dict[str, float] = {}
+    for key, d in disks.items():
+        pid, gb = on.get(key), (d or {}).get("capacity_gb") if isinstance(d, dict) else None
+        if pid and isinstance(gb, (int, float)):
+            out[pid] = out.get(pid, 0.0) + gb
+    return out
+
+
+# States whose ImportOperation still holds a StoragePolicyReservation: in flight or waiting at the commit gate.
+# (A committed or rolled-back import releases it, and finished precheck batches are deleted by the tool; a failed
+# one keeps it until its batch goes, but that is not counted here: it is advice, so it errs on the quiet side.)
+_RESERVING_STATES = (st.S_IMPORTING, st.S_AWAITING_COMMIT)
+
+
+def quota_check(store: st.Store, morefs: Sequence[str]) -> List[Dict[str, Any]]:
+    """Will this run's disks fit each namespace's storage limit? Advice, never a hold.
+
+    Every ImportOperation reserves its VM's disk size against the namespace's per-policy storage limit until it
+    is committed, rolled back or its batch is deleted (seen 2026-10-01). So per (namespace, policy) this adds the
+    planned VMs' disks to what the tool's own in-flight imports already reserve, and lists the pairs that exceed
+    the limit vCenter reports. It cannot see usage by anything else in the namespace (other tools, VMs created
+    by hand), so a pair under its limit here can still be denied; and a namespace or policy whose limit was never
+    read is skipped, never treated as full. Sizes are the disk capacities discover recorded (GiB); limits are MiB."""
+    if not morefs:
+        return []
+    snap = store.get_meta("vc_storage_policies") or {}
+    limits, names = snap.get("limits") or {}, snap.get("names") or {}
+    planned = {r["moref"]: r["namespace"] for r in store.query_vms(morefs=list(morefs))}
+    reserved = {r["moref"]: r["namespace"] for r in store.query_vms(states=list(_RESERVING_STATES))
+                if r["moref"] not in planned}
+    facts = {}
+    for r in store.query_discovered(morefs=list(planned) + list(reserved)):
+        try:
+            facts[r["moref"]] = json.loads(r["facts_json"] or "{}")
+        except ValueError:
+            facts[r["moref"]] = {}
+    need: Dict[Tuple[str, str], float] = {}
+    held: Dict[Tuple[str, str], float] = {}
+    vms: Dict[Tuple[str, str], int] = {}
+    for target, group in ((planned, need), (reserved, held)):
+        for moref, ns in target.items():
+            for pid, gib in _disk_gib_by_policy(facts.get(moref)).items():
+                group[(ns, pid)] = group.get((ns, pid), 0.0) + gib
+                if group is need:
+                    vms[(ns, pid)] = vms.get((ns, pid), 0) + 1
+    out: List[Dict[str, Any]] = []
+    for (ns, pid), want in sorted(need.items()):
+        limit_mib = (limits.get(ns) or {}).get(pid)
+        if not isinstance(limit_mib, (int, float)) or limit_mib <= 0:
+            continue
+        limit, already = limit_mib / 1024.0, held.get((ns, pid), 0.0)
+        if want + already > limit:
+            out.append({"namespace": ns, "policy": pid, "policy_name": names.get(pid) or pid, "vms": vms[(ns, pid)],
+                        "need_gib": round(want, 1), "reserved_gib": round(already, 1), "limit_gib": round(limit, 1),
+                        "over_by_gib": round(want + already - limit, 1)})
+    return out
+
+
+def quota_lines(warnings: Sequence[Dict[str, Any]]) -> List[str]:
+    return ["  storage quota: namespace {} policy '{}': this run needs {:g} GiB for {} VM(s) and {:g} GiB is already "
+            "reserved by imports in flight, against a {:g} GiB limit -- {:g} GiB over. The quota webhook will deny "
+            "what does not fit (advice only: usage by anything else in the namespace is not visible)".format(
+                w["namespace"], w["policy_name"], w["need_gib"], w["vms"], w["reserved_gib"], w["limit_gib"],
+                w["over_by_gib"]) for w in warnings]
 
 
 # Compliance answers that are a known "no" (a fail) as opposed to "vCenter could not say" (unknown).

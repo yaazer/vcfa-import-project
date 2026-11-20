@@ -5648,7 +5648,7 @@ def t_storage_breakdown():
     # per-disk facts from the VM detail vCenter already returned
     f = vcenter._facts({"disks": {"2000": {"label": "Hard disk 1", "capacity": 21474836480,
                                            "backing": {"type": "VMDK_FILE", "vmdk_file": "[DS2-Thick] vm/vm.vmdk"}}}})
-    eq(f["disks"]["2000"], {"label": "Hard disk 1", "backing": "VMDK_FILE", "datastore": "DS2-Thick", "capacity_gb": 20.0})
+    eq(f["disks"]["2000"], {"label": "Hard disk 1", "backing": "VMDK_FILE", "delta": False, "datastore": "DS2-Thick", "capacity_gb": 20.0})
 
     # The grid and the gate cannot disagree: pass exactly when the engine keeps the VM.
     with tempfile.TemporaryDirectory() as tmp:
@@ -6958,6 +6958,130 @@ def t_status_child_blocking_condition():
     eq(op.message, "VirtualMachineReadyForImport: waiting for placement results from importoperationbatch")
 
 
+@test("triage: every storage / virtual-disk failure the demo produces gets its own explanation, in an order that "
+      "keeps quota ahead of 'apply' and independent disks ahead of snapshots")
+def t_storage_triage_patterns():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import fake_kubectl
+    from vcfaimport import service
+    want = ["storage_space", "storage_policy", "storage_quota", "disk_independent", "disk_shared",
+            "disk_snapshot", "vsan_ftt", "disk_rdm"]
+    eq(len(fake_kubectl.STORAGE_FAILURES), len(want))
+    for message, issue in zip(fake_kubectl.STORAGE_FAILURES, want):
+        eq((service.classify_failure(message) or {}).get("id"), issue, message)
+    ident = lambda m: (service.classify_failure(m) or {}).get("id")      # noqa: E731
+    eq(ident("admission webhook denied: forbidden: exceeded quota: ns-a-storage"), "storage_quota", "not 'apply'")
+    eq(ident("VirtualMachineReadyForImport: waiting for placement results from importoperationbatch"), "storage_quota",
+       "the stall seen on 2026-10-01")
+    eq(ident("batch apply failed: forbidden"), "apply")
+    eq(ident("VM Tools not running"), "tools")
+    for issue in service.KNOWN_ISSUES:
+        if issue["id"].startswith(("disk_", "storage_policy")):
+            assert "retry" not in issue["actions"], "no Retry until the disk is fixed: " + issue["id"]
+
+
+@test("readiness: snapshot, legacy devices, large VM, odd and duplicate names are advisory (never block), "
+      "and an older cache without disk detail stays quiet")
+def t_readiness_disk_rules():
+    from vcfaimport import readiness
+    from vcfaimport import state as st
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        base = {"power_state": "POWERED_ON", "tools_status": "RUNNING", "folder": "F",
+                "nics": [{"device_key": 1, "network_name": "n"}]}
+        disk = lambda delta=False, gb=20.0: {"label": "d", "backing": "VMDK_FILE", "datastore": "ds",      # noqa: E731
+                                             "capacity_gb": gb, "delta": delta}
+        good = lambda **kw: dict(_good_storage_facts(), **kw)      # noqa: E731
+        store.upsert_discovered([
+            dict(base, moref="vm-1", name="clean", facts=good(disks={"2000": disk()}, devices={"serial": 0})),
+            dict(base, moref="vm-2", name="snap", facts=good(disks={"2000": disk(delta=True)})),
+            dict(base, moref="vm-3", name="legacy", facts=good(disks={"2000": disk()}, devices={"serial": 1, "floppy": 1})),
+            dict(base, moref="vm-4", name="huge", facts=good(disks={"2000": disk(gb=3072.0)})),
+            dict(base, moref="vm-5", name="Odd_Name 01", facts=good(disks={"2000": disk()})),
+            dict(base, moref="vm-6", name="twin", facts=good(disks={"2000": disk()})),
+            dict(base, moref="vm-7", name="TWIN", folder="G", facts=good(disks={"2000": disk()})),
+            dict(base, moref="vm-8", name="old-cache", facts=good()),      # no disk detail at all
+        ])
+        rows = {r["moref"]: r for r in store.query_discovered()}
+        ctx = readiness.context(list(rows.values()))
+        new = {"snapshot_disk", "legacy_devices", "large_vm", "k8s_name", "duplicate_name"}
+        codes = lambda m: sorted(f["code"] for f in readiness.assess(rows[m], ctx) if f["code"] in new)      # noqa: E731
+        eq(codes("vm-1"), [])
+        eq(codes("vm-2"), ["snapshot_disk"])
+        eq(codes("vm-3"), ["legacy_devices"])
+        eq(codes("vm-4"), ["large_vm"])
+        eq(codes("vm-5"), ["k8s_name"])
+        eq(codes("vm-6"), ["duplicate_name"])
+        eq(codes("vm-7"), ["duplicate_name", "k8s_name"])
+        eq(codes("vm-8"), [], "an older discover has no disk facts: say nothing, never guess")
+        for m in rows:       # none of them can change what readiness_exclude_blocked keeps out
+            assert readiness.grade(readiness.assess(rows[m], ctx)) in ("ready", "warn"), m
+        eq(readiness.grade(readiness.assess(rows["vm-2"], ctx)), "warn")
+        eq(readiness.grade(readiness.assess(rows["vm-4"], ctx)), "ready", "info only")
+        assert "duplicate_name" not in [f["code"] for f in readiness.assess(rows["vm-6"])]      # no context: quiet
+        eq(st.disk_layout(rows["vm-3"]["facts_json"]), "1 disk(s) 20 GB; 1 floppy; 1 serial")
+        eq(st.disk_layout(rows["vm-8"]["facts_json"]), "")
+        store.close()
+
+
+@test("a disk or device change since a precheck passed sends the VM back to pending -- but the first discover "
+      "after an upgrade (no recorded layout) never mass-resets prechecked VMs")
+def t_disk_drift_clears_precheck():
+    from vcfaimport import state as st
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        disks = lambda delta=False: {"2000": {"capacity_gb": 20.0, "delta": delta, "backing": "VMDK_FILE"}}      # noqa: E731
+        base = {"power_state": "POWERED_ON", "tools_status": "RUNNING", "folder": "F", "nics": [], "name": "n"}
+        store.upsert_discovered([dict(base, moref="vm-1", facts={"disks": disks()}),
+                                 dict(base, moref="vm-2", name="old", facts={})])      # discovered before disk facts existed
+        _record(store, moref="vm-1", name="n")
+        _record(store, moref="vm-2", name="old")
+        for m in ("vm-1", "vm-2"):
+            store.set_vm_state(m, st.S_PRECHECK_PASSED, precheck_batch="pre-x", stage="precheck")
+        eq(store.get_vm("vm-1")["src_layout"], "1 disk(s) 20 GB")
+        eq(store.get_vm("vm-2")["src_layout"], "")
+        summary = store.upsert_discovered([dict(base, moref="vm-1", facts={"disks": disks(delta=True)}),
+                                           dict(base, moref="vm-2", name="old", facts={"disks": disks()})])
+        eq(summary["precheck_cleared"], 1)
+        vm = store.get_vm("vm-1")
+        eq(vm["state"], "pending")
+        assert "disks or devices 1 disk(s) 20 GB -> 1 disk(s) 20 GB; snapshot" in vm["message"], vm["message"]
+        eq(store.get_vm("vm-2")["state"], "precheck_passed", "nothing recorded to compare with: recorded now, not reset")
+        eq(store.get_vm("vm-2")["src_layout"], "1 disk(s) 20 GB")
+        store.close()
+
+
+@test("quota advice: the run's disks plus what in-flight imports reserve, per namespace and policy, against the "
+      "limit vCenter reports -- advice only, and a limit never read is never read as full")
+def t_quota_check():
+    from vcfaimport import service
+    from vcfaimport import state as st
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _store(tmp)
+        facts = lambda gb: dict(_good_storage_facts(), disks={"2000": {"capacity_gb": gb, "backing": "VMDK_FILE"}})      # noqa: E731
+        base = {"power_state": "POWERED_ON", "tools_status": "RUNNING", "folder": "F", "nics": []}
+        store.upsert_discovered([dict(base, moref="vm-1", name="a", facts=facts(100.0)),
+                                 dict(base, moref="vm-2", name="b", facts=facts(100.0)),
+                                 dict(base, moref="vm-3", name="c", facts=facts(100.0))])
+        for m, n in (("vm-1", "a"), ("vm-2", "b"), ("vm-3", "c")):
+            _record(store, moref=m, name=n, ns="ns-a")
+        snap = {"namespaces": {"ns-a": [GOLD_POLICY]}, "names": {GOLD_POLICY: "Gold"},
+                "limits": {"ns-a": {GOLD_POLICY: 250 * 1024}}}          # 250 GiB, in MiB
+        store.set_meta("vc_storage_policies", snap)
+        eq(service.quota_check(store, ["vm-1", "vm-2"]), [], "200 GiB fits 250")
+        over = service.quota_check(store, ["vm-1", "vm-2", "vm-3"])
+        eq([(w["namespace"], w["policy_name"], w["need_gib"], w["limit_gib"], w["over_by_gib"]) for w in over],
+           [("ns-a", "Gold", 300.0, 250.0, 50.0)])
+        store.set_vm_state("vm-3", st.S_IMPORTING, stage="import")      # in-flight imports already hold their reservation
+        over = service.quota_check(store, ["vm-1", "vm-2"])
+        eq((over[0]["need_gib"], over[0]["reserved_gib"], over[0]["over_by_gib"]), (200.0, 100.0, 50.0))
+        assert "50 GiB over" in service.quota_lines(over)[0], service.quota_lines(over)
+        store.set_meta("vc_storage_policies", dict(snap, limits={}))      # no limit read: never read as full
+        eq(service.quota_check(store, ["vm-1", "vm-2", "vm-3"]), [])
+        eq(service.quota_check(store, []), [])
+        store.close()
+
+
 @test("discovery clears a precheck the VM no longer matches; renames reach the queue")
 def t_discovery_drift():
     from vcfaimport import state as st
@@ -7643,6 +7767,7 @@ UNIT = [
     t_engine_storage_compliance_live_filter_real_client,
     t_stage_moves_queued_vms, t_web_stage_moves_queued,
     t_vcenter_storage_policy_problems, t_engine_storage_policy_gate, t_eligibility_causes_and_plan, t_storage_breakdown, t_read_catalog,
+    t_storage_triage_patterns, t_readiness_disk_rules, t_disk_drift_clears_precheck, t_quota_check,
     t_engine_storage_policy_live_filter, t_discover_storage_policy_real_client,
     t_web_roles_settings,
     t_yaml_roundtrip, t_yaml_quoting, t_no_creation_rollback, t_fake_creation_rollback,

@@ -80,6 +80,14 @@ Read `README.md` for usage and `LAB-GUIDE.md` for the lab runbook.
   else what `stage()` would assign from the saved maps; none = "no target", never a guess. Cached facts only, no vCenter call.
   Per-disk `facts.disks` (datastore from the VMDK path) is absent in old caches: say "Discover again", never infer.
   No thin/thick flag is read: REST reports none, the compliance cause carries it. Do not invent provisioning rules.
+- **Disk and device readiness rules are WARN/INFO only** (`snapshot_disk`, `legacy_devices`, `large_vm`, `k8s_name`,
+  `duplicate_name`): none was seen to fail a precheck, so none may BLOCK (that would silently change what
+  `readiness_exclude_blocked` skips). They read `facts.disks` / `facts.devices`; absent in an old cache = quiet, never a guess.
+  `duplicate_name` needs `readiness.context(rows)`. `vms.src_layout` (`state.disk_layout`) is compared only when both the
+  recorded and the new discovery carry it, so the first discover after an upgrade never mass-resets prechecked VMs.
+- **`service.quota_check` is advice, never a hold** (no eligibility code): planned disks + our own in-flight reservations vs
+  the namespace's per-policy limit; unknown limit = skipped. Triage patterns for storage failures: quota before `apply`,
+  independent before snapshot (first match wins); only the 2026-10-01 placement stall was observed, the rest is guesswork.
 - **`service.read_catalog` / `catalog`** re-reads namespaces, subnets and per-namespace policies with no VMs, and refuses a
   vCenter other than the cache's. Discover uses the same `vcenter.read_namespace_catalog`.
 - **No floating panels over the work.** The Activity pane (`#pane`, views.js "PANE") is the third column of

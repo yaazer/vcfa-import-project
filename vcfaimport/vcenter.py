@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -863,13 +864,19 @@ def _facts(detail: Dict[str, Any]) -> Dict[str, Any]:
         cap = d.get("capacity")
         disks[key] = {
             "label": str(d.get("label") or ""), "backing": str(backing.get("type") or ""),
+            # A disk named like "vm-000001.vmdk" is a snapshot's delta disk: the VM has (or had) a snapshot.
+            "delta": bool(re.search(r"-\d{6}\.vmdk$", vmdk, re.IGNORECASE)),
             "datastore": vmdk[1:vmdk.index("]")] if vmdk.startswith("[") and "]" in vmdk else "",
             "capacity_gb": (round(cap / 1024 ** 3, 1)
                             if isinstance(cap, (int, float)) and not isinstance(cap, bool) else None)}
+    # Legacy devices, counted only where the detail lists the device class at all (absent = not read).
+    devices = {name: len(entries(key)) for name, key in (("floppy", "floppies"), ("serial", "serial_ports"),
+                                                        ("parallel", "parallel_ports")) if key in (detail or {})}
     return {
         # every disk key, so a disk missing from vm_storage_policies (no policy) shows
         "disk_ids": disk_ids,
         "disks": disks,
+        "devices": devices,
         "hw_version": ((detail or {}).get("hardware") or {}).get("version", ""),
         "disk_backings": [((d.get("backing") or {}).get("type") or "") for d in entries("disks")],
         "iso_connected": any((c.get("backing") or {}).get("type") == "ISO_FILE"

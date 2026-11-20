@@ -1573,6 +1573,7 @@ function planTable(v) {
       <td class="small mono">${p.namespaces.join(', ')}</td><td class="right small nowrap">${eta(p.seconds)}</td></tr>`)}
     <tr><td><b>Total</b></td><td class="right num"><b>${n(pl.total)}</b></td><td class="right num"><b>${n(pl.plan.reduce((a, p) => a + p.batches, 0))}</b></td><td></td><td class="right nowrap"><b>${eta(pl.seconds)}</b></td></tr></tbody></table>
     <div class="tiny faint mt-s">Times use ${basis}; waves run one after another.</div>
+    ${quotaNote(pl)}
     ${(pl.held || []).length ? heldCard(pl) : (pl.holdbacks || []).length ? html`<div class="note warn mt-s"><b>Held back:</b><ul class="plain">${pl.holdbacks.map((h) => html`<li>${h}</li>`)}</ul></div>` : ''}
     ${(pl.left_over || []).length ? html`<div class="note warn mt-s"><b>${plural(pl.left_over.length, 'VM')} not in your current selection ${tip('leftover')}</b>
       <ul class="plain small">${pl.left_over.slice(0, 10).map((m) => html`<li><b>${m.vm_name}</b> <span class="mono tiny">${m.moref}</span> · wave ${m.wave} · queued ${fmtTime(m.queued_at, true)}</li>`)}</ul>
@@ -1583,6 +1584,15 @@ function planTable(v) {
 // Why VMs in scope are not in this run: one block per cause (eligibility.py), each with what it means,
 // what to do, where to do it, and the VMs it holds back. Shown whether or not anything else is eligible.
 const HELD_SHOWN = 8;
+// Advice, not a hold: this import's disks against each namespace's storage limit (service.quota_check).
+function quotaNote(pl) {
+  const q = pl.quota || [];
+  if (!q.length) return '';
+  return html`<div class="note warn mt-s"><b>Storage quota: ${plural(q.length, 'namespace policy', 'namespace policies')} may not fit this import.</b>
+    Every import reserves its disks' size against the namespace limit until it is committed, rolled back or its batch is deleted.
+    <ul class="plain">${q.map((w) => html`<li><span class="mono">${w.namespace}</span> · ${w.policy_name}: needs <b>${w.need_gib} GiB</b> for ${plural(w.vms, 'VM')}${w.reserved_gib ? html` plus ${w.reserved_gib} GiB already reserved by imports in flight` : ''}, limit ${w.limit_gib} GiB — <b>${w.over_by_gib} GiB over</b></li>`)}</ul>
+    <span class="small muted">Advice only. Usage by anything else in the namespace is not visible, so a plan under its limit can still be denied. Raise the limit in vCenter, or import fewer VMs per wave.</span></div>`;
+}
 function heldCard(pl) {
   const groups = pl.held || [];
   if (!groups.length) return '';

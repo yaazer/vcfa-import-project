@@ -317,6 +317,14 @@ const SCENARIOS = {
     check('a wrong-policy disk says the policy and that the namespace does not offer it', sub2 && /Bronze/.test(sub2.textContent) && /not offered/.test(sub2.textContent), sub2 && sub2.textContent.slice(0, 300));
     check('the policies each namespace offers are listed, with limits', /Storage policies each namespace offers/.test(document.querySelector('#view').textContent) && /Gold/.test(document.querySelector('#view').textContent) && /GiB/.test(document.querySelector('#view').textContent));
     check('nothing is injected by the storage column', noInjection());
+    // Readiness knows the disk and device oddities too -- advisory, so none of them is a block.
+    const finds = (n) => (by(n) || {}).findings || [];
+    check('a snapshot delta disk is flagged', finds('app-008').includes('The VM has a snapshot'), JSON.stringify(finds('app-008')));
+    check('a serial port is flagged', finds('web-009').includes('Serial port, parallel port or floppy attached'));
+    check('a floppy is flagged', finds('db-010').includes('Serial port, parallel port or floppy attached'));
+    check('a huge disk is flagged as large', finds('svc-015').includes('A large VM'));
+    check('and none of them grades the VM "likely to fail"', ['app-008', 'web-009', 'db-010', 'svc-015'].every((n) => by(n).readiness !== 'block'), ['app-008', 'web-009', 'db-010', 'svc-015'].map((n) => by(n).readiness).join(','));
+    check('the Execute plan can render a storage-quota warning', String(quotaNote({ quota: [{ namespace: 'prod-web-ns1', policy_name: 'Gold', vms: 3, need_gib: 300, reserved_gib: 0, limit_gib: 250, over_by_gib: 50 }] })).length > 20);
     type('#sel-q', '');
     filt.value = ''; filt.dispatchEvent(new Event('change', { bubbles: true }));
   },
@@ -1508,6 +1516,8 @@ def build(tmp, vms, seed=True, hostile=True, scenario="import-flaky", commit_act
     os.environ["FAKE_VC_WRONG_POLICY_VMS"] = HELD_VMS
     # One DMZ VM (never queued by the seed) that vCenter calls non compliant on its disk, with a cause.
     os.environ["FAKE_VC_NONCOMPLIANT_VMS"] = "app-004"
+    # A snapshot, a serial port, a floppy and a huge disk: advisory readiness findings, none of which may hold a VM.
+    os.environ["FAKE_VC_ODD_VMS"] = "app-008:snapshot,web-009:serial,db-010:floppy,svc-015:big"
     vc_server, vc_port = fake_vcenter.serve(count=vms)
     env = demo.setup(tmp, vc_port, scenario, batch_size=8 if vms < 1000 else 25)
     os.environ.update(env)
