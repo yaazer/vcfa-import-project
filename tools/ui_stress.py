@@ -327,6 +327,50 @@ const SCENARIOS = {
     check('the Execute plan can render a storage-quota warning', String(quotaNote({ quota: [{ namespace: 'prod-web-ns1', policy_name: 'Gold', vms: 3, need_gib: 300, reserved_gib: 0, limit_gib: 250, over_by_gib: 50 }] })).length > 20);
     type('#sel-q', '');
     filt.value = ''; filt.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // The "Show them" shortcut used to leave no way back once a folder was picked: the bar's own
+    // bad-count could read zero for that folder while the global filter stayed on, hiding VMs that
+    // actually pass. A filter-chips row (and a bar-local exit) must make this recoverable.
+    const dmzTotal = d.filter((v) => v.folder === 'DMZ' || (v.folder || '').startsWith('DMZ/')).length;
+    document.querySelector('.storagebar [data-act="storageSet"][data-k="problem"]').click();
+    await waitFor(() => document.querySelector('.filterchips'));
+    check('picking "Show them" raises a filter chip', /fail or unknown/.test(document.querySelector('.filterchips').textContent));
+    check('every visible row is fail or unknown', [...document.querySelectorAll('#view tbody .stag')].every((b) => /fail|unknown/.test(b.textContent)));
+    document.querySelector('.tnode[data-path="DMZ"]').click();
+    await sleep(150);
+    check('the storage chip survives picking a folder (no silent reset)', /fail or unknown/.test(document.querySelector('.filterchips').textContent));
+    check('a folder chip appears alongside it', /Folder: DMZ/.test(document.querySelector('.filterchips').textContent));
+    const intersected = S.view.rows.length;
+    check('the two filters intersect: at most the folder\'s own VMs', intersected <= dmzTotal, intersected + ' vs ' + dmzTotal);
+    const storageChipX = [...document.querySelectorAll('.filterchips .chip.fchip')].find((c) => /fail or unknown/.test(c.textContent)).querySelector('.x');
+    storageChipX.click();
+    await sleep(150);
+    check('clicking the chip\'s × drops only the storage filter', !/fail or unknown/.test(document.querySelector('.filterchips').textContent) && /Folder: DMZ/.test(document.querySelector('.filterchips').textContent));
+    check('the folder\'s passing VMs reappear', S.view.rows.length === dmzTotal, S.view.rows.length + ' vs ' + dmzTotal);
+
+    // The bar's own exit (next to where the filter was turned on) must work even when its
+    // bad-count for the current context is zero.
+    document.querySelector('.storagebar [data-act="storageSet"][data-k="problem"]').click();
+    await sleep(150);
+    const showAll = document.querySelector('.storagebar [data-act="storageSet"][data-k=""]');
+    check('the storage bar offers its own way out while the filter is on', showAll);
+    showAll.click();
+    await sleep(150);
+    check('and it clears the filter', !document.querySelector('.filterchips') || !/fail or unknown/.test(document.querySelector('.filterchips').textContent));
+
+    // Clear filters wipes every narrowing filter at once, back to the page's own defaults.
+    // (mount() replaces the whole markup on a change, so re-query the select instead of
+    // reusing the earlier `filt` reference -- it may be a detached node by now.)
+    document.querySelector('.tnode[data-path="DMZ"]').click();
+    const filtNow = document.querySelector('select[data-k="storage"]');
+    filtNow.value = 'fail'; filtNow.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(150);
+    const clearAll = document.querySelector('.filterchips [data-act="clearFilters"]');
+    check('two active filters offer a single "Clear filters"', clearAll);
+    clearAll.click();
+    await sleep(150);
+    check('Clear filters removes the chip row entirely', !document.querySelector('.filterchips'));
+    check('and the full inventory is back', S.view.rows.length === d.length, S.view.rows.length + ' vs ' + d.length);
   },
 
   async stage() {

@@ -325,15 +325,47 @@ function storageBar(v, selCount) {
   pool.forEach((x) => { c[x.storage_verdict] = (c[x.storage_verdict] || 0) + 1; });
   const bad = c.fail + c.unknown;
   const chip = (k, label) => html`<button class="chip ${v.f.storage === k ? 'on' : ''}" data-act="storageSet" data-k="${v.f.storage === k ? '' : k}"><span class="tag ${STORAGE[k][0]}">${label}</span> <span class="n">${n(c[k])}</span></button>`;
+  // The filter can also be on for a reason this bar's own counts don't show (a different folder, a value set from the Discover page):
+  // whenever it's on, the way out stays here too, not just in the filter-chips row above the table.
+  const exit = v.f.storage ? html` <button class="btn xs ghost" data-act="storageSet" data-k="">Show all VMs</button>` : '';
   return html`<div class="storagebar ${bad ? 'bad' : ''}"><span><b>Storage policy check</b> of ${selCount ? 'the ' + n(selCount) + ' selected VMs' : 'all ' + n(pool.length) + ' VMs'}:</span>
     <div class="chips">${chip('pass', 'pass')}${chip('fail', 'fail')}${chip('unknown', 'unknown')}${c.no_target ? chip('no_target', 'no target yet') : ''}</div>
-    ${bad ? html`<span class="bad-text small"><b>${plural(bad, 'VM')}</b> will be held back from precheck. <button class="btn xs" data-act="storageSet" data-k="problem">Show them</button> Click a tag for the disk-by-disk reason.</span>` : html`<span class="muted small">Click a tag for each disk's policy, compliance and datastore.</span>`}</div>`;
+    ${bad ? html`<span class="bad-text small"><b>${plural(bad, 'VM')}</b> will be held back from precheck. <button class="btn xs" data-act="storageSet" data-k="problem">Show them</button> Click a tag for the disk-by-disk reason.</span>${exit}` : html`<span class="muted small">Click a tag for each disk's policy, compliance and datastore.</span>${exit}`}</div>`;
+}
+const POWER_L = { on: 'Powered on', off: 'Powered off' };
+const TOOLS_L = { ok: 'Tools running', bad: 'Tools not running' };
+const READY_L = { ready: 'Ready', warn: 'Check first', block: 'Likely to fail' };
+const SHOW_L = { sel: 'Selected only', unsel: 'Not selected only' };
+const STORAGE_L = { problem: 'Storage: fail or unknown', pass: 'Storage: pass', fail: 'Storage: fail', unknown: 'Storage: unknown', no_target: 'Storage: no target yet' };
+// The one definition of "no filter active"; init() and "Clear filters" both start from a copy of this,
+// so a filter added later can't survive Clear filters by missing from a second, drifted literal.
+const SELECT_F0 = { q: '', dc: null, folder: null, cluster: '', network: '', power: '', tools: '', show: 'all', ready: '', tag: '', app: '', storage: '' };
+// Every filter in v.f that is narrowing the VM list right now, as a removable chip -- the one
+// place to see, and clear, what's hiding a VM. Independent of folder, bad counts or which page
+// turned a filter on, so it can't disappear the way the storage filter used to.
+function filterChips(v) {
+  const f = v.f, items = [];
+  if (f.q.trim()) items.push(['q', 'Search "' + f.q.trim() + '"']);
+  if (f.folder !== null) items.push(['folder', 'Folder: ' + (f.folder || '(root)')]);
+  if (f.cluster) items.push(['cluster', 'Cluster: ' + f.cluster]);
+  if (f.network) items.push(['network', 'Network: ' + f.network]);
+  if (f.power) items.push(['power', POWER_L[f.power]]);
+  if (f.tools) items.push(['tools', TOOLS_L[f.tools]]);
+  if (f.show !== 'all') items.push(['show', SHOW_L[f.show]]);
+  if (f.ready) items.push(['ready', 'Readiness: ' + READY_L[f.ready]]);
+  if (f.storage) items.push(['storage', STORAGE_L[f.storage] || f.storage]);
+  if (f.tag) items.push(['tag', 'Tag: ' + f.tag]);
+  if (f.app) items.push(['app', 'App: ' + (f.app === '(none)' ? 'none' : f.app)]);
+  if (!items.length) return '';
+  return html`<div class="toolbar thin filterchips"><span class="small muted">Filtering by</span>
+    ${items.map(([k, label]) => html`<span class="chip fchip on">${label}<button class="x" data-act="clearFilter" data-k="${k}" aria-label="Clear ${label}">×</button></span>`)}
+    ${items.length > 1 ? html`<button class="btn xs ghost" data-act="clearFilters">Clear filters</button>` : ''}</div>`;
 }
 
 VIEWS.select = view({
   title: 'Select VMs', sub: 'Step 2 · choose what to import; folders are the unit of collection',
   init(v, p) {
-    v.f = v.f || { q: '', dc: null, folder: null, cluster: '', network: '', power: '', tools: '', show: 'all', ready: '', tag: '', app: '', storage: '' };
+    v.f = v.f || Object.assign({}, SELECT_F0);
     v.sopen = v.sopen || new Set();
     if (p.storage !== undefined) v.f.storage = p.storage;
     if (p.folder !== undefined) { v.f.folder = p.folder; v.f.dc = null; }
@@ -402,11 +434,12 @@ VIEWS.select = view({
             <select class="select" data-change="filter" data-k="power"><option value="">Any power</option><option value="on" ${attr(f.power === 'on', 'selected')}>Powered on</option><option value="off" ${attr(f.power === 'off', 'selected')}>Powered off</option></select>
             <select class="select" data-change="filter" data-k="tools"><option value="">Any Tools</option><option value="ok" ${attr(f.tools === 'ok', 'selected')}>Tools running</option><option value="bad" ${attr(f.tools === 'bad', 'selected')}>Tools not running</option></select>
             <select class="select" data-change="filter" data-k="ready"><option value="">Any readiness</option>${[['ready', 'Ready'], ['warn', 'Check first'], ['block', 'Likely to fail']].map(([k, l]) => html`<option value="${k}" ${attr(f.ready === k, 'selected')}>${l}</option>`)}</select>
-            <select class="select" data-change="filter" data-k="storage"><option value="">Any storage</option>${[['problem', 'Storage: fail or unknown'], ['pass', 'Storage: pass'], ['fail', 'Storage: fail'], ['unknown', 'Storage: unknown'], ['no_target', 'Storage: no target yet']].map(([k, l]) => html`<option value="${k}" ${attr(f.storage === k, 'selected')}>${l}</option>`)}</select>
+            <select class="select" data-change="filter" data-k="storage"><option value="">Any storage</option>${Object.entries(STORAGE_L).map(([k, l]) => html`<option value="${k}" ${attr(f.storage === k, 'selected')}>${l}</option>`)}</select>
             ${apps.length ? html`<select class="select" data-change="filter" data-k="app"><option value="">Any app</option><option value="(none)" ${attr(f.app === '(none)', 'selected')}>No app</option>${apps.map((a) => html`<option ${attr(f.app === a, 'selected')}>${a}</option>`)}</select>` : ''}
             ${tags.length ? html`<select class="select" data-change="filter" data-k="tag"><option value="">Any tag</option>${tags.map((t) => html`<option ${attr(f.tag === t, 'selected')}>${t}</option>`)}</select>` : ''}
             <div class="seg">${[['all', 'All'], ['sel', 'Selected'], ['unsel', 'Not selected']].map(([k, l]) => html`<button class="${f.show === k ? 'on' : ''}" data-act="show" data-k="${k}">${l}</button>`)}</div>
           </div>
+          ${filterChips(v)}
           <div class="toolbar thin">${savedViews('select')}</div>
           ${storageBar(v, selCount)}
           <div class="bulkbar">
@@ -463,6 +496,12 @@ VIEWS.select = view({
     bulkOpen(t, e, v) { v.bulkOpen = t.open; },
     storageOpen(t, e, v) { const m = t.dataset.moref; if (v.sopen.has(m)) v.sopen.delete(m); else v.sopen.add(m); v.render(); },
     storageSet(t, e, v) { v.f.storage = t.dataset.k; v.page = 0; v.render(); },
+    clearFilter(t, e, v) {
+      const k = t.dataset.k;
+      if (k === 'folder') { v.f.folder = null; v.f.dc = null; } else v.f[k] = SELECT_F0[k];
+      v.page = 0; v.render();
+    },
+    clearFilters(t, e, v) { v.f = Object.assign({}, SELECT_F0); v.page = 0; v.render(); },
     sort(t, e, v) { const k = t.dataset.key; v.sort = { key: k, dir: v.sort.key === k ? -v.sort.dir : 1 }; v.render(); },
     page(t, e, v) { v.page = +t.dataset.page; v.render(); window.scrollTo(0, 0); },
     folder(t, e, v) {

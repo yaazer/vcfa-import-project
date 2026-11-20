@@ -806,10 +806,10 @@ body[data-role="viewer"] .stickybar .btn.primary, body[data-role="viewer"] .bulk
 .tag.vtag { background: transparent; border: 1px solid var(--line-2); color: var(--muted); max-width: 120px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; white-space: nowrap; }
 .tag.xs { font-size: 10px; padding: 0 5px; margin-left: 4px; }
 .toolbar.thin { padding: 7px 16px; }
-.savedviews { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.chip.sv { padding: 2px 6px 2px 11px; font-size: 12px; }
-.chip.sv .x { border: 0; background: transparent; color: var(--faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; border-radius: 6px; }
-.chip.sv .x:hover { color: var(--bad); background: var(--bad-soft); }
+.savedviews, .filterchips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip.sv, .chip.fchip { padding: 2px 6px 2px 11px; font-size: 12px; }
+.chip.sv .x, .chip.fchip .x { border: 0; background: transparent; color: var(--faint); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 3px; border-radius: 6px; }
+.chip.sv .x:hover, .chip.fchip .x:hover { color: var(--bad); background: var(--bad-soft); }
 .checkrow.skip .ic { background: var(--panel-3); color: var(--faint); }
 .finding { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; }
 .finding .tag { flex: none; margin-top: 1px; }
